@@ -1,7 +1,7 @@
 /*
  * Copyright (c) 2013-2021 ARM Limited. All rights reserved.
- * Copyright 2019, Cypress Semiconductor Corporation
- * or a subsidiary of Cypress Semiconductor Corporation.
+ * Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon
+ * company) or an affiliate of Cypress Semiconductor Corporation.
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -324,9 +324,10 @@ extern uint32_t UART_Transfer  (const uint8_t *request, uint8_t *response);
 
 extern uint8_t  USB_COM_PORT_Activate (uint32_t cmd);
 
-extern uint32_t DAP_ProcessVendorCommand (const uint8_t *request, uint8_t *response);
-extern uint32_t DAP_ProcessCommand       (const uint8_t *request, uint8_t *response);
-extern uint32_t DAP_ExecuteCommand       (const uint8_t *request, uint8_t *response);
+extern uint32_t DAP_ProcessVendorCommand  (const uint8_t *request, uint8_t *response);
+extern uint32_t DAP_ProcessVendorCommandEx(const uint8_t *request, uint8_t *response);
+extern uint32_t DAP_ProcessCommand        (const uint8_t *request, uint8_t *response);
+extern uint32_t DAP_ExecuteCommand        (const uint8_t *request, uint8_t *response);
 
 extern void     DAP_Setup (void);
 
