@@ -61,6 +61,7 @@ enum _vendor_ids {
     kStub_VendorID = 0,
     kNXP_VendorID = 11,
     kTI_VendorID = 16,
+    kCypress_VendorID = 19,
     kMaxim_VendorID = 23,
     kNordic_VendorID = 54,
     kToshiba_VendorID = 92,
@@ -107,6 +108,8 @@ typedef enum _family_id {
     kAmbiq_ama3b1kk_FamilyID = CREATE_FAMILY_ID(kAmbiq_VendorID, 1),
     kMaxim_MAX3262X_FamilyID = CREATE_FAMILY_ID(kMaxim_VendorID, 1),
     kMaxim_MAX3266X_FamilyID = CREATE_FAMILY_ID(kMaxim_VendorID, 2),
+    kCypress_psoc6_FamilyID = CREATE_FAMILY_ID(kCypress_VendorID, 1),
+    kCypress_psoc6s_FamilyID = CREATE_FAMILY_ID(kCypress_VendorID, 2),
 } family_id_t;
 
 //! @brief Defines all characteristics of a device family.
