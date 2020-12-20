@@ -66,6 +66,10 @@
 #define DAPLINK_SECTOR_SIZE             0x00000200
 #define DAPLINK_MIN_WRITE_SIZE          0x00000200
 
+/* DMA RAM - SRAM4 */
+#define DAPLINK_DMA_RAM_START           0x20040000
+#define DAPLINK_DMA_RAM_SIZE            0x00004000
+
 /* USB RAM */
 #define DAPLINK_USB_RAM_START           0x40100000
 #define DAPLINK_USB_RAM_SIZE            0x00004000

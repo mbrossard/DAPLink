@@ -37,6 +37,7 @@ MEMORY
   m_cfgrom              (RW)  : ORIGIN = DAPLINK_ROM_CONFIG_USER_START, LENGTH = DAPLINK_ROM_CONFIG_USER_SIZE
   m_data                (RW)  : ORIGIN = DAPLINK_RAM_APP_START, LENGTH = DAPLINK_RAM_APP_SIZE
   m_cfgram              (RW)  : ORIGIN = DAPLINK_RAM_SHARED_START, LENGTH = DAPLINK_RAM_SHARED_SIZE
+  m_dma_ram             (RW)  : ORIGIN = DAPLINK_DMA_RAM_START, LENGTH = DAPLINK_DMA_RAM_SIZE
   m_usb_ram             (RW)  : ORIGIN = DAPLINK_USB_RAM_START, LENGTH = DAPLINK_USB_RAM_SIZE
 }
 
@@ -211,6 +212,13 @@ SECTIONS
   {
     *(cfgram)
   } > m_cfgram
+
+  .dmaram (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.dmaram)
+    . = ALIGN(4);
+  } > m_dma_ram
 
   .usbram (NOLOAD) :
   {

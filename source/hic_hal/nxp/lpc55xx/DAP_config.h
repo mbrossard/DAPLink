@@ -24,6 +24,7 @@
 
 #include "IO_Config.h"
 #include "fsl_iocon.h"
+#include "swd_dma.h"
 
 //**************************************************************************************************
 /**
@@ -549,6 +550,9 @@ __STATIC_INLINE void DAP_SETUP(void)
                                     | PIN_TDO_SWO_MASK
                                     | PIN_TDI_MASK
                                     | PIN_RESET_MASK;
+
+    // Setup DMA-based SWD.
+    swd_dma_init();
 }
 
 /** Reset Target Device with custom specific I/O pin or command sequence.

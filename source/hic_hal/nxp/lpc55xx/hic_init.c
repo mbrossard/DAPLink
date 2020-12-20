@@ -30,6 +30,7 @@
 #include "util.h"
 #include "flash_hal.h"
 #include "pin_mux.h"
+#include "swd_dma.h"
 
 #define FLASH_CMD_BLANK_CHECK (0x5)
 
@@ -205,6 +206,9 @@ void hic_enable_usb_clocks(void)
 
     // Init PHY.
     USB_EhciPhyInit(kUSB_ControllerLpcIp3511Hs0, BOARD_XTAL0_CLK_HZ, NULL);
+
+    // Let the SWD DMA implementation update its clock.
+    swd_dma_update_clock();
 }
 
 void hic_power_target(void)
