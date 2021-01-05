@@ -17,12 +17,15 @@ tool_specific:
                 - -Werror
                 - -ffunction-sections
                 - -fdata-sections
-                - -std=gnu99
                 - -fshort-wchar
                 - -fno-common
                 - -ffreestanding
                 - -fverbose-asm
                 - -mno-unaligned-access
+            c_flags:
+                - -std=gnu99
+            cxx_flags:
+                - -std=gnu++14
             ld_flags:
                 - --specs=nano.specs
                 - --specs=nosys.specs

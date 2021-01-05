@@ -45,7 +45,7 @@ typedef unsigned long  crc;
 
 #if (REFLECT_DATA == TRUE)
 #undef  REFLECT_DATA
-#define REFLECT_DATA(X)			((unsigned char) reflect((X), 8))
+#define REFLECT_DATA(X)			((unsigned char) reflect<8>((X)))
 #else
 #undef  REFLECT_DATA
 #define REFLECT_DATA(X)			(X)
@@ -53,7 +53,7 @@ typedef unsigned long  crc;
 
 #if (REFLECT_REMAINDER == TRUE)
 #undef  REFLECT_REMAINDER
-#define REFLECT_REMAINDER(X)	((crc) reflect((X), WIDTH))
+#define REFLECT_REMAINDER(X)	((crc) reflect<WIDTH>((X)))
 #else
 #undef  REFLECT_REMAINDER
 #define REFLECT_REMAINDER(X)	(X)
@@ -72,15 +72,22 @@ typedef unsigned long  crc;
  * Returns:		The reflection of the original data.
  *
  *********************************************************************/
+template <uint8_t nBits>
 static unsigned long
-reflect(unsigned long data, unsigned char nBits)
+reflect(unsigned long data)
 {
-    // util_assert(nBits <= 32);
-    if (nBits == 32) {
+#if ((defined (__ARM_ARCH_7M__      ) && (__ARM_ARCH_7M__      == 1)) || \
+     (defined (__ARM_ARCH_7EM__     ) && (__ARM_ARCH_7EM__     == 1)) || \
+     (defined (__ARM_ARCH_8M_MAIN__ ) && (__ARM_ARCH_8M_MAIN__ == 1))    )
+    if (nBits == 8) {
+        return __RBIT(data) >> 24;
+    }
+    else if (nBits == 32) {
         // Use bit reverse instruction intrinsic. The CMSIS intrinsic also
         // provides an implementation for cores that don't have the instruction.
         return __RBIT(data);
     }
+#endif
 
     unsigned long  reflection = 0x00000000;
     unsigned char  bit;
@@ -120,7 +127,7 @@ crc32(const void *data, int nBytes)
     crc            remainder = INITIAL_REMAINDER;
     int            byte;
     unsigned char  bit;
-    unsigned char const *message = data;
+    unsigned char const *message = reinterpret_cast<unsigned char const *>(data);
 
     /*
      * Perform modulo-2 division, a byte at a time.
@@ -169,7 +176,7 @@ crc32_continue(uint32_t prev_crc, const void *data, int nBytes)
     crc            remainder = REFLECT_REMAINDER(prev_crc ^ FINAL_XOR_VALUE);
     int            byte;
     unsigned char  bit;
-    unsigned char const *message = data;
+    unsigned char const *message = reinterpret_cast<unsigned char const *>(data);
 
     /*
      * Perform modulo-2 division, a byte at a time.
