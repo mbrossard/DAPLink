@@ -1,0 +1,7 @@
+common:
+    sources:
+        board:
+            - source/board/usbkw38.c
+        family:
+            - source/family/freescale/kw37z/target.c
+            - source/family/freescale/target_reset_Lseries.c
