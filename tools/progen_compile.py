@@ -104,6 +104,10 @@ cores = get_core_count() if args.parallel else 1
 projects = args.projects if len(args.projects) > 0 else project_list
 generator = generate.Generator(PROJECTS_YAML)
 for p_name in projects:
+    # armcc does not support
+    if 'armcc' in toolchain and 'lpc55' in p_name:
+        continue
+
     for project in generator.generate(p_name):
         failed = False
         if hasattr(project, 'workspace_name') and (project.workspace_name is not None):
