@@ -14,14 +14,13 @@ common:
     includes:
         - source/hic_hal/stm32/stm32f072cb
         - source/hic_hal/stm32/stm32f072cb/cmsis
-        - source/hic_hal/stm32/stm32f072cb/include
-        - source/hic_hal/stm32/stm32f072cb/hal/inc
+        - source/hic_hal/stm32/stm32f072cb/STM32F0xx_HAL_Driver/Inc
 
     sources:
         hic_hal:
             - source/hic_hal/stm32/stm32f072cb
             - source/hic_hal/stm32/stm32f072cb/cmsis
-            - source/hic_hal/stm32/stm32f072cb/hal/Src
+            - source/hic_hal/stm32/stm32f072cb/STM32F0xx_HAL_Driver/Src
 
 tool_specific:
     uvision:
