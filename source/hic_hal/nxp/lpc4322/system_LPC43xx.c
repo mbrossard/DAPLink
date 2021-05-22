@@ -647,8 +647,9 @@ void SystemCoreClockUpdate (void) {
   SystemCoreClock = GetClockFreq (base_src);
 }
 
-
+#if defined(__ARMCC)
 extern uint32_t __Vectors;                         /* see startup_LPC43xx.s   */
+#endif
 
 /*----------------------------------------------------------------------------
   Initialize the system
@@ -666,7 +667,9 @@ void SystemInit (void) {
   SysTick->CTRL &= ~(SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk);
 
   /* Set vector table pointer */
+#if defined(__ARMCC)
   SCB->VTOR = ((uint32_t)(&__Vectors)) & 0xFFF00000UL;
+#endif
 
   /* Configure PLL0 and PLL1, connect CPU clock to selected clock source */
   SetClock();
