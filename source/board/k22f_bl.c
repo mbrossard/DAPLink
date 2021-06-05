@@ -47,8 +47,8 @@ target_cfg_t target_device = {
     .flash_regions[0].start     = DAPLINK_ROM_IF_START,
     .flash_regions[0].end       = DAPLINK_ROM_IF_START + DAPLINK_ROM_IF_SIZE,
     .flash_regions[0].flags     = kRegionIsDefault,
-    .ram_regions[0].start       = 0x1fff0000,
-    .ram_regions[0].end         = 0x20010000,
+    .ram_regions[0].start       = 0x1fffe000,
+    .ram_regions[0].end         = 0x20003f00,
     // flash_algo not needed for bootloader
 };
 
