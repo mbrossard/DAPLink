@@ -41,6 +41,10 @@ tool_specific:
             hic_hal:
                 - source/hic_hal/freescale/k22f/armcc
     gcc_arm:
+        macros:
+            # Needed to get size of bootloader < 32 KB
+            # Disables assert() calls that require printf()
+            - NDEBUG
         linker_file:
             - source/hic_hal/freescale/kinetis.ld
         sources:
