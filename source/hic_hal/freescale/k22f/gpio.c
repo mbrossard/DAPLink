@@ -20,7 +20,6 @@
  */
 
 #include "MK22F51212.h"
-#include "RTL.h"
 #include "DAP_config.h"
 #include "gpio.h"
 #include "daplink.h"
