@@ -44,7 +44,7 @@ module:
         - records/usb/usb-bulk.yaml
         - records/usb/usb-hid.yaml
     hic_k22f: &module_hic_k22f
-        - records/rtos/rtos-cm3.yaml
+        - records/rtos/rtos-cm4.yaml
         - records/hic_hal/k22f.yaml
         - records/usb/usb-bulk.yaml
     hic_k26f: &module_hic_k26f
@@ -131,7 +131,7 @@ projects:
         - records/board/k20dx_bl.yaml
     k22f_bl:
         - *module_bl
-        - *module_hic_k22f
+        - records/hic_hal/k22f.yaml
         - records/board/k22f_bl.yaml
     k20dx_if:
         - *module_if
