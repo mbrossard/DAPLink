@@ -677,3 +677,20 @@ void SystemInit (void) {
   /* Update SystemCoreClock variable */
   SystemCoreClockUpdate();
 }
+
+void SystemReset(void)
+{
+    /* Ensure all outstanding memory accesses included buffered write are completed before reset */
+    __DSB();
+
+    LPC_WWDT->MOD |= (1 << 1);
+    LPC_WWDT->MOD |= (1 << 0);
+    LPC_WWDT->FEED = 0xAA;
+    LPC_WWDT->FEED = 0x55;
+
+    /* Ensure completion of memory access */
+    __DSB();
+
+    /* wait until reset */
+    while(1);
+}
