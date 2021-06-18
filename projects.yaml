@@ -114,6 +114,9 @@ module:
         - records/rtos/rtos-cm3.yaml
         - records/hic_hal/stm32f103xb.yaml
         - records/usb/usb-hid.yaml
+    hic_stm32f4x1ce: &module_hic_stm32f4x1ce
+        - records/rtos/rtos-cm4.yaml
+        - records/hic_hal/stm32f4x1ce.yaml
     hic_stm32h743xx: &module_hic_stm32h743xx
         - records/rtos/rtos-cm4.yaml
         - records/hic_hal/stm32h743xx.yaml
@@ -233,6 +236,15 @@ projects:
     stm32f103xb_if:
         - *module_if
         - *module_hic_stm32f103xb
+        - records/family/all_family.yaml
+        - records/usb/usb-bulk.yaml
+    stm32f4x1ce_bl:
+        - *module_bl
+        - records/hic_hal/stm32f4x1ce.yaml
+        - records/board/stm32f4x1ce_bl.yaml
+    stm32f4x1ce_if:
+        - *module_if
+        - *module_hic_stm32f4x1ce
         - records/family/all_family.yaml
         - records/usb/usb-bulk.yaml
     stm32h743xx_bl: &stm32h743xx_bl
