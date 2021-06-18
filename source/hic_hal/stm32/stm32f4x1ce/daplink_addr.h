@@ -22,41 +22,50 @@
 #ifndef DAPLINK_ADDR_H
 #define DAPLINK_ADDR_H
 
+/*
+ * Flash module organization:
+ * | Sector 0 | 0x0800_0000 - 0x0800_3FFF | 16 Kbytes  |
+ * | Sector 1 | 0x0800_4000 - 0x0800_7FFF | 16 Kbytes  |
+ * | Sector 2 | 0x0800_8000 - 0x0800_BFFF | 16 Kbytes  |
+ * | Sector 3 | 0x0800_C000 - 0x0800_FFFF | 16 Kbytes  |
+ * | Sector 4 | 0x0801_0000 - 0x0801_FFFF | 64 Kbytes  |
+ * | Sector 5 | 0x0802_0000 - 0x0803_FFFF | 128 Kbytes |
+ * | Sector 6 | 0x0804_0000 - 0x0805_FFFF | 128 Kbytes |
+ * | Sector 7 | 0x0806_0000 - 0x0807_FFFF | 128 Kbytes |
+ * Source: https://www.st.com/resource/en/reference_manual/dm00096844-stm32f401xb-c-and-stm32f401xd-e-advanced-arm-based-32-bit-mcus-stmicroelectronics.pdf
+ */
+
 /* Device sizes */
 
-#define DAPLINK_ROM_START               
-#define DAPLINK_ROM_SIZE                
+#define DAPLINK_ROM_START               0x08000000
+#define DAPLINK_ROM_SIZE                0x00040000 /* Limit to 256 KB */
 
-#define DAPLINK_RAM_START               
-#define DAPLINK_RAM_SIZE                
+#define DAPLINK_RAM_START               0x20000000
+#define DAPLINK_RAM_SIZE                0x00018000
 
 /* ROM sizes */
 
-#define DAPLINK_ROM_BL_START            
-#define DAPLINK_ROM_BL_SIZE             
+#define DAPLINK_ROM_BL_START            0x08000000
+#define DAPLINK_ROM_BL_SIZE             0x0000C000
 
-#define DAPLINK_ROM_IF_START            
-#define DAPLINK_ROM_IF_SIZE             
+#define DAPLINK_ROM_CONFIG_USER_START   0x0800C000
+#define DAPLINK_ROM_CONFIG_USER_SIZE    0x00004000
 
-#define DAPLINK_ROM_CONFIG_USER_START   
-#define DAPLINK_ROM_CONFIG_USER_SIZE    
+#define DAPLINK_ROM_IF_START            0x08010000
+#define DAPLINK_ROM_IF_SIZE             0x00030000
 
 /* RAM sizes */
 
-#define DAPLINK_RAM_APP_START           
-#define DAPLINK_RAM_APP_SIZE            
+#define DAPLINK_RAM_APP_START           0x20000000
+#define DAPLINK_RAM_APP_SIZE            0x00017F00
 
-#define DAPLINK_RAM_SHARED_START        
-#define DAPLINK_RAM_SHARED_SIZE         
-
-/* USB RAM */
-#define DAPLINK_USB_RAM_START           
-#define DAPLINK_USB_RAM_SIZE            
+#define DAPLINK_RAM_SHARED_START        0x20017F00
+#define DAPLINK_RAM_SHARED_SIZE         0x00000100
 
 /* Flash Programming Info */
 
-#define DAPLINK_SECTOR_SIZE             
-#define DAPLINK_MIN_WRITE_SIZE          
+#define DAPLINK_SECTOR_SIZE             KB(16)
+#define DAPLINK_MIN_WRITE_SIZE          KB(16)
 
 /* Current build */
 
