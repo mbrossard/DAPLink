@@ -6,6 +6,8 @@ common:
     macros:
         - INTERFACE_STM32F723IE
         - USE_HAL_DRIVER
+        - RTE_DEVICE_FRAMEWORK_CLASSIC
+        - USE_FULL_LL_DRIVER
         - STM32F723xx
         - DAPLINK_HIC_ID=0x9796990D  # DAPLINK_HIC_ID_STM32F723IE
         - __packed=__packed          # Prevent redefinition of __packed with ARMCC
