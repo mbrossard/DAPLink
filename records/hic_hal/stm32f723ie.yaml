@@ -1,0 +1,45 @@
+common:
+    target:
+        - Cortex-M7
+    core:
+        - Cortex-M7
+    macros:
+        - INTERFACE_STM32F723IE
+        - USE_HAL_DRIVER
+        - STM32F723xx
+        - DAPLINK_HIC_ID=0x9796990D  # DAPLINK_HIC_ID_STM32F723IE
+        - __packed=__packed          # Prevent redefinition of __packed with ARMCC
+        - DAPLINK_NO_ASSERT_FILENAMES
+        - OS_CLOCK=216000000
+
+    includes:
+        - source/hic_hal/stm32/stm32f723ie
+        - source/hic_hal/stm32/stm32f723ie/cmsis
+        - source/hic_hal/stm32/stm32f723ie/STM32F7xx_HAL_Driver
+        - source/hic_hal/stm32/stm32f723ie/STM32F7xx_HAL_Driver/Inc
+    sources:
+        hic_hal:
+            - source/hic_hal/stm32/stm32f723ie
+            - source/hic_hal/stm32/stm32f723ie/cmsis
+            - source/hic_hal/stm32/stm32f723ie/STM32F7xx_HAL_Driver/Src
+
+tool_specific:
+    uvision:
+        misc:
+            ld_flags:
+                - --predefine="-I..\..\..\source\hic_hal\stm32\stm32f723ie"
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f723ie/armcc
+    armcc:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f723ie/armcc
+    armclang:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f723ie/armcc
+    gcc_arm:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f723ie/gcc
