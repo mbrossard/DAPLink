@@ -19,12 +19,15 @@
  * limitations under the License.
  */
 
+#include "stm32f723xx.h"
 #include "read_uid.h"
 
 void read_unique_id(uint32_t *id)
 {
-    id[0] = 0;
-    id[1] = 0;
-    id[2] = 0;
-    id[3] = 0;
+    uint32_t *uid_base = (uint32_t *)UID_BASE;
+
+    id[0] = uid_base[0];
+    id[1] = uid_base[1];
+    id[2] = uid_base[2];
+    id[3] = 0xA5A5A5A5;
 }
