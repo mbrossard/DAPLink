@@ -1,6 +1,6 @@
 /**
   ******************************************************************************
-  * @file      startup_stm32f723xx.s
+  * @file      startup_stm32f723xx.S
   * @author    MCD Application Team
   * @brief     STM32F723xx Devices vector table for GCC based toolchain. 
   *            This module performs:
@@ -12,104 +12,29 @@
   *            After Reset the Cortex-M7 processor is in Thread mode,
   *            priority is Privileged, and the Stack is set to Main.
   ******************************************************************************
-  * @attention
+  * DAPLink Interface Firmware
+  * Copyright (c) 2016 STMicroelectronics. All rights reserved.
+  * Copyright (c) 2021, Arm Limited, All Rights Reserved
+  * SPDX-License-Identifier: Apache-2.0
   *
-  * <h2><center>&copy; Copyright (c) 2016 STMicroelectronics.
-  * All rights reserved.</center></h2>
+  * Licensed under the Apache License, Version 2.0 (the "License"); you may
+  * not use this file except in compliance with the License.
+  * You may obtain a copy of the License at
   *
-  * This software component is licensed by ST under BSD 3-Clause license,
-  * the "License"; You may not use this file except in compliance with the
-  * License. You may obtain a copy of the License at:
-  *                        opensource.org/licenses/BSD-3-Clause
+  * http://www.apache.org/licenses/LICENSE-2.0
   *
-  ******************************************************************************
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
   */
-    
+
   .syntax unified
   .cpu cortex-m7
   .fpu softvfp
   .thumb
 
-.global  g_pfnVectors
-.global  Default_Handler
-
-/* start address for the initialization values of the .data section. 
-defined in linker script */
-.word  _sidata
-/* start address for the .data section. defined in linker script */  
-.word  _sdata
-/* end address for the .data section. defined in linker script */
-.word  _edata
-/* start address for the .bss section. defined in linker script */
-.word  _sbss
-/* end address for the .bss section. defined in linker script */
-.word  _ebss
-/* stack used for SystemInit_ExtMemCtl; always internal RAM used */
-
-/**
- * @brief  This is the code that gets called when the processor first
- *          starts execution following a reset event. Only the absolutely
- *          necessary set is performed, after which the application
- *          supplied main() routine is called. 
- * @param  None
- * @retval : None
-*/
-
-    .section  .text.Reset_Handler
-  .weak  Reset_Handler
-  .type  Reset_Handler, %function
-Reset_Handler:  
-  ldr   sp, =_estack      /* set stack pointer */
-
-/* Copy the data segment initializers from flash to SRAM */  
-  movs  r1, #0
-  b  LoopCopyDataInit
-
-CopyDataInit:
-  ldr  r3, =_sidata
-  ldr  r3, [r3, r1]
-  str  r3, [r0, r1]
-  adds  r1, r1, #4
-    
-LoopCopyDataInit:
-  ldr  r0, =_sdata
-  ldr  r3, =_edata
-  adds  r2, r0, r1
-  cmp  r2, r3
-  bcc  CopyDataInit
-  ldr  r2, =_sbss
-  b  LoopFillZerobss
-/* Zero fill the bss segment. */  
-FillZerobss:
-  movs  r3, #0
-  str  r3, [r2], #4
-    
-LoopFillZerobss:
-  ldr  r3, = _ebss
-  cmp  r2, r3
-  bcc  FillZerobss
-
-/* Call the clock system intitialization function.*/
-  bl  SystemInit   
-/* Call static constructors */
-    bl __libc_init_array
-/* Call the application's entry point.*/
-  bl  main
-  bx  lr    
-.size  Reset_Handler, .-Reset_Handler
-
-/**
- * @brief  This is the code that gets called when the processor receives an 
- *         unexpected interrupt.  This simply enters an infinite loop, preserving
- *         the system state for examination by a debugger.
- * @param  None     
- * @retval None       
-*/
-    .section  .text.Default_Handler,"ax",%progbits
-Default_Handler:
-Infinite_Loop:
-  b  Infinite_Loop
-  .size  Default_Handler, .-Default_Handler
 /******************************************************************************
 *
 * The minimal vector table for a Cortex M7. Note that the proper constructs
@@ -117,13 +42,12 @@ Infinite_Loop:
 * 0x0000.0000.
 * 
 *******************************************************************************/
-   .section  .isr_vector,"a",%progbits
-  .type  g_pfnVectors, %object
-  .size  g_pfnVectors, .-g_pfnVectors
-   
-   
-g_pfnVectors:
-  .word  _estack
+  .section  .isr_vector, "a"
+  .align 2 
+
+  .globl __isr_vector
+__isr_vector:
+  .word  __StackTop
   .word  Reset_Handler
 
   .word  NMI_Handler
@@ -132,12 +56,12 @@ g_pfnVectors:
   .word  BusFault_Handler
   .word  UsageFault_Handler
   .word  0
-  .word  0
-  .word  0
-  .word  0
+  .word  DAPLINK_BUILD_KEY                    /* Build type - BL/IF*/
+  .word  DAPLINK_HIC_ID                       /* Compatibility*/
+  .word  DAPLINK_VERSION                      /* Version*/
   .word  SVC_Handler
   .word  DebugMon_Handler
-  .word  0
+  .word  g_board_info                         /* Ptr to Board info, family info other target details*/
   .word  PendSV_Handler
   .word  SysTick_Handler
   
@@ -247,6 +171,101 @@ g_pfnVectors:
   .word     0                                 /* Reserved                     */
   .word     SDMMC2_IRQHandler                 /* SDMMC2                       */ 
   
+  .size    __isr_vector, . - __isr_vector
+
+  .text
+  .thumb
+
+.global  g_pfnVectors
+.global  Default_Handler
+
+/* start address for the initialization values of the .data section. 
+defined in linker script */
+.word  _sidata
+/* start address for the .data section. defined in linker script */  
+.word  _sdata
+/* end address for the .data section. defined in linker script */
+.word  _edata
+/* start address for the .bss section. defined in linker script */
+.word  _sbss
+/* end address for the .bss section. defined in linker script */
+.word  _ebss
+/* stack used for SystemInit_ExtMemCtl; always internal RAM used */
+
+/**
+ * @brief  This is the code that gets called when the processor first
+ *          starts execution following a reset event. Only the absolutely
+ *          necessary set is performed, after which the application
+ *          supplied main() routine is called. 
+ * @param  None
+ * @retval : None
+*/
+
+  .section  .text.Reset_Handler
+  .weak  Reset_Handler
+  .type  Reset_Handler, %function
+Reset_Handler:  
+  ldr   sp, =__StackTop      /* set stack pointer */
+
+/* Copy the data segment initializers from flash to SRAM */  
+  movs  r1, #0
+  b  LoopCopyDataInit
+
+/*
+ * - __etext: End of code section, i.e., begin of data sections to copy from.
+ * - __data_start__/__data_end__: RAM address range that data should be
+ *   copied to. Both must be aligned to 4 bytes boundary.
+ * - __bss_start__: start of BSS section. Must align to 4
+ * - __bss_end__: end of BSS section. Must align to 4
+ */
+
+CopyDataInit:
+  ldr  r3, =__etext
+  ldr  r3, [r3, r1]
+  str  r3, [r0, r1]
+  adds  r1, r1, #4
+    
+LoopCopyDataInit:
+  ldr  r0, =__data_start__
+  ldr  r3, =__data_end__
+  adds  r2, r0, r1
+  cmp  r2, r3
+  bcc  CopyDataInit
+  ldr  r2, =__bss_start__
+  b  LoopFillZerobss
+/* Zero fill the bss segment. */  
+FillZerobss:
+  movs  r3, #0
+  str  r3, [r2], #4
+    
+LoopFillZerobss:
+  ldr  r3, = __bss_end__
+  cmp  r2, r3
+  bcc  FillZerobss
+
+/* Call the clock system intitialization function.*/
+  bl  SystemInit   
+/* Call static constructors */
+  bl __libc_init_array
+/* Call the application's entry point.*/
+  bl  main
+  bx  lr    
+.size  Reset_Handler, .-Reset_Handler
+
+/**
+ * @brief  This is the code that gets called when the processor receives an 
+ *         unexpected interrupt.  This simply enters an infinite loop, preserving
+ *         the system state for examination by a debugger.
+ * @param  None     
+ * @retval None       
+*/
+  .section  .text.Default_Handler, "ax", %progbits
+Default_Handler:
+Infinite_Loop:
+  b  Infinite_Loop
+  .size  Default_Handler, .-Default_Handler
+
+
 /*******************************************************************************
 *
 * Provide weak aliases for each Exception handler to the Default_Handler. 
@@ -532,6 +551,3 @@ g_pfnVectors:
 
    .weak      SDMMC2_IRQHandler            
    .thumb_set SDMMC2_IRQHandler,Default_Handler  
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/        
- 
