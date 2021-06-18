@@ -1,0 +1,43 @@
+common:
+    target:
+        - Cortex-M4
+    core:
+        - Cortex-M4
+    macros:
+        - INTERFACE_STM32F4X1CE
+        - USE_HAL_DRIVER
+        - STM32F401xE
+        - DAPLINK_HIC_ID=0x9796990E  # DAPLINK_HIC_ID_STM32F4X1CE
+        - __packed=__packed          # Prevent redefinition of __packed with ARMCC
+        - DAPLINK_NO_ASSERT_FILENAMES
+        - OS_CLOCK=84000000
+    includes:
+        - source/hic_hal/stm32/stm32f4x1ce
+        - source/hic_hal/stm32/stm32f4x1ce/cmsis
+        - source/hic_hal/stm32/hal/STM32F4xx_HAL_Driver/Inc
+    sources:
+        hic_hal:
+            - source/hic_hal/stm32/stm32f4x1ce
+            - source/hic_hal/stm32/stm32f4x1ce/cmsis
+            - source/hic_hal/stm32/hal/STM32F4xx_HAL_Driver/Src
+
+tool_specific:
+    uvision:
+        misc:
+            ld_flags:
+                - --predefine="-I..\..\..\source\hic_hal\stm32\stm32f4x1ce"
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f4x1ce/armcc
+    armcc:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f4x1ce/armcc
+    armclang:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f4x1ce/armcc
+    gcc_arm:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f4x1ce/gcc
