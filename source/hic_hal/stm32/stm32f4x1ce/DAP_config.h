@@ -28,6 +28,7 @@
 #ifndef __DAP_CONFIG_H__
 #define __DAP_CONFIG_H__
 
+#include "IO_Config.h"
 
 //**************************************************************************************************
 /**
@@ -43,13 +44,6 @@ This information includes:
  - Debug Access Port supported modes and settings (JTAG/SWD and SWO).
  - Optional information about a connected Target Device (for Evaluation Boards).
 */
-
-#ifdef _RTE_
-#include "RTE_Components.h"
-#include CMSIS_device_header
-#else
-#include "device.h"                             // Debug Unit Cortex-M Processor Header File
-#endif
 
 /// Processor Clock of the Cortex-M MCU used in the Debug Unit.
 /// This value is used to calculate the SWD/JTAG clock speed.
@@ -357,14 +351,20 @@ It is recommended to provide the following LEDs for status indication:
            - 1: Connect LED ON: debugger is connected to CMSIS-DAP Debug Unit.
            - 0: Connect LED OFF: debugger is not connected to CMSIS-DAP Debug Unit.
 */
-__STATIC_INLINE void LED_CONNECTED_OUT (uint32_t bit) {}
+__STATIC_INLINE void LED_CONNECTED_OUT (uint32_t bit) {
+    // LED is active low
+    HAL_GPIO_WritePin(CONNECTED_LED_PORT, CONNECTED_LED_PIN, (bit & 1) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+}
 
 /** Debug Unit: Set status Target Running LED.
 \param bit status of the Target Running LED.
            - 1: Target Running LED ON: program execution in target started.
            - 0: Target Running LED OFF: program execution in target stopped.
 */
-__STATIC_INLINE void LED_RUNNING_OUT (uint32_t bit) {}
+__STATIC_INLINE void LED_RUNNING_OUT (uint32_t bit) {
+    // LED is active low
+    HAL_GPIO_WritePin(RUNNING_LED_PORT, RUNNING_LED_PIN, (bit & 1) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+}
 
 ///@}
 

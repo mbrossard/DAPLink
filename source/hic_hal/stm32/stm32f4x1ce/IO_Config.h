@@ -22,4 +22,30 @@
 #ifndef __IO_CONFIG_H__
 #define __IO_CONFIG_H__
 
+#include "stm32f4xx.h"
+#include "stm32f4xx_hal_gpio.h"
+
+// Status LED
+// There is only one LED connected to a GPIO
+
+// Running LED (blue)
+#define RUNNING_LED_PORT             GPIOC
+#define RUNNING_LED_PIN              GPIO_PIN_13
+
+// Connected LED (blue)
+#define CONNECTED_LED_PORT           GPIOC
+#define CONNECTED_LED_PIN            GPIO_PIN_13
+
+// HID / DAP (blue)
+#define PIN_HID_LED_PORT             GPIOB
+#define PIN_HID_LED                  GPIO_PIN_13
+
+// CDC (blue)
+#define PIN_CDC_LED_PORT             GPIOC
+#define PIN_CDC_LED                  GPIO_PIN_13
+
+// MSC (blue)
+#define PIN_MSC_LED_PORT             GPIOC
+#define PIN_MSC_LED                  GPIO_PIN_13
+
 #endif
