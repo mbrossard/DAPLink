@@ -19,6 +19,7 @@
  * limitations under the License.
  */
 
+#include <stdint.h>
 #include "gpio.h"
 
 void gpio_init(void)
