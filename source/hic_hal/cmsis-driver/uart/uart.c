@@ -20,18 +20,13 @@
  */
 
 #include "string.h"
-#include "fsl_device_registers.h"
-#include "fsl_usart_cmsis.h"
 #include "uart.h"
 #include "util.h"
 #include "cortex_m.h"
 #include "circ_buf.h"
 #include "settings.h" // for config_get_overflow_detect
-
-#define USART_INSTANCE (Driver_USART0)
-#define USART_IRQ      (FLEXCOMM0_IRQn)
-
-extern uint32_t SystemCoreClock;
+#include "Driver_USART.h"
+#include "IO_Config.h"
 
 static void clear_buffers(void);
 
@@ -65,18 +60,18 @@ int32_t uart_initialize(void)
 {
     clear_buffers();
     cb_buf.tx_size = 0;
-    USART_INSTANCE.Initialize(uart_handler);
-    USART_INSTANCE.PowerControl(ARM_POWER_FULL);
+    CMSIS_UART_INSTANCE.Initialize(uart_handler);
+    CMSIS_UART_INSTANCE.PowerControl(ARM_POWER_FULL);
 
     return 1;
 }
 
 int32_t uart_uninitialize(void)
 {
-    USART_INSTANCE.Control(ARM_USART_CONTROL_RX, 0);
-    USART_INSTANCE.Control(ARM_USART_ABORT_RECEIVE, 0U);
-    USART_INSTANCE.PowerControl(ARM_POWER_OFF);
-    USART_INSTANCE.Uninitialize();
+    CMSIS_UART_INSTANCE.Control(ARM_USART_CONTROL_RX, 0);
+    CMSIS_UART_INSTANCE.Control(ARM_USART_ABORT_RECEIVE, 0U);
+    CMSIS_UART_INSTANCE.PowerControl(ARM_POWER_OFF);
+    CMSIS_UART_INSTANCE.Uninitialize();
     clear_buffers();
     cb_buf.tx_size = 0;
 
@@ -86,10 +81,10 @@ int32_t uart_uninitialize(void)
 int32_t uart_reset(void)
 {
     // disable interrupt
-    NVIC_DisableIRQ(USART_IRQ);
+    NVIC_DisableIRQ(CMSIS_UART_IRQ);
     clear_buffers();
     // enable interrupt
-    NVIC_EnableIRQ(USART_IRQ);
+    NVIC_EnableIRQ(CMSIS_UART_IRQ);
 
     return 1;
 }
@@ -158,23 +153,23 @@ int32_t uart_set_configuration(UART_Configuration *config)
             break;
     }
 
-    NVIC_DisableIRQ(USART_IRQ);
+    NVIC_DisableIRQ(CMSIS_UART_IRQ);
     clear_buffers();
 
     // If there was no Receive() call in progress aborting it is harmless.
-    USART_INSTANCE.Control(ARM_USART_CONTROL_RX, 0U);
-    USART_INSTANCE.Control(ARM_USART_ABORT_RECEIVE, 0U);
+    CMSIS_UART_INSTANCE.Control(ARM_USART_CONTROL_RX, 0U);
+    CMSIS_UART_INSTANCE.Control(ARM_USART_ABORT_RECEIVE, 0U);
 
-    uint32_t r = USART_INSTANCE.Control(control, config->Baudrate);
+    uint32_t r = CMSIS_UART_INSTANCE.Control(control, config->Baudrate);
     if (r != ARM_DRIVER_OK) {
         return 0;
     }
-    USART_INSTANCE.Control(ARM_USART_CONTROL_TX, 1);
-    USART_INSTANCE.Control(ARM_USART_CONTROL_RX, 1);
-    USART_INSTANCE.Receive(&(cb_buf.rx), 1);
+    CMSIS_UART_INSTANCE.Control(ARM_USART_CONTROL_TX, 1);
+    CMSIS_UART_INSTANCE.Control(ARM_USART_CONTROL_RX, 1);
+    CMSIS_UART_INSTANCE.Receive(&(cb_buf.rx), 1);
 
-    NVIC_ClearPendingIRQ(USART_IRQ);
-    NVIC_EnableIRQ(USART_IRQ);
+    NVIC_ClearPendingIRQ(CMSIS_UART_IRQ);
+    NVIC_EnableIRQ(CMSIS_UART_IRQ);
 
     return 1;
 }
@@ -201,15 +196,15 @@ int32_t uart_write_data(uint8_t *data, uint16_t size)
 
     // Disable interrupts to prevent the uart_handler from modifying the
     // circular buffer at the same time.
-    NVIC_DisableIRQ(USART_IRQ);
+    NVIC_DisableIRQ(CMSIS_UART_IRQ);
     uint32_t cnt = circ_buf_write(&write_buffer, data, size);
     if (cb_buf.tx_size == 0 && circ_buf_count_used(&write_buffer) > 0) {
         // There's no pending transfer, so we need to start the process.
         cb_buf.tx = circ_buf_pop(&write_buffer);
-        USART_INSTANCE.Send(&(cb_buf.tx), 1);
+        CMSIS_UART_INSTANCE.Send(&(cb_buf.tx), 1);
         cb_buf.tx_size = 1;
     }
-    NVIC_EnableIRQ(USART_IRQ);
+    NVIC_EnableIRQ(CMSIS_UART_IRQ);
 
     return cnt;
 }
@@ -229,13 +224,13 @@ void uart_handler(uint32_t event) {
         } else {
             // Drop character
         }
-        USART_INSTANCE.Receive(&(cb_buf.rx), 1);
+        CMSIS_UART_INSTANCE.Receive(&(cb_buf.rx), 1);
     }
 
     if (event & ARM_USART_EVENT_SEND_COMPLETE) {
         if (circ_buf_count_used(&write_buffer) > 0) {
             cb_buf.tx = circ_buf_pop(&write_buffer);
-            USART_INSTANCE.Send(&(cb_buf.tx), 1);
+            CMSIS_UART_INSTANCE.Send(&(cb_buf.tx), 1);
         } else {
             // Signals that next call to uart_write_data() should start a
             // transfer.
