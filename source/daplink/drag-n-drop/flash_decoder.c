@@ -32,7 +32,9 @@
 #include "cmsis_compiler.h"
 
 // Set to 1 to enable debugging
+#ifndef DEBUG_FLASH_DECODER
 #define DEBUG_FLASH_DECODER     0
+#endif
 
 #if DEBUG_FLASH_DECODER
 #include "daplink_debug.h"
@@ -68,6 +70,7 @@ __WEAK uint8_t board_detect_incompatible_image(const uint8_t *data, uint32_t siz
 flash_decoder_type_t flash_decoder_detect_type(const uint8_t *data, uint32_t size, uint32_t addr, bool addr_valid)
 {
     daplink_info_t info;
+    flash_decoder_printf("flash_decoder_detect_type()\r\n");
     util_assert(size >= FLASH_DECODER_MIN_SIZE);
     // Check if this is a daplink image
     memcpy(&info, data + DAPLINK_INFO_OFFSET, sizeof(info));
@@ -76,12 +79,15 @@ flash_decoder_type_t flash_decoder_detect_type(const uint8_t *data, uint32_t siz
     }
     if (DAPLINK_HIC_ID == info.hic_id) {
         if (DAPLINK_BUILD_KEY_IF == info.build_key) {
+            flash_decoder_printf("flash_decoder_detect_type() => FLASH_DECODER_TYPE_INTERFACE\r\n");
             // Interface update
             return FLASH_DECODER_TYPE_INTERFACE;
         } else if (DAPLINK_BUILD_KEY_BL == info.build_key) {
+            flash_decoder_printf("flash_decoder_detect_type() => FLASH_DECODER_TYPE_BOOTLOADER\r\n");
             // Bootloader update
             return FLASH_DECODER_TYPE_BOOTLOADER;
         } else {
+            flash_decoder_printf("flash_decoder_detect_type() => FLASH_DECODER_TYPE_UNKNOWN\r\n");
             return FLASH_DECODER_TYPE_UNKNOWN;
         }
     }
@@ -91,15 +97,18 @@ flash_decoder_type_t flash_decoder_detect_type(const uint8_t *data, uint32_t siz
         if(!addr_valid){ //binary is a bin type
             flash_type_target_bin = true;
         }
+        flash_decoder_printf("flash_decoder_detect_type() => FLASH_DECODER_TYPE_TARGET\r\n");
         return FLASH_DECODER_TYPE_TARGET;
     }
 
     // If an address is specified then the data can be decoded
     if (addr_valid) {
+        flash_decoder_printf("flash_decoder_detect_type() => FLASH_DECODER_TYPE_TARGET\r\n");
         // TODO - future improvement - make sure address is within target's flash
         return FLASH_DECODER_TYPE_TARGET;
     }
 
+    flash_decoder_printf("flash_decoder_detect_type() => FLASH_DECODER_TYPE_UNKNOWN\r\n");
     return FLASH_DECODER_TYPE_UNKNOWN;
 }
 
@@ -292,7 +301,7 @@ error_t flash_decoder_write(uint32_t addr, const uint8_t *data, uint32_t size)
                 state = DECODER_STATE_ERROR;
                 return status;
             }
-            
+
             // Validate incompatible target image file
             if (config_get_detect_incompatible_target()){
                 status = flash_decoder_validate_target_image(flash_type, flash_buf, flash_buf_pos);

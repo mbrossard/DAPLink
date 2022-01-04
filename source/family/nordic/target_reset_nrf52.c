@@ -24,12 +24,28 @@
 #include "target_board.h"
 #include "swd_host.h"
 
+// Set to 1 to enable debugging
+#ifndef DEBUG_NRF52_RESET
+#define DEBUG_NRF52_RESET     0
+#endif
+
+#if DEBUG_NRF52_RESET
+#include "daplink_debug.h"
+#define nrf52_reset_printf    debug_msg
+#else
+#define nrf52_reset_printf(...)
+#endif
+
+
 static void swd_set_target_reset_nrf(uint8_t asserted)
 {
     uint32_t ap_index_return;
 
+    nrf52_reset_printf("swd_set_target_reset_nrf()\r\n");
     if (asserted) {
+        nrf52_reset_printf("swd_set_target_reset_nrf() => swd_init_debug()\r\n");
         swd_init_debug();
+        nrf52_reset_printf("swd_set_target_reset_nrf() => swd_init_debug() done \r\n");
 
         swd_read_ap(0x010000FC, &ap_index_return);
         if (ap_index_return == 0x02880000) {

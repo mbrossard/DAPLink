@@ -1,6 +1,15 @@
 common:
     macros:
         - IO_CONFIG_OVERRIDE
+        # - DAPLINK_DEBUG
+        # - DAPLINK_DEBUG_RTT
+        # - DEBUG_ASSERTS
+        # - DEBUG_VFS_MANAGER=1
+        # - DEBUG_FILE_STREAM=1
+        # - DEBUG_FLASH_DECODER=1
+        # - DEBUG_FLASH_MANAGER=1
+        # - DEBUG_TARGET_FLASH=1
+        # - DEBUG_NRF52_RESET=1
     includes:
         - source/board/override_mkit_dk_dongle_nrf5x
     sources:

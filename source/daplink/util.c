@@ -24,6 +24,7 @@
 #include "util.h"
 #include "settings.h"
 #include "cortex_m.h"
+#include "daplink_debug.h"
 
 //remove dependency from vfs_manager
 __WEAK void vfs_mngr_fs_remount(void) {}
@@ -145,6 +146,10 @@ void _util_assert(bool expression, const char *filename, uint16_t line)
     if (expression) {
         return;
     }
+
+#ifdef DEBUG_ASSERTS
+    debug_msg("Assertion failed: %s:%d\r\n", filename, line);
+#endif
 
     int_state = cortex_int_get_and_disable();
     // Only write the assert if there is not already one

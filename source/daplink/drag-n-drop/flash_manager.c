@@ -4,7 +4,7 @@
  *
  * DAPLink Interface Firmware
  * Copyright (c) 2009-2019, ARM Limited, All Rights Reserved
- * Copyright 2019, Cypress Semiconductor Corporation 
+ * Copyright 2019, Cypress Semiconductor Corporation
  * or a subsidiary of Cypress Semiconductor Corporation.
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -27,7 +27,9 @@
 #include "settings.h"
 
 // Set to 1 to enable debugging
+#ifndef DEBUG_FLASH_MANAGER
 #define DEBUG_FLASH_MANAGER     0
+#endif
 
 #if DEBUG_FLASH_MANAGER
 #include "daplink_debug.h"
@@ -64,19 +66,21 @@ static error_t setup_next_sector(uint32_t addr);
 error_t flash_manager_init(const flash_intf_t *flash_intf)
 {
     error_t status;
-    // Assert that interface has been properly uninitialized
     flash_manager_printf("flash_manager_init()\r\n");
 
+    // Assert that interface has been properly uninitialized
     if (state != STATE_CLOSED) {
         util_assert(0);
         return ERROR_INTERNAL;
     }
 
+    flash_manager_printf("flash_intf_valid()\r\n");
     // Check for a valid flash interface
     if (!flash_intf_valid(flash_intf)) {
         util_assert(0);
         return ERROR_INTERNAL;
     }
+    flash_manager_printf("flash_intf_valid() done\r\n");
 
     // Initialize variables
     memset(buf, 0xFF, sizeof(buf));
@@ -89,6 +93,8 @@ error_t flash_manager_init(const flash_intf_t *flash_intf)
     last_addr = 0;
     intf = flash_intf;
     // Initialize flash
+    flash_manager_printf("    intf->init (%x)\r\n", intf);
+    flash_manager_printf("    intf->init (%x)\r\n", intf->init);
     status = intf->init();
     flash_manager_printf("    intf->init ret=%i\r\n", status);
 

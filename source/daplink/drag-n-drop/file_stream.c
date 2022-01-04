@@ -29,6 +29,18 @@
 #include "cmsis_os2.h"
 #include "compiler.h"
 #include "validation.h"
+#include "daplink_debug.h"
+
+// Set to 1 to enable debugging
+#ifndef DEBUG_FILE_STREAM
+#define DEBUG_FILE_STREAM     0
+#endif
+
+#if DEBUG_FILE_STREAM
+#define file_stream_printf    debug_msg
+#else
+#define file_stream_printf(...)
+#endif
 
 typedef enum {
     STREAM_STATE_CLOSED,
@@ -101,25 +113,31 @@ static void stream_thread_assert(void)
 stream_type_t stream_start_identify(const uint8_t *data, uint32_t size)
 {
     stream_type_t i;
-
+    file_stream_printf("stream_start_identify()\r\n");
     for (i = STREAM_TYPE_START; i < STREAM_TYPE_COUNT; i++) {
         if (stream[i].detect(data, size)) {
+            file_stream_printf("stream_start_identify() => %d\r\n", i);
             return i;
         }
     }
 
+    file_stream_printf("stream_start_identify() => %d\r\n", STREAM_TYPE_NONE);
     return STREAM_TYPE_NONE;
 }
 
 // Identify the file type from its extension
 stream_type_t stream_type_from_name(const vfs_filename_t filename)
 {
+    file_stream_printf("stream_type_from_name()\r\n");
     // 8.3 file names must be in upper case
     if (0 == strncmp("BIN", &filename[8], 3)) {
+        file_stream_printf("stream_type_from_name() => %d\r\n", STREAM_TYPE_BIN);
         return STREAM_TYPE_BIN;
     } else if (0 == strncmp("HEX", &filename[8], 3)) {
+        file_stream_printf("stream_type_from_name() => %d\r\n", STREAM_TYPE_HEX);
         return STREAM_TYPE_HEX;
     } else {
+        file_stream_printf("stream_type_from_name() => %d\r\n", STREAM_TYPE_NONE);
         return STREAM_TYPE_NONE;
     }
 }
@@ -127,6 +145,7 @@ stream_type_t stream_type_from_name(const vfs_filename_t filename)
 error_t stream_open(stream_type_t stream_type)
 {
     error_t status;
+    file_stream_printf("stream_open(%d)\r\n", stream_type);
 
     // Stream must not be open already
     if (state != STREAM_STATE_CLOSED) {
@@ -158,6 +177,7 @@ error_t stream_open(stream_type_t stream_type)
 error_t stream_write(const uint8_t *data, uint32_t size)
 {
     error_t status;
+    file_stream_printf("stream_write(%d)\r\n", size);
 
     // Stream must be open already
     if (state != STREAM_STATE_OPEN) {
@@ -180,12 +200,14 @@ error_t stream_write(const uint8_t *data, uint32_t size)
         state = STREAM_STATE_ERROR;
     }
 
+    file_stream_printf("stream_write() => %d\r\n", status);
     return status;
 }
 
 error_t stream_close(void)
 {
     error_t status;
+    file_stream_printf("stream_close())\r\n");
 
     // Stream must not be closed already
     if (STREAM_STATE_CLOSED == state) {
@@ -199,6 +221,8 @@ error_t stream_close(void)
     // Close stream
     status = current_stream->close(&shared_state);
     state = STREAM_STATE_CLOSED;
+
+    file_stream_printf("stream_close()) => %d\r\n", status);
     return status;
 }
 
@@ -206,12 +230,14 @@ error_t stream_close(void)
 
 static bool detect_bin(const uint8_t *data, uint32_t size)
 {
+    file_stream_printf("detect_bin(%d))\r\n", size);
     return FLASH_DECODER_TYPE_UNKNOWN != flash_decoder_detect_type(data, size, 0, false);
 }
 
 static error_t open_bin(void *state)
 {
     error_t status;
+    file_stream_printf("open_bin())\r\n");
     status = flash_decoder_open();
     return status;
 }
@@ -220,6 +246,7 @@ static error_t write_bin(void *state, const uint8_t *data, uint32_t size)
 {
     error_t status;
     bin_state_t *bin_state = (bin_state_t *)state;
+    file_stream_printf("write_bin(%d))\r\n", size);
 
     if (bin_state->buf_pos < FLASH_DECODER_MIN_SIZE) {
         flash_decoder_type_t flash_type;
@@ -233,8 +260,10 @@ static error_t write_bin(void *state, const uint8_t *data, uint32_t size)
         memcpy(bin_state->vector_buf + bin_state->buf_pos, data, copy_size);
         bin_state->buf_pos += copy_size;
 
+        file_stream_printf("write_bin() now at %d\r\n", bin_state->buf_pos);
         if (bin_state->buf_pos < FLASH_DECODER_MIN_SIZE) {
             // Not enough data to determine type
+            file_stream_printf("Not enough to detect\r\n");
             return ERROR_SUCCESS;
         }
 
@@ -242,7 +271,7 @@ static error_t write_bin(void *state, const uint8_t *data, uint32_t size)
         size -= copy_size;
         // Determine type
         flash_type = flash_decoder_detect_type(bin_state->vector_buf, bin_state->buf_pos, 0, false);
-
+        file_stream_printf("flash_decoder_detect_type() resturned %d\r\n", flash_type);
         if (FLASH_DECODER_TYPE_UNKNOWN == flash_type) {
             return ERROR_FD_UNSUPPORTED_UPDATE;
         }
@@ -281,6 +310,7 @@ static error_t write_bin(void *state, const uint8_t *data, uint32_t size)
 static error_t close_bin(void *state)
 {
     error_t status;
+    file_stream_printf("close_bin()))\r\n");
     status = flash_decoder_close();
     return status;
 }
@@ -289,6 +319,7 @@ static error_t close_bin(void *state)
 
 static bool detect_hex(const uint8_t *data, uint32_t size)
 {
+    file_stream_printf("detect_hex(%d))\r\n", size);
     return 1 == validate_hexfile(data);
 }
 
@@ -296,6 +327,7 @@ static error_t open_hex(void *state)
 {
     error_t status;
     hex_state_t *hex_state = (hex_state_t *)state;
+    file_stream_printf("open_hex()))\r\n");
     memset(hex_state, 0, sizeof(*hex_state));
     reset_hex_parser();
     hex_state->parsing_complete = false;
@@ -311,6 +343,7 @@ static error_t write_hex(void *state, const uint8_t *data, uint32_t size)
     uint32_t bin_start_address = 0; // Decoded from the hex file, the binary buffer data starts at this address
     uint32_t bin_buf_written = 0;   // The amount of data in the binary buffer starting at address above
     uint32_t block_amt_parsed = 0;  // amount of data parsed in the block on the last call
+    file_stream_printf("write_hex(%d))\r\n", size);
 
     while (1) {
         // try to decode a block of hex data into bin data
@@ -361,6 +394,7 @@ static error_t write_hex(void *state, const uint8_t *data, uint32_t size)
 static error_t close_hex(void *state)
 {
     error_t status;
+    file_stream_printf("close_hex()))\r\n");
     status = flash_decoder_close();
     return status;
 }
