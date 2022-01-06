@@ -21,7 +21,6 @@
 
 #include "LPC43xx.h"
 #include "uart.h"
-#include "lpc43xx_cgu.h"
 #include "lpc43xx_scu.h"
 #include "util.h"
 #include "circ_buf.h"
@@ -56,11 +55,19 @@ static int32_t reset(void);
 
 int32_t uart_initialize(void)
 {
+    uint32_t tmp;
     NVIC_DisableIRQ(UART_IRQn);
 
-    // The baudrate calculations require the UART to be clocked as SystemCoreClock
-    CGU_EntityConnect(CGU_CLKSRC_PLL1, CGU_BASE_UART0);
-    CGU_EnableEntity(CGU_BASE_UART0, ENABLE);
+    // The baudrate calculations require the UART
+    // to be clocked as SystemCoreClock
+    tmp = LPC_CGU->BASE_UART0_CLK & ~(0x0F << 24);  // clear CLK_SEL.
+    LPC_CGU->BASE_UART0_CLK = tmp
+                            | (0x01 << 11)          // AUTOBLOCK: 0=Disabled, 1=Enabled.
+                            | (0x09 << 24)          // CLK_SEL = PLL1.
+                            ;
+
+    LPC_CGU->BASE_UART0_CLK &= ~1; // PD: 0=Power Up.
+
     scu_pinmux(2, 0, UART_RX_TX, FUNC1);   /* P2_0: U0_TXD */
     scu_pinmux(2, 1, UART_RX_TX, FUNC1);   /* P2_1: U0_RXD */
 
