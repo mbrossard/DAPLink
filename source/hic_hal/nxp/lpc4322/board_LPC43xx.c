@@ -125,7 +125,9 @@ static void clock_setup_pll0usb()
 
 void sdk_init(void)
 {
+#if defined(DAPLINK_BL)
     clock_setup_base_m4(120000000);
 
     clock_setup_pll0usb();
+#endif
 }
