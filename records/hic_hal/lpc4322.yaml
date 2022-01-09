@@ -16,6 +16,7 @@ common:
         hic_hal:
             - source/hic_hal/nxp/lpc4322
             - source/hic_hal/nxp/lpc4322/RTE_Driver
+            - source/hic_hal/cmsis-driver/uart
 
 tool_specific:
     uvision:
