@@ -19,4 +19,10 @@
  * limitations under the License.
  */
 
+#if defined(DAPLINK_BL)
+#include "bl/system_LPC43xx.c"
+#elif defined(DAPLINK_IF)
 #include "if/system_LPC43xx.c"
+#else
+#error "Neither DAPLINK_BL nor DAPLINK_IF are defined!"
+#endif
