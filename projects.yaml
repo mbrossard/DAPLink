@@ -481,6 +481,10 @@ projects:
         - *module_if
         - *module_hic_lpc4322
         - records/board/mimxrt1170_evk_qspi.yaml
+    lpc55s69_lpc55s69xpresso_if:
+        - *module_if
+        - *module_hic_lpc55s69
+        - records/board/lpc55s69_lpc55S69xpresso.yaml
     lpc55s69_mculink_bl:
         - *module_bl
         - records/hic_hal/lpc55s69.yaml
