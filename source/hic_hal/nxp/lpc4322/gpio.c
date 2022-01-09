@@ -29,12 +29,6 @@
 
 bool gpio_reset_pin_is_input  = true;
 
-
-// LPC43xx peripheral register bit masks (used by macros)
-#define CCU_CLK_CFG_RUN     (1UL << 0)
-#define CCU_CLK_CFG_AUTO    (1UL << 1)
-#define CCU_CLK_STAT_RUN    (1UL << 0)
-
 static void busy_wait(uint32_t cycles)
 {
     volatile uint32_t i;
@@ -55,6 +49,7 @@ void gpio_init(void)
     /* Configure I/O pins: function number, input buffer enabled,  */
     /*                     no pull-up/down                         */
     scu_pinmux(1, 1, GPIO_NOPULL, FUNC0);   /* P1_1  LED:       GPIO0[8]  */
+    scu_pinmux(2, 2, GPIO_NOPULL, FUNC4);   /* P1_11 UARTCTRL:  GPIO5[2]  */
     scu_pinmux(2, 11, GPIO_NOPULL, FUNC0);  /* P2_11 ISPCTRL:   GPIO1[11] */
     scu_pinmux(2, 5, GPIO_PUP,    FUNC4);   /* P2_5  nRESET:    GPIO5[5]  */
     scu_pinmux(2, 6, GPIO_NOPULL, FUNC4);   /* P2_6  nRESET_OE: GPIO5[6]  */
@@ -67,6 +62,17 @@ void gpio_init(void)
     /* Configure: ISPCTRL as output HIGH */
     X_DIR_OUT(ISPCTRL);
     X_SET(ISPCTRL);
+
+    /* Configure: ISPCTRL as output HIGH */
+    X_DIR_OUT(ISPCTRL);
+    X_SET(ISPCTRL);
+
+    /* Configure: UARTCTRL as output LOW */
+    // Control target's UART RX:
+    //   UARTCTRL high:  The LPC1549 gets uart input from the LPC4322
+    //   UARTCTRL low:   The LPC1549 gets uart input from the ISP_RX on the pinlist
+    X_DIR_OUT(UARTCTRL);
+    X_CLR(UARTCTRL);
 
     /* Configure: Reset Button */
     X_DIR_IN(nRESET);

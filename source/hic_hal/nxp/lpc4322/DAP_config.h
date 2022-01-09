@@ -40,6 +40,7 @@ This information includes:
 */
 
 #include "lpc43xx_scu.h"
+#include "RTE_Driver/USART_LPC43xx.h" // Includes LPC43xx peripheral register bit masks
 
 typedef unsigned int    BOOL;
 
@@ -148,12 +149,6 @@ typedef unsigned int    BOOL;
 #define TARGET_FIXED            0               ///< Target: 1 = known, 0 = unknown;
 
 ///@}
-
-
-// LPC43xx peripheral register bit masks (used by macros)
-#define CCU_CLK_CFG_RUN       (1UL << 0)
-#define CCU_CLK_CFG_AUTO      (1UL << 1)
-#define CCU_CLK_STAT_RUN      (1UL << 0)
 
 // State of Reset Ouput Enable buffer
 extern bool gpio_reset_pin_is_input;

@@ -67,6 +67,11 @@ COMPILER_ASSERT(DAPLINK_HIC_ID == DAPLINK_HIC_ID_LPC4322);
 #define PIN_ISPCTRL_IN_BIT    11
 #define PIN_ISPCTRL           (1<<PIN_ISPCTRL_IN_BIT)
 
+// UART Control Pin           P2_2:  GPIO5[2]
+#define PORT_UARTCTRL         5
+#define PIN_UARTCTRL_IN_BIT   2
+#define PIN_UARTCTRL          (1<<PIN_UARTCTRL_IN_BIT)
+
 // Connected LED              P1_1: GPIO0[8]
 #define PORT_LED_CONNECTED    0
 #define PIN_LED_CONNECTED_IN_BIT   8
@@ -84,5 +89,11 @@ COMPILER_ASSERT(DAPLINK_HIC_ID == DAPLINK_HIC_ID_LPC4322);
 #define X_BYTE(str)    LPC_GPIO_PORT->B[(PORT_##str << 5) + PIN_##str##_IN_BIT]
 #define X_WORD(str)    LPC_GPIO_PORT->W[(PORT_##str << 5) + PIN_##str##_IN_BIT]
 
+// cmsis-driver/uart/uart.c configuration
+#include "RTE_Driver/USART_LPC43xx.h"
+/* P2_0: U0_TXD */
+/* P2_1: U0_RXD */
+#define CMSIS_UART_INSTANCE     (Driver_USART0)
+#define CMSIS_UART_IRQ          (USART0_IRQn)
 
 #endif
