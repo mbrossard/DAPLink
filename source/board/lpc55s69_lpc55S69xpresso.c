@@ -24,7 +24,7 @@
 
 const board_info_t g_board_info = {
     .info_version = kBoardInfoVersion,
-    .board_id = "0237",
+    .board_id = "0236",
     .family_id = kNXP_LPC55xx_FamilyID,
     .flags = kEnablePageErase,
     .daplink_url_name =       "PRODINFOHTM",
