@@ -153,6 +153,7 @@ SUPPORTED_CONFIGURATIONS = [
     (   0x0231,     VENDOR_TO_FAMILY('NXP', 1),         'k20dx_frdmk22f_if',                        'k20dx_bl',         'FRDM-K22F'                             ),
     (   0x0236,     VENDOR_TO_FAMILY('NXP', 0),         'lpc4322_lpc55s69xpresso_if',               'lpc4322_bl',       'LPCXpresso55S69'                       ),
     (   0x0237,     VENDOR_TO_FAMILY('NXP', 0),         'lpc55s69_lpc55s69xpresso_if',              'lpc55s69_bl',      'LPCXpresso55S69'                       ),
+    (   0x0237,     VENDOR_TO_FAMILY('NXP', 0),         'lpc55s69_nrf52840dk_if',                   'lpc55s69_bl',      'Nordic-nRF52840-DK'                    ),
     (   0x0240,     VENDOR_TO_FAMILY('NXP', 1),         'k20dx_frdmk64f_if',                        'k20dx_bl',         'FRDM-K64F'                             ),
     (   0x0244,     VENDOR_TO_FAMILY('NXP', 3),         'lpc4322_mimxrt1170_evk_qspi_if',           'lpc4322_bl',       'MIMXRT1170'                            ),
     (   0x0250,     VENDOR_TO_FAMILY('NXP', 1),         'k20dx_frdmkw24d_if',                       'k20dx_bl',         'FRDM-KW24D512'                         ),
