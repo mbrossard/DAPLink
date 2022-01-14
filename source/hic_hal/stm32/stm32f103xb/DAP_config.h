@@ -90,13 +90,15 @@ This information includes:
 
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
+#if !defined(SWO_UART)
 #define SWO_UART                0               ///< SWO UART:  1 = available, 0 = not available
+#endif
 
 /// USART Driver instance number for the UART SWO.
-#define SWO_UART_DRIVER         0               ///< USART Driver instance number (Driver_USART#).
+#define SWO_UART_DRIVER         1               ///< USART Driver instance number (Driver_USART#).
 
 /// Maximum SWO UART Baudrate
-#define SWO_UART_MAX_BAUDRATE   10000000U       ///< SWO UART Maximum Baudrate in Hz
+#define SWO_UART_MAX_BAUDRATE   4500000U       ///< SWO UART Maximum Baudrate in Hz
 
 /// Indicate that Manchester Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
