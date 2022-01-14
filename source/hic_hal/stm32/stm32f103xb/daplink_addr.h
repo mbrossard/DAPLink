@@ -22,15 +22,12 @@
 #ifndef DAPLINK_ADDR_H
 #define DAPLINK_ADDR_H
 
-/* Device sizes */
+/* ROM sizes */
+
+#ifndef STM32F103C8
 
 #define DAPLINK_ROM_START               0x08000000
 #define DAPLINK_ROM_SIZE                0x00020000
-
-#define DAPLINK_RAM_START               0x20000000
-#define DAPLINK_RAM_SIZE                0x00005000
-
-/* ROM sizes */
 
 #define DAPLINK_ROM_BL_START            0x08000000
 #define DAPLINK_ROM_BL_SIZE             0x0000BC00
@@ -41,7 +38,26 @@
 #define DAPLINK_ROM_CONFIG_USER_START   0x0801FC00
 #define DAPLINK_ROM_CONFIG_USER_SIZE    0x00000400
 
+#else
+
+#define DAPLINK_ROM_START               0x08000000
+#define DAPLINK_ROM_SIZE                0x00010000
+
+#define DAPLINK_ROM_BL_START            0x08000000
+#define DAPLINK_ROM_BL_SIZE             0x00000000
+
+#define DAPLINK_ROM_IF_START            0x08000000
+#define DAPLINK_ROM_IF_SIZE             0x0000FC00
+
+#define DAPLINK_ROM_CONFIG_USER_START   0x0800FC00
+#define DAPLINK_ROM_CONFIG_USER_SIZE    0x00000400
+
+#endif
+
 /* RAM sizes */
+
+#define DAPLINK_RAM_START               0x20000000
+#define DAPLINK_RAM_SIZE                0x00005000
 
 #define DAPLINK_RAM_APP_START           0x20000000
 #define DAPLINK_RAM_APP_SIZE            0x00004F00

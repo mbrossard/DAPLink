@@ -1,0 +1,3 @@
+common:
+    macros:
+        - STM32F103C8
