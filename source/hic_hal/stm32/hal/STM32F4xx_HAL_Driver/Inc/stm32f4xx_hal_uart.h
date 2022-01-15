@@ -275,9 +275,9 @@ typedef  void (*pUART_RxEventCallbackTypeDef)(struct __UART_HandleTypeDef *huart
 /** @defgroup UART_Parity UART Parity
   * @{
   */
-#define UART_PARITY_NONE                    0x00000000U
-#define UART_PARITY_EVEN                    ((uint32_t)USART_CR1_PCE)
-#define UART_PARITY_ODD                     ((uint32_t)(USART_CR1_PCE | USART_CR1_PS))
+#define HAL_UART_PARITY_NONE                    0x00000000U
+#define HAL_UART_PARITY_EVEN                    ((uint32_t)USART_CR1_PCE)
+#define HAL_UART_PARITY_ODD                     ((uint32_t)(USART_CR1_PCE | USART_CR1_PS))
 /**
   * @}
   */
@@ -809,9 +809,9 @@ uint32_t              HAL_UART_GetError(UART_HandleTypeDef *huart);
 #define IS_UART_LIN_WORD_LENGTH(LENGTH) (((LENGTH) == UART_WORDLENGTH_8B))
 #define IS_UART_STOPBITS(STOPBITS) (((STOPBITS) == UART_STOPBITS_1) || \
                                     ((STOPBITS) == UART_STOPBITS_2))
-#define IS_UART_PARITY(PARITY) (((PARITY) == UART_PARITY_NONE) || \
-                                ((PARITY) == UART_PARITY_EVEN) || \
-                                ((PARITY) == UART_PARITY_ODD))
+#define IS_UART_PARITY(PARITY) (((PARITY) == HAL_UART_PARITY_NONE) || \
+                                ((PARITY) == HAL_UART_PARITY_EVEN) || \
+                                ((PARITY) == HAL_UART_PARITY_ODD))
 #define IS_UART_HARDWARE_FLOW_CONTROL(CONTROL)\
                               (((CONTROL) == UART_HWCONTROL_NONE) || \
                                ((CONTROL) == UART_HWCONTROL_RTS) || \

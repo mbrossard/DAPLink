@@ -1157,7 +1157,7 @@ HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *huart, uint8_t *pData, u
     huart->TxXferCount = Size;
 
     /* In case of 9bits/No Parity transfer, pData needs to be handled as a uint16_t pointer */
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       pdata8bits  = NULL;
       pdata16bits = (uint16_t *) pData;
@@ -1246,7 +1246,7 @@ HAL_StatusTypeDef HAL_UART_Receive(UART_HandleTypeDef *huart, uint8_t *pData, ui
     huart->RxXferCount = Size;
 
     /* In case of 9bits/No Parity transfer, pRxData needs to be handled as a uint16_t pointer */
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       pdata8bits  = NULL;
       pdata16bits = (uint16_t *) pData;
@@ -1274,7 +1274,7 @@ HAL_StatusTypeDef HAL_UART_Receive(UART_HandleTypeDef *huart, uint8_t *pData, ui
       }
       else
       {
-        if ((huart->Init.WordLength == UART_WORDLENGTH_9B) || ((huart->Init.WordLength == UART_WORDLENGTH_8B) && (huart->Init.Parity == UART_PARITY_NONE)))
+        if ((huart->Init.WordLength == UART_WORDLENGTH_9B) || ((huart->Init.WordLength == UART_WORDLENGTH_8B) && (huart->Init.Parity == HAL_UART_PARITY_NONE)))
         {
           *pdata8bits = (uint8_t)(huart->Instance->DR & (uint8_t)0x00FF);
         }
@@ -1642,7 +1642,7 @@ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle(UART_HandleTypeDef *huart, uint8_t *p
     huart->RxXferCount = Size;
 
     /* In case of 9bits/No Parity transfer, pRxData needs to be handled as a uint16_t pointer */
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       pdata8bits  = NULL;
       pdata16bits = (uint16_t *) pData;
@@ -1687,7 +1687,7 @@ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle(UART_HandleTypeDef *huart, uint8_t *p
         }
         else
         {
-           if ((huart->Init.WordLength == UART_WORDLENGTH_9B) || ((huart->Init.WordLength == UART_WORDLENGTH_8B) && (huart->Init.Parity == UART_PARITY_NONE)))
+           if ((huart->Init.WordLength == UART_WORDLENGTH_9B) || ((huart->Init.WordLength == UART_WORDLENGTH_8B) && (huart->Init.Parity == HAL_UART_PARITY_NONE)))
            {
              *pdata8bits = (uint8_t)(huart->Instance->DR & (uint8_t)0x00FF);
            }
@@ -3499,7 +3499,7 @@ static HAL_StatusTypeDef UART_Transmit_IT(UART_HandleTypeDef *huart)
   /* Check that a Tx process is ongoing */
   if (huart->gState == HAL_UART_STATE_BUSY_TX)
   {
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       tmp = (uint16_t *) huart->pTxBuffPtr;
       huart->Instance->DR = (uint16_t)(*tmp & (uint16_t)0x01FF);
@@ -3565,7 +3565,7 @@ static HAL_StatusTypeDef UART_Receive_IT(UART_HandleTypeDef *huart)
   /* Check that a Rx process is ongoing */
   if (huart->RxState == HAL_UART_STATE_BUSY_RX)
   {
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       pdata8bits  = NULL;
       pdata16bits = (uint16_t *) huart->pRxBuffPtr;
@@ -3577,7 +3577,7 @@ static HAL_StatusTypeDef UART_Receive_IT(UART_HandleTypeDef *huart)
       pdata8bits = (uint8_t *) huart->pRxBuffPtr;
       pdata16bits  = NULL;
 
-      if ((huart->Init.WordLength == UART_WORDLENGTH_9B) || ((huart->Init.WordLength == UART_WORDLENGTH_8B) && (huart->Init.Parity == UART_PARITY_NONE)))
+      if ((huart->Init.WordLength == UART_WORDLENGTH_9B) || ((huart->Init.WordLength == UART_WORDLENGTH_8B) && (huart->Init.Parity == HAL_UART_PARITY_NONE)))
       {
         *pdata8bits = (uint8_t)(huart->Instance->DR & (uint8_t)0x00FF);
       }
