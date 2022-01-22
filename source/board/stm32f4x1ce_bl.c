@@ -42,12 +42,12 @@ static const sector_info_t sectors_info[] = {
 // stm32f401 target information
 target_cfg_t target_device = {
     .sectors_info               = sectors_info,
-    .sector_info_length         = (sizeof(sectors_info))/(sizeof(sector_info_t)),
+    .sector_info_length         = (sizeof(sectors_info)) / (sizeof(sector_info_t)),
     .flash_regions[0].start     = 0x08000000 + KB(64),
-    .flash_regions[0].end       = 0x08000000 + KB(192),
+    .flash_regions[0].end       = 0x08000000 + KB(256),
     .flash_regions[0].flags     = kRegionIsDefault,
     .ram_regions[0].start       = 0x20000000,
-    .ram_regions[0].end         = 0x20010000,
+    .ram_regions[0].end         = 0x20000000 + KB(96),
     /* .flash_algo not needed for bootloader */
 };
 
