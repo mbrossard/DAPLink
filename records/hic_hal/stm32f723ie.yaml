@@ -17,13 +17,14 @@ common:
     includes:
         - source/hic_hal/stm32/stm32f723ie
         - source/hic_hal/stm32/stm32f723ie/cmsis
-        - source/hic_hal/stm32/stm32f723ie/STM32F7xx_HAL_Driver
         - source/hic_hal/stm32/stm32f723ie/STM32F7xx_HAL_Driver/Inc
+        - source/hic_hal/stm32/shared/usb_otg
     sources:
         hic_hal:
             - source/hic_hal/stm32/stm32f723ie
             - source/hic_hal/stm32/stm32f723ie/cmsis
             - source/hic_hal/stm32/stm32f723ie/STM32F7xx_HAL_Driver/Src
+            - source/hic_hal/stm32/shared/usb_otg
 
 tool_specific:
     uvision:
