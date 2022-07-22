@@ -24,6 +24,7 @@
 #include "target_config.h"
 #include "target_family.h"
 #include "target_board.h"
+#include "drag-n-drop/uf2.h"
 
 static inline uint32_t test_range(const uint32_t test, const uint32_t min, const uint32_t max)
 {
@@ -95,26 +96,23 @@ uint8_t validate_hexfile(const uint8_t *buf)
     }
 }
 
-uint8_t validate_uf2file(const uint8_t *buf)
+uint8_t validate_uf2block(const uint8_t *buf, uint32_t size)
 {
-#if 0
-    if (g_target_family && g_target_family->validate_uf2file) {
-        return g_target_family->validate_uf2file(buf);
-    }
-#endif
-    // look here for known uf2 record
-    // First magic number, UF2 signature
-    if ((buf[0] != 0x55) || (buf[1] != 0x46) || (buf[2] != 0x32) || (buf[3] != 0x0A)) {
+    if (size != sizeof(UF2_Block)) {
         return 0;
     }
-    // Second magic number, 0x9E5D5157
-    if ((buf[4] != 0x57) || (buf[5] != 0x51) || (buf[6] != 0x5D) || (buf[7] != 0x9E)) {
+
+    const UF2_Block *block = (const UF2_Block *)buf;
+
+    if (block->magicStart0 != UF2_MAGIC_START0 ||
+        block->magicStart1 != UF2_MAGIC_START1 ||
+        block->magicEnd != UF2_MAGIC_END) {
         return 0;
     }
-    // Final magic number, 0x0AB16F30
-    if ((buf[508] != 0x30) || (buf[509] != 0x6F) || (buf[510] != 0xB1) || (buf[511] != 0x0A)) {
+
+    if (block->payloadSize > sizeof(block->data)) {
         return 0;
     }
-    // TODO validate check sum , assuming 512-byte granularity .
+
     return 1;
 }
