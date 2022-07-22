@@ -24,6 +24,7 @@
 #include "file_stream.h"
 #include "util.h"
 #include "intelhex.h"
+#include "uf2.h"
 #include "flash_decoder.h"
 #include "error.h"
 #include "cmsis_os2.h"
@@ -382,7 +383,7 @@ static error_t close_hex(void *state)
 
 static bool detect_uf2(const uint8_t *data, uint32_t size)
 {
-    return 0 != validate_uf2file(data);
+    return 1 == validate_uf2block(data, size);
 }
 
 static error_t open_uf2(void *state)
@@ -398,40 +399,20 @@ static error_t open_uf2(void *state)
 static error_t write_uf2(void *state, const uint8_t *data, uint32_t size)
 {
     error_t status = ERROR_SUCCESS;
-    // uf2_state_t *uf2_state = (uf2_state_t *)state;
-    uint32_t bin_start_address = 0; // Decoded from the uf2 file, the binary buffer data starts at this address
-    uint32_t bin_buf_written = 0;   // The amount of data in the binary buffer starting at address above
+    uint32_t start_addr;
+    const flash_intf_t *flash_intf;
+    const UF2_Block *block;
 
-    // TODO deal with endianness
-
-    while (1) {
-        util_assert(size >= 512);
-        if (validate_uf2file(data) == 0) {
-            status = ERROR_HEX_PARSER; // UF2 validation error
-            break;
-        }
-
-        bin_start_address = *(uint32_t *)(data + 12);
-        bin_buf_written = *(uint32_t *)(data + 16);
-
-        status = flash_decoder_write(bin_start_address, data + 32, bin_buf_written);
-        if (status != ERROR_SUCCESS) {
-            break;
-        }
-        
-        if (*(uint32_t *)(data + 20) + 1 == *(uint32_t *)(data + 24)) {
-            // uf2_state->parsing_complete = true;
-            status = ERROR_SUCCESS_DONE;
-            break;
-        }
-
-        size -= 512;
-        data += 512;
-
-        if (size == 0) {
-            break; // status == ERROR_SUCCESS
-        }
+    if (1 != validate_uf2block(data, size)) {
+        return ERROR_FD_UNSUPPORTED_UPDATE;
     }
+
+    block = (const UF2_Block *)data;
+    if (block->flags & UF2_FLAG_NOFLASH) {
+        return ERROR_SUCCESS;
+    }
+
+    status = flash_decoder_write(block->targetAddr, block->data, block->payloadSize);
 
     return status;
 }
