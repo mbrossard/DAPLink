@@ -38,7 +38,9 @@ MEMORY
   m_cfgrom              (RW)  : ORIGIN = DAPLINK_ROM_CONFIG_USER_START, LENGTH = DAPLINK_ROM_CONFIG_USER_SIZE
   m_data                (RW)  : ORIGIN = DAPLINK_RAM_APP_START, LENGTH = DAPLINK_RAM_APP_SIZE
   m_cfgram              (RW)  : ORIGIN = DAPLINK_RAM_SHARED_START, LENGTH = DAPLINK_RAM_SHARED_SIZE
+#ifndef LPC11U35_401
   m_data_2              (RW)  : ORIGIN = DAPLINK_RAM_APP2_START, LENGTH = DAPLINK_RAM_APP2_SIZE
+#endif
   m_usb_ram             (RW)  : ORIGIN = DAPLINK_USB_RAM_START, LENGTH = DAPLINK_USB_RAM_SIZE
 }
 
@@ -173,6 +175,7 @@ SECTIONS
 
   /* Uninitialized data section */
 
+#ifndef LPC11U35_401
   /* build .bss_2 first so we don't have to exclude any sections put in here from .bss */
   .bss_2 :
   {
@@ -181,6 +184,7 @@ SECTIONS
     *(.bss.mbr)
     . = ALIGN(4);
   } > m_data_2
+#endif
 
   .bss :
   {
@@ -196,6 +200,24 @@ SECTIONS
     __END_BSS = .;
   } > m_data
 
+#ifdef LPC11U35_401
+  .heap :
+  {
+    . = ALIGN(8);
+    __end__ = .;
+    PROVIDE(end = .);
+    __HeapBase = .;
+    . += HEAP_SIZE;
+    __HeapLimit = .;
+    __heap_limit = .; /* Add for _sbrk */
+  } > m_data
+
+  .stack :
+  {
+    . = ALIGN(8);
+    . += STACK_SIZE;
+  } > m_data
+#else
   .heap :
   {
     . = ALIGN(8);
@@ -212,6 +234,7 @@ SECTIONS
     . = ALIGN(8);
     . += STACK_SIZE;
   } > m_data_2
+#endif
 
   .cfgram (NOLOAD) :
   {
@@ -226,7 +249,11 @@ SECTIONS
   } > m_usb_ram
 
   /* Initializes stack on the end of block */
+#ifdef LPC11U35_401
+  __StackTop   = ORIGIN(m_data) + LENGTH(m_data);
+#else
   __StackTop   = ORIGIN(m_data_2) + LENGTH(m_data_2);
+#endif
   __StackLimit = __StackTop - STACK_SIZE;
   PROVIDE(__stack = __StackTop);
 
@@ -234,4 +261,3 @@ SECTIONS
 
   ASSERT(__StackLimit >= __HeapLimit, "region overflowed with stack and heap")
 }
-

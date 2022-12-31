@@ -52,8 +52,10 @@
 #define DAPLINK_RAM_SHARED_START        (0x10001F00 - DAPLINK_DEV_IAP_RESERVED)
 #define DAPLINK_RAM_SHARED_SIZE         0x00000100
 
+#ifndef LPC11U35_401
 #define DAPLINK_RAM_APP2_START          0x20000000
 #define DAPLINK_RAM_APP2_SIZE           0x00000800
+#endif
 
 /* Flash Programming Info */
 
