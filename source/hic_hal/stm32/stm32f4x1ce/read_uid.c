@@ -23,8 +23,8 @@
 
 void read_unique_id(uint32_t *id)
 {
-    id[0] = 0x0;
-    id[1] = 0x0;
-    id[2] = 0x0;
+    id[0] = *(uint32_t*)(0x1FFF7A10);
+    id[1] = *(uint32_t*)(0x1FFF7A14);
+    id[2] = *(uint32_t*)(0x1FFF7A18);
     id[3] = 0xA5A5A5A5;
 }
