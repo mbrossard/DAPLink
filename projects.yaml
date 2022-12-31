@@ -471,6 +471,10 @@ projects:
         - *module_if
         - *module_hic_lpc11u35
         - records/board/nz32_sc151.yaml
+    lpc11u35_okdo_e1_if:
+        - *module_if
+        - *module_hic_lpc11u35_bulk
+        - records/board/okdo_e1.yaml
     lpc11u35_pitaya_link_if:
         - *module_if
         - *module_hic_lpc11u35
