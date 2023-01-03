@@ -50,6 +50,8 @@
 #include "stm32f723xx.h"
 #elif defined (INTERFACE_STM32F746XX)
 #include "stm32f746xx.h"
+#elif defined (INTERFACE_STM32H743XI)
+#include "stm32h743xx.h"
 #elif defined (INTERFACE_STM32H743)
 #include "stm32h7xx.h"
 #elif defined (INTERFACE_M48SSIDAE)
