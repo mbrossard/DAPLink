@@ -1116,7 +1116,7 @@ HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *huart, uint8_t *pData, u
     huart->TxXferCount = Size;
 
     /* In case of 9bits/No Parity transfer, pData needs to be handled as a uint16_t pointer */
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       pdata8bits  = NULL;
       pdata16bits = (uint16_t *) pData;
@@ -1207,7 +1207,7 @@ HAL_StatusTypeDef HAL_UART_Receive(UART_HandleTypeDef *huart, uint8_t *pData, ui
     uhMask = huart->Mask;
 
     /* In case of 9bits/No Parity transfer, pRxData needs to be handled as a uint16_t pointer */
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       pdata8bits  = NULL;
       pdata16bits = (uint16_t *) pData;
@@ -1282,7 +1282,7 @@ HAL_StatusTypeDef HAL_UART_Transmit_IT(UART_HandleTypeDef *huart, uint8_t *pData
     huart->gState = HAL_UART_STATE_BUSY_TX;
 
     /* Set the Tx ISR function pointer according to the data word length */
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       huart->TxISR = UART_TxISR_16BIT;
     }
@@ -3254,7 +3254,7 @@ HAL_StatusTypeDef UART_Start_Receive_IT(UART_HandleTypeDef *huart, uint8_t *pDat
   SET_BIT(huart->Instance->CR3, USART_CR3_EIE);
 
   /* Set the Rx ISR function pointer according to the data word length */
-  if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+  if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
   {
     huart->RxISR = UART_RxISR_16BIT;
   }
