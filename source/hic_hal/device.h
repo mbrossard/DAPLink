@@ -42,6 +42,8 @@
 #include "stm32f072xb.h"
 #elif defined (INTERFACE_STM32F103XB)
 #include "stm32f1xx.h"
+#elif defined (INTERFACE_STM32H743XI)
+#include "stm32h743xx.h"
 #elif defined (INTERFACE_M48SSIDAE)
 #include "M480.h"
 #elif defined (INTERFACE_NRF52820)
