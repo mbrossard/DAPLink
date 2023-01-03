@@ -14,15 +14,20 @@ common:
     includes:
         - source/hic_hal/stm32/stm32h743xx
         - source/hic_hal/stm32/stm32h743xx/cmsis
-        - source/hic_hal/stm32/stm32h743xx/STM32H7xx_HAL_Driver
-        - source/hic_hal/stm32/stm32h743xx/STM32H7xx_HAL_Driver/Inc
+        - source/hic_hal/stm32/hal/STM32H7xx_HAL_Driver/Inc
+        - source/hic_hal/stm32/shared/usb_otg
     sources:
         hic_hal:
             - source/hic_hal/stm32/stm32h743xx
             - source/hic_hal/stm32/stm32h743xx/cmsis
-            - source/hic_hal/stm32/stm32h743xx/STM32H7xx_HAL_Driver/Src
+            - source/hic_hal/stm32/hal/STM32H7xx_HAL_Driver/Src
+            - source/hic_hal/stm32/shared/usb_otg
 tool_specific:
     armcc:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32h743xx/armcc
+    armclang:
         sources:
             hic_hal:
                 - source/hic_hal/stm32/stm32h743xx/armcc
