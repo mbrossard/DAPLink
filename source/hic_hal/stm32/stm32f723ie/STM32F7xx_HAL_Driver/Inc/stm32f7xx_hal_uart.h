@@ -358,9 +358,9 @@ typedef  void (*pUART_RxEventCallbackTypeDef)
 /** @defgroup UART_Parity  UART Parity
   * @{
   */
-#define UART_PARITY_NONE                    0x00000000U                        /*!< No parity   */
-#define UART_PARITY_EVEN                    USART_CR1_PCE                      /*!< Even parity */
-#define UART_PARITY_ODD                     (USART_CR1_PCE | USART_CR1_PS)     /*!< Odd parity  */
+#define HAL_UART_PARITY_NONE                0x00000000U                        /*!< No parity   */
+#define HAL_UART_PARITY_EVEN                USART_CR1_PCE                      /*!< Even parity */
+#define HAL_UART_PARITY_ODD                 (USART_CR1_PCE | USART_CR1_PS)     /*!< Odd parity  */
 /**
   * @}
   */

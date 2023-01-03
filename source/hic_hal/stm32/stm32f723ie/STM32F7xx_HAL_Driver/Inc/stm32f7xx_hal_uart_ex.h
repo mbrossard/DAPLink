@@ -353,7 +353,7 @@ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_
   do {                                                                \
     if ((__HANDLE__)->Init.WordLength == UART_WORDLENGTH_9B)          \
     {                                                                 \
-      if ((__HANDLE__)->Init.Parity == UART_PARITY_NONE)              \
+      if ((__HANDLE__)->Init.Parity == HAL_UART_PARITY_NONE)          \
       {                                                               \
         (__HANDLE__)->Mask = 0x01FFU ;                                \
       }                                                               \
@@ -364,7 +364,7 @@ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_
     }                                                                 \
     else if ((__HANDLE__)->Init.WordLength == UART_WORDLENGTH_8B)     \
     {                                                                 \
-      if ((__HANDLE__)->Init.Parity == UART_PARITY_NONE)              \
+      if ((__HANDLE__)->Init.Parity == HAL_UART_PARITY_NONE)          \
       {                                                               \
         (__HANDLE__)->Mask = 0x00FFU ;                                \
       }                                                               \
@@ -375,7 +375,7 @@ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *huart, uint8_
     }                                                                 \
     else if ((__HANDLE__)->Init.WordLength == UART_WORDLENGTH_7B)     \
     {                                                                 \
-      if ((__HANDLE__)->Init.Parity == UART_PARITY_NONE)              \
+      if ((__HANDLE__)->Init.Parity == HAL_UART_PARITY_NONE)          \
       {                                                               \
         (__HANDLE__)->Mask = 0x007FU ;                                \
       }                                                               \
