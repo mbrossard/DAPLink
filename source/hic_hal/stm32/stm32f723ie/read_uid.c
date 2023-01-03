@@ -29,5 +29,5 @@ void read_unique_id(uint32_t *id)
     id[0] = uid_base[0];
     id[1] = uid_base[1];
     id[2] = uid_base[2];
-    id[3] = 0xA5A5A5A5;
+    id[3] = 0xA5A5F723;
 }
