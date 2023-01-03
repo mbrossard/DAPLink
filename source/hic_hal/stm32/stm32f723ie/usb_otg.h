@@ -26,13 +26,23 @@
 #include "stm32f7xx_hal.h"
 #include "util.h"
 
+#if defined(FORCE_USB_FS)
+
+#define USB_OTG_USE_FS                  1
+#define USB_OTG_ENDPOINT_NUM            5
+
+#elif defined(USE_EMBEDDED_FS)
+
+#define USB_OTG_USE_HS                  1
+#define USB_OTG_HS_USE_EMBEDDED_FS_PHY  1
+#define USB_OTG_ENDPOINT_NUM            8
+
+#else
+
 #define USB_OTG_USE_HS                  1
 #define USB_OTG_HS_USE_EMBEDDED_HS_PHY  1
 #define USB_OTG_ENDPOINT_NUM            8
-#define USBD_TX1_FIFO_SIZE             (512U)
-#define USBD_TX2_FIFO_SIZE             (512U)
-#define USBD_TX3_FIFO_SIZE             (512U)
-#define USBD_TX4_FIFO_SIZE             (512U)
-#define USBD_TX5_FIFO_SIZE             (512U)
+
+#endif
 
 #endif
