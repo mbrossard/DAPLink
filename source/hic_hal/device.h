@@ -50,6 +50,8 @@
 #include "nrf52820.h"
 #elif defined (INTERFACE_NRF52840)
 #include "nrf52840.h"
+#elif defined (INTERFACE_NRF5340)
+#include "nrf5340_application.h"
 #else
 #error "CMSIS core headers needed"
 #endif

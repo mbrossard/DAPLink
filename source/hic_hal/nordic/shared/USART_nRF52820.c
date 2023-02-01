@@ -187,28 +187,28 @@ static int32_t USART_Uninitialize (void) {
   NRF_UARTE0->PSEL.TXD = RTE_USART0_TX_PIN_NUM | UARTE_PSEL_TXD_CONNECT_Msk;
 
   /* Configure Tx pin as GPIO with configuration as after reset */
-  NRF_GPIO->PIN_CNF[RTE_USART0_TX_PIN_NUM] = 2U;
+  nrf_gpio_cfg_pincnf_set(RTE_USART0_TX_PIN_NUM, 2U);
 #endif
 #if (RTE_USART0_RX_EN != 0U)            /* If Rx Pin is enabled in config file */
   /* Disconnect RXD */
   NRF_UARTE0->PSEL.RXD = RTE_USART0_RX_PIN_NUM | UARTE_PSEL_RXD_CONNECT_Msk;
 
   /* Configure Rx pin as GPIO with configuration as after reset */
-  NRF_GPIO->PIN_CNF[RTE_USART0_RX_PIN_NUM] = 2U;
+  nrf_gpio_cfg_pincnf_set(RTE_USART0_RX_PIN_NUM, 2U);
 #endif
 #if (RTE_USART0_CTS_EN != 0U)           /* If CTS Pin is enabled in config file */
   /* Disconnect CTS */
   NRF_UARTE0->PSEL.CTS = RTE_USART0_CTS_PIN_NUM | UARTE_PSEL_CTS_CONNECT_Msk;
 
   /* Configure CTS pin as GPIO with configuration as after reset */
-  NRF_GPIO->PIN_CNF[RTE_USART0_CTS_PIN_NUM] = 2U;
+  nrf_gpio_cfg_pincnf_set(RTE_USART0_CTS_PIN_NUM, 2U);
 #endif
 #if (RTE_USART0_RTS_EN != 0U)           /* If RTS Pin is enabled in config file */
   /* Disconnect RTS */
   NRF_UARTE0->PSEL.RTS = RTE_USART0_RTS_PIN_NUM | UARTE_PSEL_RTS_CONNECT_Msk;
 
   /* Configure RTS pin as GPIO with configuration as after reset */
-  NRF_GPIO->PIN_CNF[RTE_USART0_RTS_PIN_NUM] = 2U;
+  nrf_gpio_cfg_pincnf_set(RTE_USART0_RTS_PIN_NUM, 2U);
 #endif
 
   driver_state = 0U;
@@ -467,14 +467,14 @@ static int32_t USART_Control (uint32_t control, uint32_t arg) {
           NRF_UARTE0->PSEL.CTS = RTE_USART0_CTS_PIN_NUM | UARTE_PSEL_CTS_CONNECT_Msk;
 
           /* Configure CTS pin as GPIO input with pull-up */
-          NRF_GPIO->PIN_CNF[RTE_USART0_CTS_PIN_NUM] = GPIO_PIN_CNF_PULL_Msk;
+          nrf_gpio_cfg_pincnf_set(RTE_USART0_CTS_PIN_NUM, GPIO_PIN_CNF_PULL_Msk);
 #endif
 #if (RTE_USART0_RTS_EN != 0U)           /* If RTS Pin is enabled in config file */
           /* Disconnect RTS */
           NRF_UARTE0->PSEL.RTS = RTE_USART0_RTS_PIN_NUM | UARTE_PSEL_RTS_CONNECT_Msk;
 
           /* Configure RTS pin as GPIO output with pull-up */
-          NRF_GPIO->PIN_CNF[RTE_USART0_RTS_PIN_NUM] = GPIO_PIN_CNF_PULL_Msk | GPIO_PIN_CNF_DIR_Output | GPIO_PIN_CNF_INPUT_Msk;
+          nrf_gpio_cfg_pincnf_set(RTE_USART0_RTS_PIN_NUM, GPIO_PIN_CNF_PULL_Msk | GPIO_PIN_CNF_DIR_Output | GPIO_PIN_CNF_INPUT_Msk);
 #endif
           /* Disable hardware flow control */
           NRF_UARTE0->CONFIG &= ~UARTE_CONFIG_HWFC_Msk;
@@ -482,14 +482,14 @@ static int32_t USART_Control (uint32_t control, uint32_t arg) {
         case ARM_USART_FLOW_CONTROL_RTS_CTS:
 #if (RTE_USART0_CTS_EN != 0U)           /* If CTS Pin is enabled in config file */
           /* Configure CTS pin as GPIO input with pull-up */
-          NRF_GPIO->PIN_CNF[RTE_USART0_CTS_PIN_NUM] = GPIO_PIN_CNF_PULL_Msk;
+          nrf_gpio_cfg_pincnf_set(RTE_USART0_CTS_PIN_NUM, GPIO_PIN_CNF_PULL_Msk);
 
           /* Connect CTS */
           NRF_UARTE0->PSEL.CTS = RTE_USART0_CTS_PIN_NUM;
 #endif
 #if (RTE_USART0_RTS_EN != 0U)           /* If RTS Pin is enabled in config file */
           /* Configure RTS pin as GPIO output with pull-up */
-          NRF_GPIO->PIN_CNF[RTE_USART0_RTS_PIN_NUM] = GPIO_PIN_CNF_PULL_Msk | GPIO_PIN_CNF_DIR_Output | GPIO_PIN_CNF_INPUT_Msk;
+          nrf_gpio_cfg_pincnf_set(RTE_USART0_RTS_PIN_NUM, GPIO_PIN_CNF_PULL_Msk | GPIO_PIN_CNF_DIR_Output | GPIO_PIN_CNF_INPUT_Msk);
 
           /* Connect RTS */
           NRF_UARTE0->PSEL.RTS = RTE_USART0_RTS_PIN_NUM;
@@ -577,8 +577,7 @@ static int32_t USART_Control (uint32_t control, uint32_t arg) {
           break;
         case 1:                         /* Enable transmitter */
           /* Configure Tx pin as GPIO output with pull-up */
-          NRF_GPIO->PIN_CNF[RTE_USART0_TX_PIN_NUM] = GPIO_PIN_CNF_PULL_Msk | GPIO_PIN_CNF_DIR_Output | GPIO_PIN_CNF_INPUT_Msk;
-
+          nrf_gpio_cfg_pincnf_set(RTE_USART0_TX_PIN_NUM, GPIO_PIN_CNF_PULL_Msk | GPIO_PIN_CNF_DIR_Output | GPIO_PIN_CNF_INPUT_Msk);
           /* Connect TXD */
           NRF_UARTE0->PSEL.TXD = RTE_USART0_TX_PIN_NUM;
           break;
@@ -604,8 +603,7 @@ static int32_t USART_Control (uint32_t control, uint32_t arg) {
           break;
         case 1:                         /* Enable receiver */
           /* Configure Rx pin as GPIO input with pull-up */
-          NRF_GPIO->PIN_CNF[RTE_USART0_RX_PIN_NUM] = GPIO_PIN_CNF_PULL_Msk;
-
+          nrf_gpio_cfg_pincnf_set(RTE_USART0_RX_PIN_NUM, GPIO_PIN_CNF_PULL_Msk);
           /* Connect RXD */
           NRF_UARTE0->PSEL.RXD = RTE_USART0_RX_PIN_NUM;
 
@@ -715,7 +713,7 @@ static int32_t USART_SetModemControl (ARM_USART_MODEM_CONTROL control) {
           /* If RTS pin is not configured as GPIO Output */
           return ARM_DRIVER_ERROR;
         }
-        NRF_GPIO->OUTSET = (1U << RTE_USART0_RTS_PIN_NUM);
+	nrf_gpio_pin_write(RTE_USART0_RTS_PIN_NUM, 1);
 #else
         return ARM_DRIVER_ERROR;
 #endif
@@ -734,7 +732,7 @@ static int32_t USART_SetModemControl (ARM_USART_MODEM_CONTROL control) {
           /* If RTS pin is not configured as GPIO Output */
           return ARM_DRIVER_ERROR;
         }
-        NRF_GPIO->OUTCLR = (1U << RTE_USART0_RTS_PIN_NUM);
+	nrf_gpio_pin_write(RTE_USART0_RTS_PIN_NUM, 0);
 #else
         return ARM_DRIVER_ERROR;
 #endif
@@ -769,7 +767,7 @@ static ARM_USART_MODEM_STATUS USART_GetModemStatus (void) {
         (cts_gpio_cnf <= 32U) ||
        ((NRF_GPIOTE->CONFIG[cts_gpio_cnf-1U] & 3) == 0U)) {
       /* If CTS pin is configured as GPIO Input */
-      if ((NRF_GPIO->IN & (1U << RTE_USART0_RTS_PIN_NUM)) == 0U) {
+      if (nrf_gpio_pin_read(RTE_USART0_RTS_PIN_NUM) == 0U) {
         modem_status.cts = 1U;
       }
     }
@@ -840,16 +838,16 @@ void UARTE0_UART0_IRQHandler (void) {
     error_src = NRF_UARTE0->ERRORSRC;
     NRF_UARTE0->ERRORSRC     = error_src;
     NRF_UARTE0->EVENTS_ERROR = 0U;
-    if ((error_src & UART_ERRORSRC_BREAK_Msk) != 0U) {
+    if ((error_src & UARTE_ERRORSRC_BREAK_Msk) != 0U) {
       events |= ARM_USART_EVENT_RX_BREAK;
     }
-    if ((error_src & UART_ERRORSRC_FRAMING_Msk) != 0U) {
+    if ((error_src & UARTE_ERRORSRC_FRAMING_Msk) != 0U) {
       events |= ARM_USART_EVENT_RX_FRAMING_ERROR;
     }
-    if ((error_src & UART_ERRORSRC_PARITY_Msk) != 0U) {
+    if ((error_src & UARTE_ERRORSRC_PARITY_Msk) != 0U) {
       events |= ARM_USART_EVENT_RX_PARITY_ERROR;
     }
-    if ((error_src & UART_ERRORSRC_OVERRUN_Msk) != 0U) {
+    if ((error_src & UARTE_ERRORSRC_OVERRUN_Msk) != 0U) {
       events |= ARM_USART_EVENT_RX_OVERFLOW;
     }
   }
