@@ -1,0 +1,49 @@
+common:
+    target:
+        - cortex-m33
+    core:
+        - Cortex-M33
+    macros:
+        - INTERFACE_NRF5340
+        - NRF5340_XXAA_APPLICATION
+        - DAPLINK_HIC_ID=0x6E005340  # DAPLINK_HIC_ID_NRF5340
+        - OS_CLOCK=64000000
+        - __DAPLINK
+    includes:
+        - source/hic_hal/nordic/nrf5340
+        - source/hic_hal/nordic/nrf5340/cmsis
+        - source/hic_hal/nordic/nrfx
+        - source/hic_hal/nordic/nrfx/drivers
+        - source/hic_hal/nordic/nrfx/drivers/include
+        - source/hic_hal/nordic/nrfx/hal
+        - source/hic_hal/nordic/nrfx/mdk
+    sources:
+        hic_hal:
+            - source/hic_hal/nordic/nrf5340
+            - source/hic_hal/nordic/nrf5340/cmsis
+            - source/hic_hal/nordic/nrfx/drivers
+            - source/hic_hal/nordic/shared
+
+tool_specific:
+    uvision:
+        misc:
+            ld_flags:
+                - --predefine="-I..\..\..\source\hic_hal\nordic\nrf5340"
+        sources:
+            hic_hal:
+                - source/hic_hal/nordic/nrf5340/arm
+    armcc:
+        sources:
+            hic_hal:
+                - source/hic_hal/nordic/nrf5340/arm
+    armclang:
+        misc:
+            common_flags:
+                - -mfpu=none
+        sources:
+            hic_hal:
+                - source/hic_hal/nordic/nrf5340/arm
+    gcc_arm:
+        sources:
+            hic_hal:
+                - source/hic_hal/nordic/nrf5340/gcc

@@ -54,6 +54,7 @@
 
 #include "nrf.h"                        /* Device header */
 #include "nrfx.h"
+#include "nrfx_usbd.h"
 #include "nrf52_erratas.h"
 
 #define  __NO_USB_LIB_C
@@ -87,43 +88,6 @@ static uint32_t    ep0_dir;
 static ep_config_t ep_config[2][USBD_EP_NUM_MAX];
 static uint32_t    ep_buf   [2][USBD_EP_NUM_MAX][64/4];
 
-
-/* Helper functions */
-
-/* Enable USB Device */
-void usbd_enable (void) {
-  uint32_t i;
-
-  if (nrf52_errata_187()) {             /* If errata [187] (USBD: USB cannot be enabled) is present */
-    *(volatile uint32_t *)0x4006EC00 = 0x00009375;
-    *(volatile uint32_t *)0x4006ED14 = 0x00000003;
-    *(volatile uint32_t *)0x4006EC00 = 0x00009375;
-  }
-
-  /* Enable the peripheral */
-  NRF_USBD->ENABLE = USBD_ENABLE_ENABLE_Enabled << USBD_ENABLE_ENABLE_Pos;
-
-  /* Waiting for peripheral to enable (max 10 ms), this should take a few �s */
-  for (i = 160000U; i != 0U; i--) {
-    if ((NRF_USBD->EVENTCAUSE & USBD_EVENTCAUSE_READY_Msk) != 0U) {
-      break;
-    }
-  }
-
-  /* Enable ready event */
-  NRF_USBD->EVENTCAUSE &= ~USBD_EVENTCAUSE_READY_Msk;
-
-  if (nrf52_errata_187()) {             /* If errata [187] (USBD: USB cannot be enabled) is present */
-    *(volatile uint32_t *)0x4006EC00 = 0x00009375;
-    *(volatile uint32_t *)0x4006ED14 = 0x00000000;
-    *(volatile uint32_t *)0x4006EC00 = 0x00009375;
-  }
-}
-
-/* Disable USB Device */
-void usbd_disable (void) {
-  NRF_USBD->ENABLE = USBD_ENABLE_ENABLE_Disabled << USBD_ENABLE_ENABLE_Pos;
-}
 
 /* Do EasyDMA transfer to/from USB controller's internal buffer */
 void usbd_dma (uint32_t EPNum, uint32_t *buf, uint32_t cnt) {
@@ -166,6 +130,20 @@ void usbd_dma (uint32_t EPNum, uint32_t *buf, uint32_t cnt) {
 #endif
 }
 
+#if NRF_POWER_HAS_USBREG
+#include "nrfx_power.h"
+static bool usbreg_ready = false;
+/**
+ * @brief The handler of USB power events
+ */
+void usbevt_handler(nrfx_power_usb_evt_t event)
+{
+  if (event == NRFX_POWER_USB_EVT_READY) {
+    usbreg_ready = true;
+  }
+}
+
+#endif
 
 /* Driver functions */
 
@@ -181,19 +159,17 @@ void USBD_Init (void) {
   os_mut_init(&usbd_hw_mutex);
 #endif
 
-  if (nrf52_errata_223()) {             /* If errata [223] (USBD: Unexpected behavior after reset) is present */
-    usbd_enable();
-    usbd_disable();
-  }
+  nrfx_usbd_enable();
+#if NRF_POWER_HAS_USBREG
 
-  usbd_enable();
+  struct nrfx_power_usbevt_config_t usbevt_config = {
+    .handler = usbevt_handler,
+  };
+  nrfx_power_usbevt_init(&usbevt_config);
+  while(!usbreg_ready) {}
+#endif
 
-  /* Enable only USB Reset interrupt */
-  NRF_USBD->INTENSET = USBD_INTEN_USBRESET_Msk;
-
-  NVIC_SetPriority(USBD_IRQn, NRFX_USBD_DEFAULT_CONFIG_IRQ_PRIORITY);
-  NVIC_ClearPendingIRQ(USBD_IRQn);
-  NVIC_EnableIRQ(USBD_IRQn);
+  nrfx_usbd_start(true);
 }
 
 
@@ -823,7 +799,7 @@ void USBD_IRQHandler (void) {
 #endif
     /* Enable Status stage */
     if (local_ep0_status_next) {
-		NRF_USBD->TASKS_EP0STATUS = USBD_TASKS_EP0STATUS_TASKS_EP0STATUS_Trigger;
+    NRF_USBD->TASKS_EP0STATUS = USBD_TASKS_EP0STATUS_TASKS_EP0STATUS_Trigger;
     }
   }
 

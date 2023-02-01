@@ -46,4 +46,12 @@
 #define RX_DIR                         (0U)
 #define TX_DIR                         (1U)
 
+NRF_STATIC_INLINE void nrf_gpio_cfg_pincnf_set(uint32_t pin_number,
+                                               uint32_t value)
+{
+    NRF_GPIO_Type * reg = nrf_gpio_pin_port_decode(&pin_number);
+
+    reg->PIN_CNF[pin_number] = value;
+}
+
 #endif /* __USART_nRF52820_H */
