@@ -1,0 +1,4 @@
+common:
+    sources:
+        board:
+            - source/board/nrf5340_bl.c
