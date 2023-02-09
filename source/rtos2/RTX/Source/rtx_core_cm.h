@@ -91,7 +91,8 @@ __STATIC_INLINE uint32_t xPSR_InitVal (bool_t privileged, bool_t thumb) {
 #define STACK_FRAME_INIT_VAL    0xBCU
 // --- Begin DAPLink change
 // - Change EXC_RETURN.ES and .S to 0 (NS)
-#elif (defined(__ARM_ARCH_8M_MAIN__) && (__ARM_ARCH_8M_MAIN__ != 0))
+#elif ((defined(__ARM_ARCH_8M_MAIN__) && (__ARM_ARCH_8M_MAIN__ != 0)) && \
+       (defined(INTERFACE_LPC55XX)))
 #define STACK_FRAME_INIT_VAL    0xBCU
 // --- End DAPLink change
 #else
