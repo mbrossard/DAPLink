@@ -6,8 +6,3 @@ common:
         - CSI_VALUE=4000000
         - HSI_VALUE=64000000
         - OPENH743I
-        - MAIN_TASK_STACK=2048
-        - DAPLINK_STACK_SIZE=1024
-    sources:
-        board:
-            - source/board/stm32h743xi_bl.c
