@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 ARM Limited. All rights reserved.
+ * Copyright (c) 2013-2021 ARM Limited. All rights reserved.
  *
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -17,8 +17,8 @@
  *
  * ----------------------------------------------------------------------
  *
- * $Date:        1. December 2017
- * $Revision:    V2.0.0
+ * $Date:        16. June 2021
+ * $Revision:    V2.1.0
  *
  * Project:      CMSIS-DAP Configuration
  * Title:        DAP_config.h CMSIS-DAP Configuration File (Template)
@@ -28,6 +28,7 @@
 #ifndef __DAP_CONFIG_H__
 #define __DAP_CONFIG_H__
 
+#include "IO_Config.h"
 
 //**************************************************************************************************
 /**
@@ -53,7 +54,7 @@ This information includes:
 
 /// Processor Clock of the Cortex-M MCU used in the Debug Unit.
 /// This value is used to calculate the SWD/JTAG clock speed.
-#define CPU_CLOCK               100000000U      ///< Specifies the CPU Clock in Hz.
+#define CPU_CLOCK               SystemCoreClock      ///< Specifies the CPU Clock in Hz.
 
 /// Number of processor cycles for I/O Port write operations.
 /// This value is used to calculate the SWD/JTAG clock speed that is generated with I/O
@@ -69,7 +70,7 @@ This information includes:
 
 /// Indicate that JTAG communication mode is available at the Debug Port.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
-#define DAP_JTAG                1               ///< JTAG Mode: 1 = available, 0 = not available.
+#define DAP_JTAG                0               ///< JTAG Mode: 1 = available, 0 = not available.
 
 /// Configure maximum number of JTAG devices on the scan chain connected to the Debug Access Port.
 /// This setting impacts the RAM requirements of the Debug Unit. Valid range is 1 .. 255.
@@ -88,17 +89,20 @@ This information includes:
 /// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. Typical vales are 64 for Full-speed USB HID or WinUSB,
 /// 1024 for High-speed USB HID and 512 for High-speed USB WinUSB.
-#define DAP_PACKET_SIZE         512U            ///< Specifies Packet Size in bytes.
+#define DAP_PACKET_SIZE         64U             ///< Specifies Packet Size in bytes.
 
 /// Maximum Package Buffers for Command and Response data.
 /// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. For devices with limited RAM or USB buffer the
 /// setting can be reduced (valid range is 1 .. 255).
-#define DAP_PACKET_COUNT        8U              ///< Specifies number of packets buffered.
+#define DAP_PACKET_COUNT        1U              ///< Specifies number of packets buffered.
 
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
 #define SWO_UART                0               ///< SWO UART:  1 = available, 0 = not available.
+
+/// USART Driver instance number for the UART SWO.
+#define SWO_UART_DRIVER         0               ///< USART Driver instance number (Driver_USART#).
 
 /// Maximum SWO UART Baudrate.
 #define SWO_UART_MAX_BAUDRATE   10000000U       ///< SWO UART Maximum Baudrate in Hz.
@@ -116,16 +120,28 @@ This information includes:
 /// Clock frequency of the Test Domain Timer. Timer value is returned with \ref TIMESTAMP_GET.
 #define TIMESTAMP_CLOCK         100000000U      ///< Timestamp clock in Hz (0 = timestamps not supported).
 
+/// Indicate that UART Communication Port is available.
+/// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
+#define DAP_UART                0               ///< DAP UART:  1 = available, 0 = not available.
+
+/// USART Driver instance number for the UART Communication Port.
+#define DAP_UART_DRIVER         1               ///< USART Driver instance number (Driver_USART#).
+
+/// UART Receive Buffer Size.
+#define DAP_UART_RX_BUFFER_SIZE 1024U           ///< Uart Receive Buffer Size in bytes (must be 2^n).
+
+/// UART Transmit Buffer Size.
+#define DAP_UART_TX_BUFFER_SIZE 1024U           ///< Uart Transmit Buffer Size in bytes (must be 2^n).
+
+/// Indicate that UART Communication via USB COM Port is available.
+/// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
+#define DAP_UART_USB_COM_PORT   0               ///< USB COM Port:  1 = available, 0 = not available.
+
 /// Debug Unit is connected to fixed Target Device.
 /// The Debug Unit may be part of an evaluation board and always connected to a fixed
-/// known device.  In this case a Device Vendor and Device Name string is stored which
-/// may be used by the debugger or IDE to configure device parameters.
-#define TARGET_DEVICE_FIXED     0               ///< Target Device: 1 = known, 0 = unknown;
-
-#if TARGET_DEVICE_FIXED
-#define TARGET_DEVICE_VENDOR    "ARM"           ///< String indicating the Silicon Vendor
-#define TARGET_DEVICE_NAME      "Cortex-M4"     ///< String indicating the Target Device
-#endif
+/// known device. In this case a Device Vendor, Device Name, Board Vendor and Board Name strings
+/// are stored and may be used by the debugger or IDE to configure device parameters.
+#define TARGET_FIXED            0               ///< Target: 1 = known, 0 = unknown;
 
 ///@}
 
@@ -165,6 +181,68 @@ of the same I/O port. The following SWDIO I/O Pin functions are provided:
  - \ref PIN_SWDIO_OUT to write to the SWDIO I/O pin with utmost possible speed.
 */
 
+__STATIC_INLINE void pin_out_init(GPIO_TypeDef* port, uint32_t pin, uint8_t bit) {
+    GPIO_InitTypeDef GPIO_InitStruct = {
+        .Pin  = pin,
+        .Mode = GPIO_MODE_OUTPUT_PP,
+        .Pull  = GPIO_NOPULL,
+        .Speed = GPIO_SPEED_FREQ_VERY_HIGH,
+    };
+    HAL_GPIO_Init(port, &GPIO_InitStruct);
+    port->BSRR = pin;
+}
+
+__STATIC_INLINE void pin_out_od_init(GPIO_TypeDef* port, uint32_t pin, uint8_t bit) {
+    GPIO_InitTypeDef GPIO_InitStruct = {
+        .Pin   = pin,
+        .Mode  = GPIO_MODE_OUTPUT_OD,
+        .Pull  = GPIO_PULLUP,
+        .Speed = GPIO_SPEED_FREQ_VERY_HIGH,
+    };
+    HAL_GPIO_Init(port, &GPIO_InitStruct);
+    port->BSRR = pin;
+}
+
+__STATIC_INLINE void pin_in_init(GPIO_TypeDef* port, uint32_t pin, uint8_t bit, uint8_t mode) {
+    GPIO_InitTypeDef GPIO_InitStruct = {
+        .Pin   = pin,
+        .Mode  = mode == 0 ? GPIO_MODE_ANALOG : GPIO_MODE_INPUT,
+        .Pull  = GPIO_PULLUP,
+        .Speed = GPIO_SPEED_FREQ_VERY_HIGH,
+    };
+    HAL_GPIO_Init(port, &GPIO_InitStruct);
+
+    if (mode == 1) {
+        port->BSRR = pin;
+    } else if (mode == 2) {
+        port->BSRR = pin << 16;
+    }
+}
+
+__STATIC_INLINE uint32_t read_input(GPIO_TypeDef* port, uint32_t pin) {
+    return (port->IDR & pin) ? 1 : 0;
+}
+
+__STATIC_INLINE uint32_t read_output(GPIO_TypeDef* port, uint32_t pin) {
+    return (port->ODR & pin) ? 1 : 0;
+}
+
+__STATIC_INLINE uint32_t set_gpio(GPIO_TypeDef* port, uint32_t pin) {
+    port->BSRR = pin;
+}
+
+__STATIC_INLINE uint32_t clear_gpio(GPIO_TypeDef* port, uint32_t pin) {
+    port->BSRR = pin << 16;
+}
+
+__STATIC_INLINE void out_gpio(GPIO_TypeDef* port, uint32_t pin, uint32_t bit) {
+    if (bit & 1) {
+       clear_gpio(port, pin);
+    } else {
+       set_gpio(port, pin);
+    }
+}
+
 
 // Configure DAP I/O pins ------------------------------
 
@@ -174,7 +252,22 @@ Configures the DAP Hardware I/O pins for JTAG mode:
  - TDO to input mode.
 */
 __STATIC_INLINE void PORT_JTAG_SETUP (void) {
-  ;
+#if (DAP_JTAG != 0)
+    // TCK output
+    pin_out_init(JTAG_TCK_PIN_PORT, JTAG_TCK_PIN, JTAG_TCK_PIN_Bit);
+    // TMS output
+    pin_out_init(JTAG_TMS_PIN_PORT, JTAG_TMS_PIN, JTAG_TMS_PIN_Bit);
+#if defined(SWDIO_IN_PIN)
+    // SWDIO/TMS input
+    pin_in_init(SWDIO_IN_PIN_PORT, SWDIO_IN_PIN, SWDIO_IN_PIN_Bit, 1);
+#endif
+	  // TDI output
+    pin_out_init(JTAG_TDI_PIN_PORT, JTAG_TDI_PIN, JTAG_TDI_PIN_Bit);
+		// TDO input
+    pin_in_init(JTAG_TDO_PIN_PORT, JTAG_TDO_PIN, JTAG_TDO_PIN_Bit, 1);
+    // RESET output OD HIGH
+    pin_out_od_init(nRESET_PIN_PORT, nRESET_PIN, nRESET_PIN_Bit);
+#endif
 }
 
 /** Setup SWD I/O pins: SWCLK, SWDIO, and nRESET.
@@ -183,7 +276,16 @@ Configures the DAP Hardware I/O pins for Serial Wire Debug (SWD) mode:
  - TDI, nTRST to HighZ mode (pins are unused in SWD mode).
 */
 __STATIC_INLINE void PORT_SWD_SETUP (void) {
-  ;
+    // SWCLK output
+    pin_out_init(SWCLK_TCK_PIN_PORT, SWCLK_TCK_PIN, SWCLK_TCK_PIN_Bit);
+    // SWDIO (OUT) output
+    pin_out_init(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN, SWDIO_OUT_PIN_Bit);
+#if defined(SWDIO_IN_PIN)
+    // SWDIO (IN) input
+    pin_in_init(SWDIO_IN_PIN_PORT, SWDIO_IN_PIN, SWDIO_IN_PIN_Bit, 1);
+#endif
+    // RESET output OD HIGH
+    pin_out_od_init(nRESET_PIN_PORT, nRESET_PIN, nRESET_PIN_Bit);
 }
 
 /** Disable JTAG/SWD I/O Pins.
@@ -191,7 +293,11 @@ Disables the DAP Hardware I/O pins which configures:
  - TCK/SWCLK, TMS/SWDIO, TDI, TDO, nTRST, nRESET to High-Z mode.
 */
 __STATIC_INLINE void PORT_OFF (void) {
-  ;
+    pin_in_init(SWCLK_TCK_PIN_PORT, SWCLK_TCK_PIN, SWCLK_TCK_PIN_Bit, 0);
+    pin_in_init(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN, SWDIO_OUT_PIN_Bit, 0);
+#if defined(SWDIO_IN_PIN)
+    pin_in_init(SWDIO_IN_PIN_PORT, SWDIO_IN_PIN, SWDIO_IN_PIN_Bit, 0);
+#endif
 }
 
 
@@ -201,21 +307,21 @@ __STATIC_INLINE void PORT_OFF (void) {
 \return Current status of the SWCLK/TCK DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_SWCLK_TCK_IN  (void) {
-  return (0U);
+    return read_output(SWCLK_TCK_PIN_PORT, SWCLK_TCK_PIN);
 }
 
 /** SWCLK/TCK I/O pin: Set Output to High.
 Set the SWCLK/TCK DAP hardware I/O pin to high level.
 */
 __STATIC_FORCEINLINE void     PIN_SWCLK_TCK_SET (void) {
-  ;
+    set_gpio(SWCLK_TCK_PIN_PORT, SWCLK_TCK_PIN);
 }
 
 /** SWCLK/TCK I/O pin: Set Output to Low.
 Set the SWCLK/TCK DAP hardware I/O pin to low level.
 */
 __STATIC_FORCEINLINE void     PIN_SWCLK_TCK_CLR (void) {
-  ;
+    clear_gpio(SWCLK_TCK_PIN_PORT, SWCLK_TCK_PIN);
 }
 
 
@@ -225,35 +331,39 @@ __STATIC_FORCEINLINE void     PIN_SWCLK_TCK_CLR (void) {
 \return Current status of the SWDIO/TMS DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_SWDIO_TMS_IN  (void) {
-  return (0U);
+    return read_input(SWDIO_IN_PIN_PORT, SWDIO_IN_PIN);
 }
 
 /** SWDIO/TMS I/O pin: Set Output to High.
 Set the SWDIO/TMS DAP hardware I/O pin to high level.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_TMS_SET (void) {
-  ;
+    set_gpio(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN);
 }
 
 /** SWDIO/TMS I/O pin: Set Output to Low.
 Set the SWDIO/TMS DAP hardware I/O pin to low level.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_TMS_CLR (void) {
-  ;
+    clear_gpio(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN);
 }
 
 /** SWDIO I/O pin: Get Input (used in SWD mode only).
 \return Current status of the SWDIO DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_SWDIO_IN      (void) {
-  return (0U);
+    return read_input(SWDIO_IN_PIN_PORT, SWDIO_IN_PIN);
 }
 
 /** SWDIO I/O pin: Set Output (used in SWD mode only).
 \param bit Output value for the SWDIO DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_OUT     (uint32_t bit) {
-  ;
+    if (bit & 1) {
+        set_gpio(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN);
+    } else {
+        clear_gpio(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN);
+    }
 }
 
 /** SWDIO I/O pin: Switch to Output mode (used in SWD mode only).
@@ -261,7 +371,8 @@ Configure the SWDIO DAP hardware I/O pin to output mode. This function is
 called prior \ref PIN_SWDIO_OUT function calls.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_OUT_ENABLE  (void) {
-  ;
+    pin_out_init(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN, SWDIO_OUT_PIN_Bit);
+    clear_gpio(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN);
 }
 
 /** SWDIO I/O pin: Switch to Input mode (used in SWD mode only).
@@ -269,7 +380,8 @@ Configure the SWDIO DAP hardware I/O pin to input mode. This function is
 called prior \ref PIN_SWDIO_IN function calls.
 */
 __STATIC_FORCEINLINE void     PIN_SWDIO_OUT_DISABLE (void) {
-  ;
+    pin_in_init(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN, SWDIO_OUT_PIN_Bit, 0);
+    set_gpio(SWDIO_OUT_PIN_PORT, SWDIO_OUT_PIN);
 }
 
 
@@ -279,14 +391,24 @@ __STATIC_FORCEINLINE void     PIN_SWDIO_OUT_DISABLE (void) {
 \return Current status of the TDI DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_TDI_IN  (void) {
-  return (0U);
+#if (DAP_JTAG != 0)
+    return read_input(JTAG_TDI_PIN_PORT, JTAG_TDI_PIN);
+#else
+    return (0U);
+#endif
 }
 
 /** TDI I/O pin: Set Output.
 \param bit Output value for the TDI DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE void     PIN_TDI_OUT (uint32_t bit) {
-  ;
+#if (DAP_JTAG != 0)
+    if (bit & 1) {
+        set_gpio(JTAG_TDI_PIN_PORT, JTAG_TDI_PIN);
+    } else {
+        clear_gpio(JTAG_TDI_PIN_PORT, JTAG_TDI_PIN);
+    }
+#endif
 }
 
 
@@ -296,7 +418,11 @@ __STATIC_FORCEINLINE void     PIN_TDI_OUT (uint32_t bit) {
 \return Current status of the TDO DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_TDO_IN  (void) {
-  return (0U);
+#if (DAP_JTAG != 0)
+    return read_input(JTAG_TDO_PIN_PORT, JTAG_TDO_PIN);
+#else
+    return (0U);
+#endif
 }
 
 
@@ -306,7 +432,7 @@ __STATIC_FORCEINLINE uint32_t PIN_TDO_IN  (void) {
 \return Current status of the nTRST DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_nTRST_IN   (void) {
-  return (0U);
+    return (0U); // Not available
 }
 
 /** nTRST I/O pin: Set Output.
@@ -315,7 +441,7 @@ __STATIC_FORCEINLINE uint32_t PIN_nTRST_IN   (void) {
            - 1: release JTAG TRST Test Reset.
 */
 __STATIC_FORCEINLINE void     PIN_nTRST_OUT  (uint32_t bit) {
-  ;
+    ; // Not available
 }
 
 // nRESET Pin I/O------------------------------------------
@@ -324,7 +450,7 @@ __STATIC_FORCEINLINE void     PIN_nTRST_OUT  (uint32_t bit) {
 \return Current status of the nRESET DAP hardware I/O pin.
 */
 __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN  (void) {
-  return (0U);
+    return read_input(nRESET_PIN_PORT, nRESET_PIN);
 }
 
 /** nRESET I/O pin: Set Output.
@@ -333,7 +459,11 @@ __STATIC_FORCEINLINE uint32_t PIN_nRESET_IN  (void) {
            - 1: release device hardware reset.
 */
 __STATIC_FORCEINLINE void     PIN_nRESET_OUT (uint32_t bit) {
-  ;
+    if (bit & 1) {
+       clear_gpio(nRESET_PIN_PORT, nRESET_PIN);
+    } else {
+       set_gpio(nRESET_PIN_PORT, nRESET_PIN);
+    }
 }
 
 ///@}
@@ -357,14 +487,20 @@ It is recommended to provide the following LEDs for status indication:
            - 1: Connect LED ON: debugger is connected to CMSIS-DAP Debug Unit.
            - 0: Connect LED OFF: debugger is not connected to CMSIS-DAP Debug Unit.
 */
-__STATIC_INLINE void LED_CONNECTED_OUT (uint32_t bit) {}
+__STATIC_INLINE void LED_CONNECTED_OUT (uint32_t bit) {
+    // LED is active low
+    out_gpio(CONNECTED_LED_PIN_PORT, CONNECTED_LED_PIN, bit);
+}
 
 /** Debug Unit: Set status Target Running LED.
 \param bit status of the Target Running LED.
            - 1: Target Running LED ON: program execution in target started.
            - 0: Target Running LED OFF: program execution in target stopped.
 */
-__STATIC_INLINE void LED_RUNNING_OUT (uint32_t bit) {}
+__STATIC_INLINE void LED_RUNNING_OUT (uint32_t bit) {
+    // LED is active low
+    out_gpio(RUNNING_LED_PIN_PORT, RUNNING_LED_PIN, bit);
+}
 
 ///@}
 
@@ -385,7 +521,7 @@ default, the DWT timer is used.  The frequency of this timer is configured with 
 \return Current timestamp value.
 */
 __STATIC_INLINE uint32_t TIMESTAMP_GET (void) {
-  return (DWT->CYCCNT);
+    return (DWT->CYCCNT);
 }
 
 ///@}
@@ -409,7 +545,7 @@ Status LEDs. In detail the operation of Hardware I/O and LED pins are enabled an
  - LED output pins are enabled and LEDs are turned off.
 */
 __STATIC_INLINE void DAP_SETUP (void) {
-  ;
+    ;
 }
 
 /** Reset Target Device with custom specific I/O pin or command sequence.
@@ -420,7 +556,7 @@ when a device needs a time-critical unlock sequence that enables the debug port.
         1 = a device specific reset sequence is implemented.
 */
 __STATIC_INLINE uint8_t RESET_TARGET (void) {
-  return (0U);             // change to '1' when a device reset sequence is implemented
+    return (0U);             // change to '1' when a device reset sequence is implemented
 }
 
 ///@}
