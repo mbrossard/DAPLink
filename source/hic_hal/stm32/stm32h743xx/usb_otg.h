@@ -22,14 +22,18 @@
 #ifndef __USB_OTG_H__
 #define __USB_OTG_H__
 
-#include "stm32f7xx.h"
-#include "stm32f7xx_hal.h"
+#include "stm32h7xx.h"
+#include "stm32h7xx_hal.h"
 #include "util.h"
+
+#define GPIO_AF10_OTG_FS GPIO_AF10_OTG1_FS
+#define GPIO_AF10_OTG_HS GPIO_AF10_OTG1_HS
+#define GPIO_AF12_OTG_HS_FS GPIO_AF12_OTG1_FS
 
 #if defined(FORCE_USB_FS)
 
 #define USB_OTG_USE_FS                  1
-#define USB_OTG_ENDPOINT_NUM            5
+#define USB_OTG_ENDPOINT_NUM            8
 
 #elif defined(USE_EMBEDDED_FS)
 
@@ -40,7 +44,7 @@
 #else
 
 #define USB_OTG_USE_HS                  1
-#define USB_OTG_HS_USE_EMBEDDED_HS_PHY  1
+#define USB_OTG_HS_USE_EXTERNAL_HS_PHY  1
 #define USB_OTG_ENDPOINT_NUM            8
 
 #endif
