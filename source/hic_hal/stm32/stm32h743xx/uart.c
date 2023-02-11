@@ -41,6 +41,10 @@ int32_t uart_get_configuration(UART_Configuration *config)
 {
 }
 
+void uart_set_control_line_state(uint16_t ctrl_bmp)
+{
+}
+
 int32_t uart_write_free(void)
 {
 }
