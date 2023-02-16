@@ -1,25 +1,34 @@
-/**************************************************************************//**
- * @file     DAP_config.h
- * @brief    CMSIS-DAP Configuration File
- * @Version 1.05 (based on version  V1.10 ARM DAP_config.h)
+/*
+ * @file    DAP_config.h
+ * @brief
  *
- * @note
- * Copyright (C) 2012-2015 ARM Limited. All rights reserved.
+ * DAPLink Interface Firmware
+ * Copyright (c) 2009-2021, ARM Limited, All Rights Reserved
  * Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon company)
  * or an affiliate of Cypress Semiconductor Corporation.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * @par
- * ARM Limited (ARM) is supplying this software for use with Cortex-M
- * processor based microcontrollers.
+ * Licensed under the Apache License, Version 2.0 (the License); you may
+ * not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * @par
- * THIS SOFTWARE IS PROVIDED "AS IS".  NO WARRANTIES, WHETHER EXPRESS, IMPLIED
- * OR STATUTORY, INCLUDING, BUT NOT LIMITED TO, IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE APPLY TO THIS SOFTWARE.
- * ARM SHALL NOT, IN ANY CIRCUMSTANCES, BE LIABLE FOR SPECIAL, INCIDENTAL, OR
- * CONSEQUENTIAL DAMAGES, FOR ANY REASON WHATSOEVER.
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- ******************************************************************************/
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an AS IS BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * ----------------------------------------------------------------------
+ *
+ * $Date:        16. June 2021
+ * $Revision:    V2.1.0
+ *
+ * Project:      CMSIS-DAP Configuration
+ * Title:        DAP_config.h CMSIS-DAP Configuration File (Template)
+ *
+ *---------------------------------------------------------------------------*/
 
 #ifndef __DAP_CONFIG_H__
 #define __DAP_CONFIG_H__
@@ -38,8 +47,9 @@ Provides definitions about the hardware and configuration of the Debug Unit.
 
 This information includes:
  - Definition of Cortex-M processor parameters used in CMSIS-DAP Debug Unit.
+ - Debug Unit Identification strings (Vendor, Product, Serial Number).
  - Debug Unit communication packet size.
- - Debug Access Port communication mode (JTAG or SWD).
+ - Debug Access Port supported modes and settings (JTAG/SWD and SWO).
  - Optional information about a connected Target Device (for Evaluation Boards).
 */
 
@@ -86,12 +96,13 @@ void SetDAPDefaultIdleCycle(void);
 #define DAP_DEFAULT_SWJ_CLOCK   3000000u        ///< Default SWD/JTAG clock frequency in Hz.
 
 /// Maximum Package Size for Command and Response data.
-/// This configuration settings is used to optimized the communication performance with the
-/// debugger and depends on the USB peripheral. Change setting to 1024 for High-Speed USB.
+/// This configuration settings is used to optimize the communication performance with the
+/// debugger and depends on the USB peripheral. Typical vales are 64 for Full-speed USB HID or WinUSB,
+/// 1024 for High-speed USB HID and 512 for High-speed USB WinUSB.
 #define DAP_PACKET_SIZE         64u             ///< USB: 64 = Full-Speed, 1024 = High-Speed.
 
 /// Maximum Package Buffers for Command and Response data.
-/// This configuration settings is used to optimized the communication performance with the
+/// This configuration settings is used to optimize the communication performance with the
 /// debugger and depends on the USB peripheral. For devices with limited RAM or USB buffer the
 /// setting can be reduced (valid range is 1 .. 255). Change setting to 4 for High-Speed USB.
 #define DAP_PACKET_COUNT        4U             ///< Buffers: 64 = Full-Speed, 4 = High-Speed.
@@ -99,6 +110,9 @@ void SetDAPDefaultIdleCycle(void);
 /// Indicate that UART Serial Wire Output (SWO) trace is available.
 /// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
 #define SWO_UART                0              ///< SWO UART:  1 = available, 0 = not available
+
+/// USART Driver instance number for the UART SWO.
+#define SWO_UART_DRIVER         0               ///< USART Driver instance number (Driver_USART#).
 
 /// Maximum SWO UART Baudrate
 #define SWO_UART_MAX_BAUDRATE   10000000U       ///< SWO UART Maximum Baudrate in Hz
@@ -115,16 +129,29 @@ void SetDAPDefaultIdleCycle(void);
 
 /// Clock frequency of the Test Domain Timer. Timer value is returned with \ref TIMESTAMP_GET.
 #define TIMESTAMP_CLOCK         0U      ///< Timestamp clock in Hz (0 = timestamps not supported).
+
+/// Indicate that UART Communication Port is available.
+/// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
+#define DAP_UART                0               ///< DAP UART:  1 = available, 0 = not available.
+
+/// USART Driver instance number for the UART Communication Port.
+#define DAP_UART_DRIVER         1               ///< USART Driver instance number (Driver_USART#).
+
+/// UART Receive Buffer Size.
+#define DAP_UART_RX_BUFFER_SIZE 1024U           ///< Uart Receive Buffer Size in bytes (must be 2^n).
+
+/// UART Transmit Buffer Size.
+#define DAP_UART_TX_BUFFER_SIZE 1024U           ///< Uart Transmit Buffer Size in bytes (must be 2^n).
+
+/// Indicate that UART Communication via USB COM Port is available.
+/// This information is returned by the command \ref DAP_Info as part of <b>Capabilities</b>.
+#define DAP_UART_USB_COM_PORT   1               ///< USB COM Port:  1 = available, 0 = not available.
+
 /// Debug Unit is connected to fixed Target Device.
 /// The Debug Unit may be part of an evaluation board and always connected to a fixed
-/// known device.  In this case a Device Vendor and Device Name string is stored which
-/// may be used by the debugger or IDE to configure device parameters.
+/// known device. In this case a Device Vendor, Device Name, Board Vendor and Board Name strings
+/// are stored and may be used by the debugger or IDE to configure device parameters.
 #define TARGET_DEVICE_FIXED     0               ///< Target Device: 1 = known, 0 = unknown;
-
-#if TARGET_DEVICE_FIXED
-#define TARGET_DEVICE_VENDOR    "ARM"          ///< String indicating the Silicon Vendor
-#define TARGET_DEVICE_NAME      "Cortex-M0"    ///< String indicating the Target Device
-#endif
 
 ///@}
 
@@ -479,4 +506,3 @@ static __inline uint8_t RESET_TARGET(void)
 
 
 #endif /* __DAP_CONFIG_H__ */
-
