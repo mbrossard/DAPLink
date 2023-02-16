@@ -50,6 +50,7 @@ typedef enum IRQn
 #define __CM3_REV                 0x0201
 
 #define __MPU_PRESENT             0
+#define __VTOR_PRESENT            1
 #define __NVIC_PRIO_BITS          3
 #define __Vendor_SysTickConfig    0
 

@@ -14,14 +14,17 @@ common:
         hic_hal:
             - source/hic_hal/infineon/psoc5lp
             - source/hic_hal/infineon/psoc5lp/PSoC5
-            - source/hic_hal/infineon/psoc5lp/armcc
 
 tool_specific:
     uvision:
         misc:
             ld_flags:
-                - --predefine="-I..\..\..\source\hic_hal\infineon\psoc5lp"
-    make_armcc:
+                - --predefine="-I../../../source/hic_hal/infineon/psoc5lp"
+        sources:
+            - source/hic_hal/infineon/psoc5lp/armcc
+    armcc:
         misc:
             ld_flags:
-                - --predefine="-Isource\hic_hal\infineon\psoc5lp"
+                - --predefine="-Isource/hic_hal/infineon/psoc5lp"
+        sources:
+            - source/hic_hal/infineon/psoc5lp/armcc

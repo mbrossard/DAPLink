@@ -3,7 +3,7 @@
 * @brief   CMSIS Peripheral Access Layer for PSOC5LP
 *
 ********************************************************************************
-* Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon company) 
+* Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon company)
 * or an affiliate of Cypress Semiconductor Corporation.
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -36,5 +36,7 @@ uint8_t interrogate_kit_hw_id(void);
 uint8_t get_kit_hw_id(void);
 bool kit_has_sflash_restriction(void);
 void SetKitProgActiveApp(uint8_t mode);
+
+extern uint32_t SystemCoreClock;
 
 #endif /* PSOC5LP_H */

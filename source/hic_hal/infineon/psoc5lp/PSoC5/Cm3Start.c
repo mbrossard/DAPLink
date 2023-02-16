@@ -31,6 +31,7 @@
 #include "cyfitter.h"
 #include "daplink_addr.h"
 
+uint32_t SystemCoreClock = OS_CLOCK;
 
 #define CY_NUM_INTERRUPTS           (32u)
 #define CY_NUM_VECTORS              (CYINT_IRQ_BASE + CY_NUM_INTERRUPTS)

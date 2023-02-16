@@ -4,7 +4,7 @@
 * @brief   PSoC5LP HW uart API
 *
 ********************************************************************************
-* Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon company) 
+* Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon company)
 * or an affiliate of Cypress Semiconductor Corporation.
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -24,7 +24,6 @@
 #include "util.h"
 #include "cortex_m.h"
 #include "circ_buf.h"
-#include "RTL.h"
 #include "rl_usb.h"
 
 #include "UART_Bridge.h"
@@ -263,6 +262,10 @@ int32_t uart_set_configuration(UART_Configuration *config)
         prevBaudrate = dDTERate;
     }
     return 0;
+}
+
+void uart_set_control_line_state(uint16_t ctrl_bmp)
+{
 }
 
 int32_t uart_uninitialize(void)

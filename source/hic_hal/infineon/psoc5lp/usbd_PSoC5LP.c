@@ -3,7 +3,7 @@
 * @brief   PSoC5LP usbd API implementation
 *
 ********************************************************************************
-* Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon company) 
+* Copyright (2019-2021) Cypress Semiconductor Corporation (an Infineon company)
 * or an affiliate of Cypress Semiconductor Corporation.
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,7 +19,6 @@
 * limitations under the License.
 *****************************************************************************/
 
-#include "RTL.h"
 #include "usb_def.h"
 #include "usb_msc.h"
 #include "usbd_core.h"
@@ -430,7 +429,7 @@ static void USBFS_Init(void)
 * Function Name: USBFS_InitComponent
 ****************************************************************************//**
 *
-*   This function initializes the component’s global variables and initiates
+*   This function initializes the component's global variables and initiates
 *   communication with the host by pull-up D+ line.
 *
 * \param device:
@@ -1341,7 +1340,7 @@ void USBD_SetStallEP(U32 EPNum)
     {
         if ( HwEP == USBFS_EP0 )
         {
-            /* We expect no more data, so STALLs in case of OUT token 
+            /* We expect no more data, so STALLs in case of OUT token
                and ACKs with a zero length packet in case of IN token. */
             USBFS_ep0Mode = USBFS_MODE_STATUS_IN_ONLY;
         }
@@ -1449,4 +1448,3 @@ U32 USBD_WriteEP(U32 EPNum, U8 *pData, U32 cnt)
     }
     return res;
 }
-

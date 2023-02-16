@@ -49,7 +49,7 @@
 #elif defined (INTERFACE_NRF52820)
 #include "nrf52820.h"
 #elif defined (INTERFACE_PSOC5LP)
-#include "core_cm3_psoc5.h"
+#include "psoc5lp.h"
 #else
 #error "CMSIS core headers needed"
 #endif
