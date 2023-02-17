@@ -176,6 +176,11 @@ SECTIONS
     *(cfgrom)
   } > m_cfgrom
 
+  .ramvectors (NOLOAD) : ALIGN(8)
+  {
+    KEEP(*(.ramvectors))
+  } > m_data
+
   /* Uninitialized data section */
   .bss :
   {
@@ -222,4 +227,3 @@ SECTIONS
 
   ASSERT(__StackLimit >= __HeapLimit, "region overflowed with stack and heap")
 }
-
