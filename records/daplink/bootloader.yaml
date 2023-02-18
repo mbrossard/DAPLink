@@ -22,7 +22,7 @@ tool_specific:
                 - --predefine=-DDAPLINK_BL
     uvision_armc6:
         linker_file:
-            - source/daplink/daplinkac6.sct
+            - source/daplink/daplink.uvac6.sct
         misc:
             ld_flags:
                 - --predefine=-DDAPLINK_BL

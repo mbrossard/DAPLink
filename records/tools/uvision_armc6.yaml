@@ -1,7 +1,7 @@
 tool_specific:
     uvision_armc6:
         linker_file:
-            - source/daplink/daplinkac6.sct
+            - source/daplink/daplink.uvac6.sct
         misc:
             asm_flags:
                 - -g
