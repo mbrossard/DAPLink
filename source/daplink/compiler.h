@@ -55,6 +55,11 @@ extern "C" {
 #define NO_OPTIMIZE_INLINE
 #define NO_OPTIMIZE_POST
 #define RAM_FUNCTION __attribute__((section("ram_func")))
+#elif (defined(__LLVM__))
+#define NO_OPTIMIZE_PRE
+#define NO_OPTIMIZE_INLINE
+#define NO_OPTIMIZE_POST
+#define RAM_FUNCTION
 #elif (defined(__GNUC__))
 #define NO_OPTIMIZE_PRE
 #define NO_OPTIMIZE_INLINE __attribute__((optimize("O0")))

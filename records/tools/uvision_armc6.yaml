@@ -1,0 +1,29 @@
+tool_specific:
+    uvision_armc6:
+        linker_file:
+            - source/daplink/daplinkac6.sct
+        misc:
+            asm_flags:
+                - -g
+            c_flags:
+                # uvision.uvproj.tmpl specifies:
+                # - Oz
+                # - C11
+                # - split sections
+                # - -g
+                - -fdata-sections
+                - -ffunction-sections
+                - -fno-builtin
+                - -fshort-enums
+                - -fshort-wchar
+                - -funsigned-char
+                - -masm=auto
+                - -nostdlib
+                - -Wall
+                - -Wno-error=cpp
+                - -Warmcc-pragma-thumb
+                - -Wno-ignored-optimization-argument
+                - -Wno-unused-command-line-argument
+                - -mno-unaligned-access
+            ld_flags:
+                - --bestdebug

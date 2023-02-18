@@ -4,8 +4,6 @@ tool_specific:
             - cortex-m0
         macros:
             - __PROGRAM_START
-        linker_file:
-            - source/daplink/daplink.sct
         misc:
             asm_flags:
                 - -g
@@ -45,4 +43,3 @@ tool_specific:
                 - -g
             ld_flags:
                 - --bestdebug
-

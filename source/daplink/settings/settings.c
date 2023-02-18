@@ -68,6 +68,10 @@ COMPILER_ASSERT((offsetof(cfg_ram_t, hexdump) % sizeof(uint32_t)) == 0);
 // Configuration RAM
 #if defined(__CC_ARM)
 static cfg_ram_t config_ram __attribute__((section("cfgram"), zero_init));
+#elif defined (__LLVM__)
+#pragma clang section bss="cfgram"
+static cfg_ram_t config_ram;
+#pragma clang section bss=""
 #else
 static cfg_ram_t config_ram __attribute__((section("cfgram")));
 #endif

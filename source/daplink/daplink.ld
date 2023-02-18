@@ -140,12 +140,14 @@ SECTIONS
   } > m_text
 
   __etext = .;    /* define a global symbol at end of code */
+  __data_source = .;
   __DATA_ROM = .; /* Symbol is used by startup for data initialization */
 
   .data : AT(__DATA_ROM)
   {
     . = ALIGN(4);
     __DATA_RAM = .;
+    __data_start = .;
     __data_start__ = .;      /* create a global symbol at data start */
     *(.data)                 /* .data sections */
     *(.data*)                /* .data* sections */
@@ -153,9 +155,12 @@ SECTIONS
     KEEP(*(.jcr*))
     . = ALIGN(4);
     __data_end__ = .;        /* define a global symbol at data end */
+    __data_end = .;
   } > m_data
 
   __DATA_END = __DATA_ROM + (__data_end__ - __data_start__);
+  __data_size = (__data_end__ - __data_start__);
+  __tls_base = __data_start;
 
   /* fill .text out to the end of the app */
   .fill __DATA_END :
@@ -177,21 +182,25 @@ SECTIONS
   } > m_cfgrom
 
   /* Uninitialized data section */
-  .bss :
+  .bss (NOLOAD) :
   {
     /* This is used by the startup in order to initialize the .bss section */
     . = ALIGN(4);
     __START_BSS = .;
+    __bss_start = .;
     __bss_start__ = .;
     *(.bss)
     *(.bss*)
     *(COMMON)
     . = ALIGN(4);
     __bss_end__ = .;
+    __bss_end = .;
     __END_BSS = .;
   } > m_data
 
-  .heap :
+  __bss_size = (__bss_end__ - __bss_start__);
+
+  .heap (NOLOAD) :
   {
     . = ALIGN(8);
     __end__ = .;
@@ -202,7 +211,7 @@ SECTIONS
     __heap_limit = .; /* Add for _sbrk */
   } > m_data
 
-  .stack :
+  .stack (NOLOAD) :
   {
     . = ALIGN(8);
     . += STACK_SIZE;

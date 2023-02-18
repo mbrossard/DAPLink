@@ -30,6 +30,13 @@ tool_specific:
         sources:
             hic_hal:
                 - source/hic_hal/stm32/stm32f103xb/armcc
+    uvision_armc6:
+        misc:
+            ld_flags:
+                - --predefine="-I..\..\..\source\hic_hal\stm32\stm32f103xb"
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f103xb/armcc
     armcc:
         misc:
             asm_flags:
@@ -44,6 +51,13 @@ tool_specific:
             hic_hal:
                 - source/hic_hal/stm32/stm32f103xb/armcc
     gcc_arm:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f103xb/gcc
+    llvm_arm:
+        misc:
+            common_flags:
+                - --config armv7m_soft_nofp.cfg
         sources:
             hic_hal:
                 - source/hic_hal/stm32/stm32f103xb/gcc

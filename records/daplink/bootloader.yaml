@@ -20,6 +20,12 @@ tool_specific:
         misc:
             ld_flags:
                 - --predefine=-DDAPLINK_BL
+    uvision_armc6:
+        linker_file:
+            - source/daplink/daplinkac6.sct
+        misc:
+            ld_flags:
+                - --predefine=-DDAPLINK_BL
     armcc:
         linker_file:
             - source/daplink/daplink.sct
