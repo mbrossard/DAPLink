@@ -1,0 +1,7 @@
+common:
+    sources:
+        board:
+            - source/board/nrf52840_isp1807.c
+    macros:
+        - USB_PROD_STR="ISP1807 CMSIS-DAP"
+        - SSCI_ISP1807
