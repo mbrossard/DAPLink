@@ -61,6 +61,12 @@ uint32_t EraseChip(void);
  */
 uint32_t EraseSector(uint32_t adr);
 
+/** Get erase sector size
+ *  @param adr address of a sector to erase
+ *  @return erase sector size on success, 0 otherwise
+ */
+uint32_t EraseSectorSize(uint32_t adr);
+
 /** Program data into memory
  *  @param adr address to start programming from
  *  @param sz the amount of data to program
