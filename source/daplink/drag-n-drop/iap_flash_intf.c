@@ -328,14 +328,20 @@ static error_t erase_chip(void)
         return ERROR_INTERNAL;
     }
 
-    for (uint32_t addr = updt_start; addr < updt_end; addr += DAPLINK_SECTOR_SIZE) {
+    for (uint32_t addr = updt_start; addr < updt_end;) {
         error_t status;
-        status = erase_sector(addr);
+        uint32_t sector_size = erase_sector_size(addr);
 
-        if (status != ERROR_SUCCESS) {
+        if (sector_size != 0) {
+            status = erase_sector(addr);
+        }
+
+        if ((sector_size == 0) || (status != ERROR_SUCCESS)) {
             state = STATE_ERROR;
             return ERROR_IAP_ERASE_ALL;
         }
+
+        addr += sector_size;
     }
 
     mass_erase_performed = true;
@@ -347,9 +353,14 @@ static uint32_t program_page_min_size(uint32_t addr)
     return DAPLINK_MIN_WRITE_SIZE;
 }
 
-static uint32_t erase_sector_size(uint32_t addr)
+__WEAK uint32_t EraseSectorSize(uint32_t adr)
 {
     return DAPLINK_SECTOR_SIZE;
+}
+
+static uint32_t erase_sector_size(uint32_t addr)
+{
+    return EraseSectorSize(addr);
 }
 
 static bool page_program_allowed(uint32_t addr, uint32_t size)
