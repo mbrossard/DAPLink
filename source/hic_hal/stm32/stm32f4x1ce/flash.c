@@ -20,6 +20,7 @@
  */
 
 #include "flash_hal.h"        // FlashOS Structures
+#include "flash_blob.h"
 #include "target_config.h"    // target_device
 #include "stm32f4xx.h"
 #include "util.h"
@@ -98,6 +99,42 @@ uint32_t EraseSector(uint32_t adr)
         }
     }
     return ret;
+}
+
+static const sector_info_t sectors_info[] = {
+    {0x08000000 + KB(0),   KB(16)},
+    {0x08000000 + KB(16),  KB(16)},
+    {0x08000000 + KB(32),  KB(16)},
+    {0x08000000 + KB(48),  KB(16)},
+    {0x08000000 + KB(64),  KB(64)},
+    {0x08000000 + KB(128), KB(128)},
+ };
+
+#include "daplink_addr.h"
+
+uint32_t EraseSectorSize(uint32_t adr)
+{
+    uint32_t i = 0, j = (sizeof(sectors_info) / sizeof(sector_info_t)) - 1;
+    if ((adr < sectors_info[0].start) ||
+        (adr >= (sectors_info[j].start + sectors_info[j].size))) {
+        return 0;
+    }
+
+    uint32_t cur, next, size;
+    for (; i < j - 1; i++) {
+        cur = sectors_info[i].start;
+        next = sectors_info[i + 1].start;
+
+        if (adr > next) {
+            continue;
+        } else if (adr == next) {
+            return sectors_info[i + 1].size;
+        } else {
+            return sectors_info[i].size;
+        }
+    }
+
+    return sectors_info[j].size;
 }
 
 uint32_t ProgramPage(uint32_t adr, uint32_t sz, uint32_t *buf)
