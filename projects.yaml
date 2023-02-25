@@ -688,11 +688,11 @@ projects:
 
 
     # Test projects
-    lpc55s69_nrf52840dk_test_if:
+    lpc55s69_stm32f103c8_test_if:
         - *module_if
         - *module_hic_lpc55s69
-        - records/board/lpc55s69_nrf52840dk.yaml
         - records/board/mcu_link.yaml
+        - records/board/test/lpc55s69_stm32f103c8.yaml
     stm32f072xb_disco_test_if:
         - *module_if
         - *module_hic_stm32f072xb

@@ -119,7 +119,7 @@ PROJECT_RELEASE_INFO = [
 ]
 
 TEST_RELEASE_INFO = [
-    ('lpc55s69_nrf52840dk_test_if',                 False,      0x10000,    "bin"       ),
+    ('lpc55s69_stm32f103c8_test_if',                False,      0x10000,    "bin"       ),
     ('stm32f103xb_stm32f207zg_if',                  False,      0x0000,     "bin"       ),
 ]
 
@@ -260,7 +260,7 @@ SUPPORTED_CONFIGURATIONS = [
     (   0x0000,     VENDOR_TO_FAMILY('Stub', 1),        'stm32f103xb_if',                           None,               None                                    ),
 
     # Test projects
-    (   0x1102,     VENDOR_TO_FAMILY('Nordic', 2),      'lpc55s69_nrf52840dk_test_if',              'lpc55s69_bl',      'Nordic-nRF52840-DK'                    ),
+    (   0xF000,     VENDOR_TO_FAMILY('Stub', 1),        'lpc55s69_stm32f103c8_test_if',             'lpc55s69_bl',      'ST-Nucleo-F103RB'                      ),
 ]
 
 # Add new HICs here

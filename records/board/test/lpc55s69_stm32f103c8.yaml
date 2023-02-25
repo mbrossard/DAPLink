@@ -1,0 +1,8 @@
+common:
+    macros:
+        - SWO_UART=1
+    sources:
+        board:
+            - source/board/test/lpc55s69_stm32f103c8.c
+        family:
+            - source/family/st/stm32f103c8/target.c

@@ -1,9 +1,9 @@
 /**
- * @file    lpc55S69_nrf52840dk.c
- * @brief   board file for test project MCU-LINK + nRF52840-DK
+ * @file    lpc55s69-stm32f103c8.c
+ * @brief   board file for test project MCU-LINK + STM32F103C8
  *
  * DAPLink Interface Firmware
- * Copyright (c) 2009-2019, ARM Limited, All Rights Reserved
+ * Copyright (c) 2023, Mathias Brossard <mathias@brossard.org>
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,14 +22,11 @@
 #include "target_family.h"
 #include "target_board.h"
 
-extern target_cfg_t target_device_nrf52840;
-
 const board_info_t g_board_info = {
     .info_version = kBoardInfoVersion,
-    .board_id = "1102",
-    .family_id = kNordic_Nrf52_FamilyID,
-    .flags = kEnablePageErase,
-    .target_cfg = &target_device_nrf52840,
-    .board_vendor = "Nordic Semiconductor",
-    .board_name = "nRF52840-DK",
+    .board_id = "f000",
+    .family_id = kStub_HWReset_FamilyID,
+    .target_cfg = &target_device,
+    .board_vendor = "DAPLink Test",
+    .board_name = "lpc55S69-stm32f103c8",
 };
