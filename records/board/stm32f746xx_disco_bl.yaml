@@ -1,0 +1,11 @@
+common:
+    macros:
+        # - FORCE_USB_FS
+        # - USB_OTG_SET_FS_SPEED
+        - DISCOVERY_F746ZG
+        - DAPLINK_DEBUG
+        - DAPLINK_DEBUG_RTT
+        - DEBUG_USBD
+    sources:
+        board:
+            - source/board/stm32f746xx_bl.c

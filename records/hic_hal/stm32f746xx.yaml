@@ -1,0 +1,48 @@
+common:
+    target:
+        - Cortex-M7
+    core:
+        - Cortex-M7
+    macros:
+        - INTERFACE_STM32F746XX
+        - USE_HAL_DRIVER
+        - RTE_DEVICE_FRAMEWORK_CLASSIC
+        - USE_FULL_LL_DRIVER
+        - STM32F746xx
+        - DAPLINK_HIC_ID=0x9796990D  # DAPLINK_HIC_ID_STM32F723IE
+        - __packed=__packed          # Prevent redefinition of __packed with ARMCC
+        - DAPLINK_NO_ASSERT_FILENAMES
+        - OS_CLOCK=216000000
+
+    includes:
+        - source/hic_hal/stm32/stm32f746xx
+        - source/hic_hal/stm32/stm32f746xx/cmsis
+        - source/hic_hal/stm32/hal/STM32F7xx_HAL_Driver/Inc
+        - source/hic_hal/stm32/shared/usb_otg
+    sources:
+        hic_hal:
+            - source/hic_hal/stm32/stm32f746xx
+            - source/hic_hal/stm32/stm32f746xx/cmsis
+            - source/hic_hal/stm32/hal/STM32F7xx_HAL_Driver/Src
+            - source/hic_hal/stm32/shared/usb_otg
+
+tool_specific:
+    uvision:
+        misc:
+            ld_flags:
+                - --predefine="-I..\..\..\source\hic_hal\stm32\stm32f746xx"
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f746xx/armcc
+    armcc:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f746xx/armcc
+    armclang:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f746xx/armcc
+    gcc_arm:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f746xx/gcc
