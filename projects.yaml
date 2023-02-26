@@ -117,13 +117,16 @@ module:
     hic_stm32f4x1ce: &module_hic_stm32f4x1ce
         - records/rtos/rtos-cm4.yaml
         - records/hic_hal/stm32f4x1ce.yaml
-    hic_stm32h743xx: &module_hic_stm32h743xx
+    hic_stm32f429xx: &module_hic_stm32f429xx
         - records/rtos/rtos-cm4.yaml
-        - records/hic_hal/stm32h743xx.yaml
-        - records/usb/usb-hid.yaml
+        - records/hic_hal/stm32f429xx.yaml
     hic_stm32f723ie: &module_hic_stm32f723ie
         - records/rtos/rtos-cm4.yaml
         - records/hic_hal/stm32f723ie.yaml
+        - records/usb/usb-hid.yaml
+    hic_stm32h743xx: &module_hic_stm32h743xx
+        - records/rtos/rtos-cm4.yaml
+        - records/hic_hal/stm32h743xx.yaml
         - records/usb/usb-hid.yaml
 
 projects:
@@ -249,6 +252,15 @@ projects:
     stm32f4x1ce_if:
         - *module_if
         - *module_hic_stm32f4x1ce
+        - records/family/all_family.yaml
+        - records/usb/usb-bulk.yaml
+    stm32f429xx_bl:
+        - *module_bl
+        - records/hic_hal/stm32f429xx.yaml
+        - records/board/stm32f429xx_bl.yaml
+    stm32f429xx_if:
+        - *module_if
+        - *module_hic_stm32f429xx
         - records/family/all_family.yaml
         - records/usb/usb-bulk.yaml
     stm32f723ie_bl:

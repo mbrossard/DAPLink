@@ -1,0 +1,49 @@
+common:
+    target:
+        - Cortex-M4
+    core:
+        - Cortex-M4
+    macros:
+        - INTERFACE_STM32F429XX
+        - USE_HAL_DRIVER
+        - STM32F429xx
+        - DAPLINK_HIC_ID=0x9796990F  # DAPLINK_HIC_ID_STM32F429XX
+        - __packed=__packed          # Prevent redefinition of __packed with ARMCC
+        - OS_CLOCK=168000000
+        - RTE_DEVICE_FRAMEWORK_CLASSIC
+        - DAPLINK_DEBUG
+        - DAPLINK_DEBUG_RTT
+        - DEBUG_USBD
+        - FORCE_USB_FS
+    includes:
+        - source/hic_hal/stm32/stm32f429xx
+        - source/hic_hal/stm32/stm32f429xx/cmsis
+        - source/hic_hal/stm32/hal/STM32F4xx_HAL_Driver/Inc
+        - source/hic_hal/stm32/shared/usb_otg
+    sources:
+        hic_hal:
+            - source/hic_hal/stm32/stm32f429xx
+            - source/hic_hal/stm32/stm32f429xx/cmsis
+            - source/hic_hal/stm32/hal/STM32F4xx_HAL_Driver/Src
+            - source/hic_hal/stm32/shared/usb_otg
+
+tool_specific:
+    uvision:
+        misc:
+            ld_flags:
+                - --predefine="-I..\..\..\source\hic_hal\stm32\stm32f429xx"
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f429xx/armcc
+    armcc:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f429xx/armcc
+    armclang:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f429xx/armcc
+    gcc_arm:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32f429xx/gcc
