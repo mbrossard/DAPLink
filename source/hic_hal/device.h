@@ -44,6 +44,8 @@
 #include "stm32f1xx.h"
 #elif defined (INTERFACE_STM32F4X1CE)
 #include "stm32f401xe.h"
+#elif defined (INTERFACE_STM32F429XX)
+#include "stm32f429xx.h"
 #elif defined (INTERFACE_STM32F723IE)
 #include "stm32f723xx.h"
 #elif defined (INTERFACE_STM32F746XX)
