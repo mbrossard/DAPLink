@@ -30,7 +30,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <rl_usb.h>
-#include <stm32f4xx.h> 
+#include <stm32f4xx.h>
 
 #define __NO_USB_LIB_C
 #include "usb_config.c"
@@ -77,63 +77,32 @@ uint32_t *InPacketDataPtr[4] = { 0,
 #if   ((USBD_HID_ENABLE     == 1) && (USBD_HID_EP_INTIN      == 1))
                        HID_IntInPacketData,
 #elif ((USBD_CDC_ACM_ENABLE == 1) && (USBD_CDC_ACM_EP_INTIN  == 1))
-                       CDC_ACM_IntInPacketData, 
+                       CDC_ACM_IntInPacketData,
 #else
-                            0, 
+                            0,
 #endif
 
 #if   ((USBD_HID_ENABLE     == 1) && (USBD_HID_EP_INTIN      == 2))
-                       HID_IntInPacketData, 
+                       HID_IntInPacketData,
 #elif ((USBD_CDC_ACM_ENABLE == 1) && (USBD_CDC_ACM_EP_INTIN  == 2))
-                       CDC_ACM_IntInPacketData, 
+                       CDC_ACM_IntInPacketData,
 #else
-                            0, 
+                            0,
 #endif
 
 #if   ((USBD_HID_ENABLE     == 1) && (USBD_HID_EP_INTIN      == 3))
-                       HID_IntInPacketData, 
+                       HID_IntInPacketData,
 #elif ((USBD_CDC_ACM_ENABLE == 1) && (USBD_CDC_ACM_EP_INTIN  == 3))
-                       CDC_ACM_IntInPacketData, 
+                       CDC_ACM_IntInPacketData,
 #else
-                            0, 
+                            0,
 #endif
 };
-
-
-#if    (USBD_ADC_ENABLE == 1)
-
-uint32_t ADC_IsoOutPacketData    [(USBD_ADC_WMAXPACKETSIZE + 3) / 4];
-
-uint32_t *IsoOutPacketDataPtr[4] = { 0,
-#if    (USBD_ADC_EP_ISOOUT == 1)
-                                     ADC_IsoOutPacketData,
-#else
-                                     0,
-#endif
-  
-#if    (USBD_ADC_EP_ISOOUT == 2)
-                                     ADC_IsoOutPacketData,
-#else
-                                     0,
-#endif
-  
-#if    (USBD_ADC_EP_ISOOUT == 3)
-                                     ADC_IsoOutPacketData,
-#else
-                                     0,
-#endif
-};
-#else
-uint32_t *IsoOutPacketDataPtr[4] = { 0 };
-#endif
 
 
 uint32_t InPacketDataCnt[4]      = { 0 };
 uint32_t InPacketDataReady       =   0  ;
 uint32_t SyncWriteEP             =   0  ;
-
-uint32_t IsoOutPacketDataCnt[4]  = { 0 };
-uint32_t IsoOutTokenRead         =   0  ;
 
 /*
  *  usbd_stm32_delay
@@ -277,7 +246,7 @@ void USBD_Reset (void) {
       DOEPCTL(i)  = (1 << 30) | (1 << 27);   /* OUT EP disable, Set NAK       */
     if (DIEPCTL(i) & (1UL << 31))
       DIEPCTL(i)  = (1 << 30) | (1 << 27);   /* IN EP disable, Set NAK        */
-    
+
     DIEPINT(i)    = 0x1B;                    /* clear IN Ep interrupts        */
     DOEPINT(i)    = 0x1B;                    /* clear OUT Ep interrupts       */
   }
@@ -373,7 +342,7 @@ void USBD_SetAddress (uint32_t  adr, uint32_t setup) {
  */
 static void USBD_FlushInEpFifo (uint32_t EPNum) {
   uint32_t wcnt;
-  
+
   EPNum &= ~0x80;
   OTG->GRSTCTL = (OTG->GRSTCTL & ~(0x1F << 6)) | /* flush EP fifo             */
                  (EPNum << 6)| (1 << 5);
@@ -457,9 +426,6 @@ void USBD_EnableEP (uint32_t EPNum) {
       DIEPCTL(EPNum)  |= (1   << 30);   /* disable EP                         */
 
     InPacketDataReady &= ~(1 << EPNum);
-    if (EP_IN_TYPE(EPNum) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-      OTG->GINTMSK |= (1 << 20);        /* enable IISOIXFR                    */
-    }
   } else {
     if (EP_OUT_TYPE(EPNum) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
       OTG->GINTMSK   |= (1 << 15);      /* enable end of periodic frame       */
@@ -482,48 +448,25 @@ void USBD_EnableEP (uint32_t EPNum) {
  */
 
 void USBD_DisableEP (uint32_t EPNum) {
-  uint32_t num, wcnt, IsoEpEnCnt;
-
-  IsoEpEnCnt = 0;
+  uint32_t num, wcnt;
 
   /* Disable IN Endpoint                                                      */
   if (EPNum & 0x80) {
     EPNum &= ~0x80;
-    for (num = 1; num <= USBD_EP_NUM; num++) {
-      if (DIEPCTL(num) & (1 <<15)) {
-        if (EP_IN_TYPE(num) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-          IsoEpEnCnt++;
-        }
-      }
-    }
-
     InPacketDataReady &= ~(1 << EPNum);
-    if (IsoEpEnCnt == 1) {              /* if all iso endpoints disabled      */
-      OTG->GINTMSK &= ~(1 << 20);       /* disable IISOIXFR                   */
-    }
     if (DIEPCTL(EPNum) &   (1UL << 31))
       DIEPCTL(EPNum)   |=  (1   << 30); /* disable EP                         */
     DIEPCTL(EPNum)     |=  (1   << 27); /* set EP NAK                         */
     DIEPCTL(EPNum)     &= ~(1   << 15); /* deactivate EP                      */
-    
+
   /* Disable OUT Endpoint                                                     */
   } else {
-    for (num = 1; num <= USBD_EP_NUM; num++) {
-      if (DOEPCTL(num) & (1 <<15)) {
-        if (EP_OUT_TYPE(num) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-          IsoEpEnCnt++;
-        }
-      }
-    }
-    if (IsoEpEnCnt == 1)                /* if all iso endpoints disabled      */
-      OTG->GINTMSK &= ~(1 << 15);       /* disable EOPF                       */
-    
     OTG->DCTL |= (1 << 9);              /* set global out nak                 */
 
     wcnt = 1000;
     while (!(OTG->GINTSTS & (1 << 7)))  /* wait until global NAK              */
       if ((wcnt--) == 0) break;
-    
+
     if (DOEPCTL(EPNum) &   (1UL << 31))   /* if ep enabled                    */
       DOEPCTL(EPNum)   |=  (1   << 30);   /* disable EP                       */
     DOEPCTL(EPNum)     |=  (1   << 27);   /* set EP NAK                       */
@@ -556,13 +499,6 @@ void USBD_ResetEP (uint32_t EPNum) {
     DIEPCTL(EPNum)     |= (1   << 27);  /* set EP NAK                         */
 
     USBD_FlushInEpFifo (EPNum | 0x80);  /* Flush endpoint fifo                */
-
-    /* If endpoint is isochronous, set proper EVEN/ODD frame and enable Ep    */
-    if (EP_IN_TYPE(EPNum) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-      if (USBD_GetFrame() & 1) DIEPCTL(EPNum) |= (1 << 28); /* set even frame */
-      else DIEPCTL(EPNum) |= (1 << 29);                     /* set odd frame  */
-      DIEPCTL(EPNum)  |= (1UL << 31) | (1 << 26);           /* enable EP      */
-    }
   }
 }
 
@@ -577,18 +513,18 @@ void USBD_ResetEP (uint32_t EPNum) {
 
 void USBD_SetStallEP (uint32_t EPNum) {
   uint32_t wcnt;
-  
+
   /* Stall OUT Endpoint                                                       */
   if (!(EPNum & 0x80)) {
     OTG->DCTL |= (1 << 9);              /* set global out nak                 */
     wcnt = 1000;
     while (!(OTG->GINTSTS & (1 << 7)))    /* wait until global NAK            */
       if ((wcnt--) == 0) break;
-    
+
     if (DOEPCTL(EPNum) &   (1UL << 31)) /* if endpoint enabled                */
       DOEPCTL(EPNum)   |=  (1   << 30); /* disable EP                         */
     DOEPCTL(EPNum) |= (1 << 21);        /* set stall                          */
-    
+
     wcnt = 1000;
     while(!(DOEPINT(EPNum) & (1 << 1))) /* wait until EP disabled             */
       if ((wcnt--) == 0) break;
@@ -624,7 +560,7 @@ void USBD_ClrStallEP (uint32_t EPNum) {
 
     DOEPCTL(EPNum) &= ~(1 << 21);       /* Clear stall                        */
   }
- 
+
   /* Clear IN Endpoint Stall                                                  */
   } else {
     EPNum &= ~0x80;
@@ -671,40 +607,19 @@ void USBD_ClearEPBuf (uint32_t EPNum) {
  */
 
 uint32_t USBD_ReadEP (U32 EPNum, U8 *pData, U32 cnt) {
-  uint32_t i, sz, isoEpFlag;
+  uint32_t i, sz;
 
   if ((DOEPCTL(EPNum) & (1 << 15)) == 0) return (0); /* if Ep not active      */
-  isoEpFlag = (EP_OUT_TYPE(EPNum) == USB_ENDPOINT_TYPE_ISOCHRONOUS);
-  
-  /* Isochronous Ep: read data from intermediate buffer                       */
-  if (isoEpFlag) {                      /* if Isochronouos endpoint           */
-    if (IsoOutTokenRead == 0) {          
-      sz = IsoOutPacketDataCnt[EPNum];  /* get data size                      */
-      for (i = 0; i < sz; i++) {        /* copy data from intermediate buffer */
-        pData[i] = ((uint8_t *)(IsoOutPacketDataPtr[EPNum]))[i];
-      }
-      IsoOutPacketDataCnt[EPNum] = 0;   /* reset data count                   */
-      return (sz);
-    }
-  }
-  
-  sz = ( OTG->GRXSTSP >> 4) & 0x7FF;    /* get available data size            */
-   if (isoEpFlag) {
-    /* if data pid = data0 and 
-       number of packets in which this payload was received = 1, data is valid*/
-    if ((DOEPTSIZ(EPNum) & ((0x3FF << 19) | (3 << 29))) == 0)  
-      IsoOutPacketDataCnt[EPNum] = sz;  /* save isochronous Ep data size      */
-    else IsoOutPacketDataCnt[EPNum] = 0;/* else data is unvalid               */ 
-  }
 
-  /* copy data from fifo
-     if Isochronous Ep: data is copied to intermediate buffer                 */
+  sz = ( OTG->GRXSTSP >> 4) & 0x7FF;    /* get available data size            */
+
+  /* copy data from fifo                                                      */
   for (i = 0; i < (uint32_t)((sz+3)/4); i++) {
     *((uint32_t *)pData) = RX_FIFO;
     pData += 4;
   }
   /* wait RxFIFO non-empty (OUT transfer completed or Setup trans. completed) */
-  while ((OTG->GINTSTS & (1 << 4)) == 0);  
+  while ((OTG->GINTSTS & (1 << 4)) == 0);
   OTG->GRXSTSP;                         /* pop register                       */
   OTG->GINTMSK |= (1 << 4);             /* unmask RxFIFO non-empty interrupt  */
 
@@ -714,8 +629,8 @@ uint32_t USBD_ReadEP (U32 EPNum, U8 *pData, U32 cnt) {
 
 /*
  *  Write USB Device Endpoint Data
- *  If write was requested synchronously from IRQ then data is written to FIFO directly 
- *  else data is written to the intermediate buffer and synchronously transferred to FIFO 
+ *  If write was requested synchronously from IRQ then data is written to FIFO directly
+ *  else data is written to the intermediate buffer and synchronously transferred to FIFO
  *  on next NAK event.
  *    Parameters:      EPNum: Device Endpoint Number
  *                       EPNum.0..3: Address
@@ -726,30 +641,27 @@ uint32_t USBD_ReadEP (U32 EPNum, U8 *pData, U32 cnt) {
  */
 
 uint32_t USBD_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
-  uint32_t *ptr, i, isoEpFlag;
+  uint32_t *ptr, i;
 
   EPNum &= ~(0x80);
 
   if ((DIEPCTL(EPNum) & (1 << 15)) == 0) return (0); /* if Ep not active      */
-  isoEpFlag = (EP_IN_TYPE(EPNum) == USB_ENDPOINT_TYPE_ISOCHRONOUS);
 
   /* Asynchronous write to intermediate buffer                                */
   if (!SyncWriteEP && InPacketDataPtr[EPNum]) {
-    if ((!(InPacketDataReady & (1 << EPNum))) || isoEpFlag) {
+    if (!(InPacketDataReady & (1 << EPNum))) {
       InPacketDataCnt[EPNum] = cnt;     /* save Data size                     */
       ptr = InPacketDataPtr[EPNum];
       i   = (cnt+3)/4;
-      if (i) { 
+      if (i) {
         while (i--) {                   /* save data to intermediate buffer   */
           *ptr++ = *((uint32_t *)pData);
           pData +=4;
         }
       }
-      if (!isoEpFlag) {
         InPacketDataReady |=  1 << EPNum;
         DIEPCTL(EPNum)    |= (1 << 27); /* Set NAK to enable interrupt on NAK */
         OTG->DIEPMSK   |= (1 <<  6);    /* INEPNEM = 1, IN EP NAK efective msk*/
-      }
     } else {                            /* If packet already loaded to buffer */
       return 0;
     }
@@ -757,13 +669,8 @@ uint32_t USBD_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
     if (cnt) while ((DTXFSTS(EPNum) * 4) < cnt); /* get space in Ep TxFIFO    */
 
     /* Set transfer size and packet count                                     */
-    DIEPTSIZ(EPNum) = cnt | (1 << 19) | (1 << 29); 
-                             
-    if (isoEpFlag) {                    /* if Isochronous Ep: set packet frame*/
-      if (USBD_GetFrame() & 1) DIEPCTL(EPNum) |= (1 << 28); /* even frame     */
-      else DIEPCTL(EPNum) |= (1 << 29);                     /* odd frame      */
-    }
-    
+    DIEPTSIZ(EPNum) = cnt | (1 << 19) | (1 << 29);
+
     DIEPCTL(EPNum) |= (1UL << 31) | (1 << 26);  /* enable ep and clear NAK    */
     if (cnt) {
       ptr = (uint32_t *)pData;
@@ -773,7 +680,7 @@ uint32_t USBD_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
         pData +=4;
       }
     }
-    if (isoEpFlag == 0) InPacketDataReady &= ~(1 << EPNum);
+    InPacketDataReady &= ~(1 << EPNum);
   }
   return (cnt);
 }
@@ -801,7 +708,6 @@ void OTG_FS_IRQHandler(void) {
 void USBD_Handler(void)
 {
   uint32_t istr, val, num, i, msk;
-  static uint32_t IsoInIncomplete = 0;
 
   istr = OTG->GINTSTS & OTG->GINTMSK;
 
@@ -878,14 +784,8 @@ void USBD_Handler(void)
 /* OUT packet                                                                 */
       case 2:
       OTG->GINTMSK &= ~(1 << 4);
-      if (EP_OUT_TYPE(num) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-        IsoOutTokenRead = 1;
-        USBD_ReadEP (num, (uint8_t *)IsoOutPacketDataPtr[num]);
-        IsoOutTokenRead = 0;
-      } else {
-        if (USBD_P_EP[num]) {
-          USBD_P_EP[num](USBD_EVT_OUT);
-        }
+      if (USBD_P_EP[num]) {
+        USBD_P_EP[num](USBD_EVT_OUT);
       }
       break;
 
@@ -910,29 +810,17 @@ void USBD_Handler(void)
 
       /* Endpoint disabled                                                    */
       if (DOEPINT(num) & (1 << 1)) {
-        if (EP_OUT_TYPE(num) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-          DOEPTSIZ(num) = (1 << 19) |                /* packet count          */
-                          (OutMaxPacketSize[num]);   /* transfer size         */
-          
-          if ((USBD_GetFrame() & 1)) DOEPCTL(num) |= (1 << 28); /* even frame */
-          else                       DOEPCTL(num) |= (1 << 29); /* odd frame  */
-
-          DOEPCTL(num)    |= (1UL <<31) | (1 << 26);
-        }
         DOEPINT(num) |= (1 << 1);
       }
-      
+
       /* Transfer complete interrupt                                          */
       if ((DOEPINT(num) & 1) | (DOEPINT(num) & (1 << 3))) {
-        if (EP_OUT_TYPE(num) != USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-
-          DOEPTSIZ(num)    = (1 << 19) |                 /* packet count      */
-                             (OutMaxPacketSize[num]);    /* transfer size     */
-          if (num == 0) {
-            DOEPTSIZ(0)   |= (1 << 29);
-          }
-          DOEPCTL(num)    |= (1UL <<31) | (1 << 26);     /* clr NAK, en EP    */
+        DOEPTSIZ(num)    = (1 << 19) |                 /* packet count      */
+                            (OutMaxPacketSize[num]);    /* transfer size     */
+        if (num == 0) {
+          DOEPTSIZ(0)   |= (1 << 29);
         }
+        DOEPCTL(num)    |= (1UL <<31) | (1 << 26);     /* clr NAK, en EP    */
         DOEPINT(num) |= 1;
       }
     }
@@ -955,23 +843,10 @@ void USBD_Handler(void)
       /* Endpoint disabled                                                    */
       if (DIEPINT(num) & (1 << 1)) {
         DIEPINT(num) = (1 << 1);
-        
-        if (EP_IN_TYPE(num) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-          if ((IsoInIncomplete & (1 << num)) != 0) {
-
-            USBD_FlushInEpFifo(num | 0x80);
-            SyncWriteEP = 1;
-            USBD_WriteEP (num, (uint8_t *)InPacketDataPtr[num], InPacketDataCnt[num]);
-            SyncWriteEP = 0;
-
-            IsoInIncomplete &= ~(1 << num);
-          }
-        }
       }
 
       /* IN endpoint NAK effective                                            */
       if (DIEPINT(num) & (1 << 6)) {
-        if (EP_IN_TYPE(num) != USB_ENDPOINT_TYPE_ISOCHRONOUS) {
           if (InPacketDataPtr[num] && (InPacketDataReady & (1 << num))) {
             SyncWriteEP = 1;
             USBD_WriteEP (num, (uint8_t *)InPacketDataPtr[num], InPacketDataCnt[num]);
@@ -983,18 +858,13 @@ void USBD_Handler(void)
               DIEPCTL(num) |= (1 << 26);
             DIEPINT(num)    = (1 <<  6);
         }
-      }
 
       /* Transmit completed                                                   */
       if (DIEPINT(num) & 1) {
         DIEPINT(num) = 1;
         SyncWriteEP = 1;
-        if (EP_IN_TYPE(num) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
-          USBD_WriteEP (num, (uint8_t *)InPacketDataPtr[num], InPacketDataCnt[num]);
-        } else {
-          if (USBD_P_EP[num]) {
-            USBD_P_EP[num](USBD_EVT_IN);
-          }
+        if (USBD_P_EP[num]) {
+          USBD_P_EP[num](USBD_EVT_IN);
         }
         SyncWriteEP = 0;
       }
@@ -1003,51 +873,13 @@ void USBD_Handler(void)
 
 /* End of periodic frame                                                      */
   if (istr & (1 << 15)) {
-    for (num = 1; num <= USBD_EP_NUM; num++) {
-
-      if (EP_OUT_TYPE(num) != USB_ENDPOINT_TYPE_ISOCHRONOUS) continue;
-      if (((DOEPCTL(num) >> 15) & 1) == 0)                   continue;
-
-      /* incomplete isochronous out transfer                                  */
-      if (OTG->GINTSTS & (1 << 21)) {
-        if ((USBD_GetFrame() & 1) == ((DOEPCTL(num) >> 16) & 1)) {
-          if (DOEPCTL(num) & (1UL << 31)) {
-            InPacketDataCnt[num] = 0;   /* discard data                       */
-            DOEPCTL(num) |= (1UL << 30);/* disable endpoint                   */
-          }
-        }
-
-      /* prepare for next isohronous transfer                                 */
-      } else {
-        DOEPTSIZ(num) = (1 << 19) |                /* packet count            */
-                        (OutMaxPacketSize[num]);   /* transfer size           */
-
-        if ((USBD_GetFrame() & 1)) DOEPCTL(num) |= (1 << 28); /* even frame   */
-        else                       DOEPCTL(num) |= (1 << 29); /* odd frame    */
-
-        DOEPCTL(num)    |= (1UL <<31) | (1 << 26);
-      }
-    }
     OTG->GINTSTS = (1 << 15) | (1 << 21);
   }
 
 /* incomplete isochronous IN transfer                                         */
   if (istr & (1 << 20)) {
     OTG->GINTSTS = (1 << 20);
-    for (num = 1; num < (USBD_EP_NUM + 1); num++) {
-
-      if (EP_IN_TYPE(num) != USB_ENDPOINT_TYPE_ISOCHRONOUS) continue;
-      if (((DIEPCTL(num) >> 15) & 1) == 0)                  continue;
-
-      if (DIEPCTL(num) & (1UL << 31)) { /* if EP en & packet frame is incorect*/
-        if ((USBD_GetFrame() & 1) == ((DIEPCTL(num) >> 16) & 1)) {
-          
-          IsoInIncomplete |= (1 << num);
-          DIEPCTL(num)    |= (1UL << 30) | (1 << 27);
-        }
-      }
-    }
   }
 
-    NVIC_EnableIRQ(OTG_IRQn);
+  NVIC_EnableIRQ(OTG_IRQn);
 }
