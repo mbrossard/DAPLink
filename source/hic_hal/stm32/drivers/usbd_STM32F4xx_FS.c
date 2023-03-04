@@ -27,14 +27,13 @@
  *      Copyright (c) 2004-2013 KEIL - An ARM Company. All rights reserved.
  *---------------------------------------------------------------------------*/
 
-#include <RTL.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <rl_usb.h>
 #include <stm32f4xx.h> 
 
 #define __NO_USB_LIB_C
-#include "usb_config_FS.c"
-
-#define OTG                 OTG_FS
+#include "usb_config.c"
 
 #define RX_FIFO_SIZE        256
 #define TX0_FIFO_SIZE       64
@@ -42,16 +41,25 @@
 #define TX2_FIFO_SIZE       64
 #define TX3_FIFO_SIZE       64
 
-#define TX_FIFO(n)          *((__packed volatile uint32_t*)(OTG_FS_BASE + 0x1000 + n*0x1000))
-#define RX_FIFO             *((volatile uint32_t*)(OTG_FS_BASE + 0x1000))
+#define OTG                  USB_OTG_FS
+#define USB_OTG_PERIPH_BASE  USB_OTG_FS_PERIPH_BASE
+#define OTG_IRQn             OTG_FS_IRQn
 
-#define DIEPTSIZ(EPNum)     *(&OTG->DIEPTSIZ0 + EPNum * 8)
-#define DIEPCTL(EPNum)      *(&OTG->DIEPCTL0  + EPNum * 8)
-#define DTXFSTS(EPNum)      *(&OTG->DTXFSTS0  + EPNum * 8)
-#define DOEPTSIZ(EPNum)     *(&OTG->DOEPTSIZ0 + EPNum * 8)
-#define DOEPCTL(EPNum)      *(&OTG->DOEPCTL0  + EPNum * 8)
-#define DIEPINT(EPNum)      *(&OTG->DIEPINT0  + EPNum * 8)
-#define DOEPINT(EPNum)      *(&OTG->DOEPINT0  + EPNum * 8)
+#define TX_FIFO(n)           *((volatile uint32_t *)(USB_OTG_PERIPH_BASE + USB_OTG_FIFO_BASE + ((n) * USB_OTG_FIFO_SIZE)))
+#define RX_FIFO              *((volatile uint32_t *)(USB_OTG_PERIPH_BASE + USB_OTG_FIFO_BASE))
+
+#define OTG_EP_IN(i)         ((USB_OTG_INEndpointTypeDef *)(USB_OTG_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE + ((i) * USB_OTG_EP_REG_SIZE)))
+#define OTG_EP_OUT(i)        ((USB_OTG_OUTEndpointTypeDef *)(USB_OTG_PERIPH_BASE + USB_OTG_OUT_ENDPOINT_BASE + ((i) * USB_OTG_EP_REG_SIZE)))
+
+#define DIEPTSIZ(ep_num)     ((OTG_EP_IN(ep_num))->DIEPTSIZ)
+#define DIEPCTL(ep_num)      ((OTG_EP_IN(ep_num))->DIEPCTL)
+#define DTXFSTS(ep_num)      ((OTG_EP_IN(ep_num))->DTXFSTS)
+#define DOEPTSIZ(ep_num)     ((OTG_EP_OUT(ep_num))->DOEPTSIZ)
+#define DOEPCTL(ep_num)      ((OTG_EP_OUT(ep_num))->DOEPCTL)
+#define DIEPINT(ep_num)      ((OTG_EP_IN(ep_num))->DIEPINT)
+#define DOEPINT(ep_num)      ((OTG_EP_OUT(ep_num))->DOEPINT)
+
+#define OTG_DEV              ((USB_OTG_DeviceTypeDef *)(USB_OTG_PERIPH_BASE + USB_OTG_DEVICE_BASE))
 
 #define EP_IN_TYPE(num)      ((DIEPCTL(num) >> 18) & 3)
 #define EP_OUT_TYPE(num)     ((DOEPCTL(num) >> 18) & 3)
@@ -135,7 +143,7 @@ uint32_t IsoOutTokenRead         =   0  ;
 void usbd_stm32_delay (uint32_t delay) {
   delay *= SystemCoreClock / 100000;
   while (delay--) {
-    __nop(); __nop(); __nop(); __nop(); __nop(); __nop(); __nop(); __nop();
+    __NOP(); __NOP(); __NOP(); __NOP(); __NOP(); __NOP(); __NOP(); __NOP();
   }
 }
 
@@ -146,13 +154,8 @@ void usbd_stm32_delay (uint32_t delay) {
  *    Return Value:    None
  */
 
-#ifdef __RTX
-void __svc(1) USBD_IntrEna (void);
-void __SVC_1               (void) {
-#else
 void          USBD_IntrEna (void) {
-#endif
-  NVIC_EnableIRQ   (OTG_FS_IRQn);       /* Enable OTG interrupt               */
+  NVIC_EnableIRQ   (OTG_IRQn);       /* Enable OTG interrupt               */
 }
 
 
@@ -227,11 +230,7 @@ void USBD_Init (void) {
                      (1   << 18) |      /* IN EP int unmask                   */
                      (1   << 19) |      /* OUT EP int unmask                  */
                      (1UL << 31) |      /* resume int unmask                  */
-#ifdef __RTX
-  ((USBD_RTX_DevTask   != 0) ? (1 <<  3) : 0);   /* SOF int unmask            */
-#else                            
   ((USBD_P_SOF_Event   != 0) ? (1 <<  3) : 0);   /* SOF int unmask            */
-#endif
 
   USBD_IntrEna();                       /* Enable OTG interrupt               */
   OTG->GAHBCFG    |=  1 | (1 << 7);     /* Enable interrupts                  */
@@ -245,7 +244,7 @@ void USBD_Init (void) {
  *    Return Value:    None
  */
 
-void USBD_Connect (uint32_t con) {
+void USBD_Connect (BOOL con) {
   if (con) {
     OTG->GCCFG  |=  (1 << 19) |         /* enable VBUS sensing device "B"     */
                     (1 << 16);          /* power down deactivated             */
@@ -350,7 +349,7 @@ void USBD_WakeUp (void) {
  *    Return Value:    None
  */
 
-void USBD_WakeUpCfg (uint32_t cfg) {
+void USBD_WakeUpCfg (BOOL cfg) {
   /* Not needed                                                               */
 }
 
@@ -390,7 +389,7 @@ static void USBD_FlushInEpFifo (uint32_t EPNum) {
  *    Return Value:    None
  */
 
-void USBD_Configure (uint32_t cfg) {
+void USBD_Configure (BOOL cfg) {
   InPacketDataReady &= ~1UL;
 }
 
@@ -671,7 +670,7 @@ void USBD_ClearEPBuf (uint32_t EPNum) {
  *    Return Value:    Number of bytes read
  */
 
-uint32_t USBD_ReadEP (uint32_t EPNum, uint8_t *pData) {
+uint32_t USBD_ReadEP (U32 EPNum, U8 *pData, U32 cnt) {
   uint32_t i, sz, isoEpFlag;
 
   if ((DOEPCTL(EPNum) & (1 << 15)) == 0) return (0); /* if Ep not active      */
@@ -701,7 +700,7 @@ uint32_t USBD_ReadEP (uint32_t EPNum, uint8_t *pData) {
   /* copy data from fifo
      if Isochronous Ep: data is copied to intermediate buffer                 */
   for (i = 0; i < (uint32_t)((sz+3)/4); i++) {
-    *((__packed uint32_t *)pData) = RX_FIFO;
+    *((uint32_t *)pData) = RX_FIFO;
     pData += 4;
   }
   /* wait RxFIFO non-empty (OUT transfer completed or Setup trans. completed) */
@@ -742,7 +741,7 @@ uint32_t USBD_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
       i   = (cnt+3)/4;
       if (i) { 
         while (i--) {                   /* save data to intermediate buffer   */
-          *ptr++ = *((__packed uint32_t *)pData);
+          *ptr++ = *((uint32_t *)pData);
           pData +=4;
         }
       }
@@ -770,7 +769,7 @@ uint32_t USBD_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
       ptr = (uint32_t *)pData;
       i   = (cnt+3)/4;
       while (i--) {                     /* copy data to endpoint TxFIFO       */
-        TX_FIFO(EPNum) = *(__packed uint32_t *)pData;
+        TX_FIFO(EPNum) = *(uint32_t *)pData;
         pData +=4;
       }
     }
@@ -795,6 +794,12 @@ uint32_t USBD_GetFrame (void) {
  *  USB Device Interrupt Service Routine
  */
 void OTG_FS_IRQHandler(void) {
+    NVIC_DisableIRQ(OTG_IRQn);
+    USBD_SignalHandler();
+}
+
+void USBD_Handler(void)
+{
   uint32_t istr, val, num, i, msk;
   static uint32_t IsoInIncomplete = 0;
 
@@ -804,45 +809,27 @@ void OTG_FS_IRQHandler(void) {
   if (istr & (1 << 12)) {
     USBD_Reset();
     usbd_reset_core();
-#ifdef __RTX
-    if (USBD_RTX_DevTask) {
-      isr_evt_set(USBD_EVT_RESET, USBD_RTX_DevTask);
-    }
-#else
     if (USBD_P_Reset_Event) {
       USBD_P_Reset_Event();
     }
-#endif
     OTG->GINTSTS = (1 << 12);
   }
 
 /* suspend interrupt                                                          */
   if (istr & (1 << 11)) {
     USBD_Suspend();
-#ifdef __RTX
-    if (USBD_RTX_DevTask) {
-      isr_evt_set(USBD_EVT_SUSPEND, USBD_RTX_DevTask);
-    }
-#else
     if (USBD_P_Suspend_Event) {
       USBD_P_Suspend_Event();
     }
-#endif
     OTG->GINTSTS = (1 << 11);
   }
 
 /* resume interrupt                                                           */
   if (istr & (1UL << 31)) {
     USBD_Resume();
-#ifdef __RTX
-    if (USBD_RTX_DevTask) {
-      isr_evt_set(USBD_EVT_RESUME, USBD_RTX_DevTask);
-    }
-#else
     if (USBD_P_Resume_Event) {
       USBD_P_Resume_Event();
     }
-#endif
     OTG->GINTSTS = (1UL << 31);
   }
 
@@ -869,15 +856,9 @@ void OTG_FS_IRQHandler(void) {
 
 /* Start Of Frame                                                             */
   if (istr & (1 << 3)) {
-#ifdef __RTX
-    if (USBD_RTX_DevTask) {
-      isr_evt_set(USBD_EVT_SOF, USBD_RTX_DevTask);
-    }
-#else
     if (USBD_P_SOF_Event) {
       USBD_P_SOF_Event();
     }
-#endif
      OTG->GINTSTS = (1 << 3);
   }
 
@@ -889,16 +870,9 @@ void OTG_FS_IRQHandler(void) {
     switch ((val >> 17) & 0x0F) {
 /* setup packet                                                               */
       case 6:
-#ifdef __RTX
-      OTG->GINTMSK &= ~(1 << 4);
-      if (USBD_RTX_EPTask[num]) {
-        isr_evt_set(USBD_EVT_SETUP, USBD_RTX_EPTask[num]);
-      }
-#else
       if (USBD_P_EP[num]) {
         USBD_P_EP[num](USBD_EVT_SETUP);
       }
-#endif
       break;
 
 /* OUT packet                                                                 */
@@ -909,15 +883,9 @@ void OTG_FS_IRQHandler(void) {
         USBD_ReadEP (num, (uint8_t *)IsoOutPacketDataPtr[num]);
         IsoOutTokenRead = 0;
       } else {
-#ifdef __RTX
-        if (USBD_RTX_EPTask[num]) {
-          isr_evt_set(USBD_EVT_OUT, USBD_RTX_EPTask[num]);
-        }
-#else
         if (USBD_P_EP[num]) {
           USBD_P_EP[num](USBD_EVT_OUT);
         }
-#endif
       }
       break;
 
@@ -1024,15 +992,9 @@ void OTG_FS_IRQHandler(void) {
         if (EP_IN_TYPE(num) == USB_ENDPOINT_TYPE_ISOCHRONOUS) {
           USBD_WriteEP (num, (uint8_t *)InPacketDataPtr[num], InPacketDataCnt[num]);
         } else {
-#ifdef __RTX
-          if (USBD_RTX_EPTask[num]) {
-            isr_evt_set(USBD_EVT_IN,  USBD_RTX_EPTask[num]);
-          }
-#else
           if (USBD_P_EP[num]) {
             USBD_P_EP[num](USBD_EVT_IN);
           }
-#endif
         }
         SyncWriteEP = 0;
       }
@@ -1086,4 +1048,6 @@ void OTG_FS_IRQHandler(void) {
       }
     }
   }
+
+    NVIC_EnableIRQ(OTG_IRQn);
 }
