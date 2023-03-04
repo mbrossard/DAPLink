@@ -244,15 +244,15 @@ void USBD_Init (void) {
 
   OTG->GAHBCFG    &=  ~1;               /* Disable interrupts                 */
   OTG->GCCFG      |=  (1 << 21);        /* No VBUS sensing                    */
-  OTG->DCTL       |=  (1 <<  1);        /* soft disconnect enabled            */
+  OTG_DEV->DCTL   |=  (1 <<  1);        /* soft disconnect enabled            */
 
   OTG->GUSBCFG    |=  (1 << 30);        /* Force device mode                  */
   usbd_stm32_delay    (1000);           /* Wait min 25 ms, we wait ~100 ms    */
 
 #ifndef __OTG_HS_EMBEDDED_PHY
-  OTG->DCFG       &= ~3;                /* High speed phy                     */
+  OTG_DEV->DCFG   &= ~3;                /* High speed phy                     */
 #else
-  OTG->DCFG       |=  3;                /* Full speed phy                     */
+  OTG_DEV->DCFG   |=  3;                /* Full speed phy                     */
 #endif
 
   OTG->GINTMSK     = (1   << 11) |      /* suspend int unmask                 */
@@ -279,14 +279,14 @@ void USBD_Init (void) {
 void USBD_Connect (BOOL con) {
   if (con) {
 #ifdef __OTG_HS_EMBEDDED_PHY
-    OTG->GCCFG  |=  (1 << 16);          /* power down deactivated             */
+    OTG->GCCFG    |=  (1 << 16);        /* power down deactivated             */
 #endif
-    OTG->DCTL   &= ~(1 <<  1);          /* soft disconnect disabled           */
+    OTG_DEV->DCTL &= ~(1 <<  1);        /* soft disconnect disabled           */
   }
   else {
-    OTG->DCTL   |=  (1 <<  1);          /* soft disconnect enabled            */
+    OTG_DEV->DCTL |=  (1 <<  1);        /* soft disconnect enabled            */
 #ifdef __OTG_HS_EMBEDDED_PHY
-    OTG->GCCFG  &= ~(1 << 16);          /* power down activated               */
+    OTG->GCCFG    &= ~(1 << 16);        /* power down activated               */
 #endif
   }
 }
@@ -303,9 +303,9 @@ void USBD_Reset (void) {
 
   SyncWriteEP       = 0;
   InPacketDataReady = 0;
-  OTG->DOEPMSK      = 0;
-  OTG->DIEPMSK      = 0;  
-  
+  OTG_DEV->DOEPMSK      = 0;
+  OTG_DEV->DIEPMSK      = 0;
+
   for (i = 0; i < (USBD_EP_NUM + 1); i++) {
     if (DOEPCTL(i) & (1UL << 31)) {
       DOEPCTL(i)  = (1 << 30) | (1 << 27);   /* OUT EP disable, Set NAK       */
@@ -319,30 +319,30 @@ void USBD_Reset (void) {
 
   USBD_SetAddress(0 , 1);
 
-  OTG->DAINTMSK  = (1 << 16) |          /* unmask IN&OUT EP0 interruts        */
+  OTG_DEV->DAINTMSK  = (1 << 16) |      /* unmask IN&OUT EP0 interruts        */
                     1;
-  OTG->DOEPMSK   = (1 << 3) |           /* setup phase done                   */
-                   (1 << 1) |           /* endpoint disabled                  */
-                    1;                  /* transfer complete                  */
-  OTG->DIEPMSK   = (1 << 1) |           /* endpoint disabled                  */
-                    1;                  /* transfer completed                 */
+  OTG_DEV->DOEPMSK   = (1 << 3) |       /* setup phase done                   */
+                       (1 << 1) |       /* endpoint disabled                  */
+                        1;              /* transfer complete                  */
+  OTG_DEV->DIEPMSK   = (1 << 1) |       /* endpoint disabled                  */
+                        1;              /* transfer completed                 */
 
-  OTG->GRXFSIZ   =  RX_FIFO_SIZE/4;
-  OTG->TX0FSIZ   = (RX_FIFO_SIZE/4) | ((TX0_FIFO_SIZE/4) << 16);
+  OTG->GRXFSIZ    =  RX_FIFO_SIZE/4;
+  OTG->DIEPTXF[0] = (RX_FIFO_SIZE/4) | ((TX0_FIFO_SIZE/4) << 16);
 
-  OTG->DIEPTXF1  = ((RX_FIFO_SIZE + TX0_FIFO_SIZE)/4) |
-                   ((TX1_FIFO_SIZE/4) << 16);
+  OTG->DIEPTXF[1] = ((RX_FIFO_SIZE + TX0_FIFO_SIZE)/4) |
+                    ((TX1_FIFO_SIZE/4) << 16);
 
-  OTG->DIEPTXF2  = ((RX_FIFO_SIZE + TX0_FIFO_SIZE + TX1_FIFO_SIZE)/4) |
-                   ((TX2_FIFO_SIZE/4) << 16);
+  OTG->DIEPTXF[2] = ((RX_FIFO_SIZE + TX0_FIFO_SIZE + TX1_FIFO_SIZE)/4) |
+                    ((TX2_FIFO_SIZE/4) << 16);
 
-  OTG->DIEPTXF3  = ((RX_FIFO_SIZE + TX0_FIFO_SIZE+ TX1_FIFO_SIZE +TX2_FIFO_SIZE)/4) |
-                   ((TX3_FIFO_SIZE/4) << 16);
-                   
-  OTG->DIEPTXF4  = ((RX_FIFO_SIZE + TX0_FIFO_SIZE + TX1_FIFO_SIZE + TX2_FIFO_SIZE + TX3_FIFO_SIZE)/4) | 
-                   ((TX4_FIFO_SIZE/4) << 16);                   
+  OTG->DIEPTXF[3] = ((RX_FIFO_SIZE + TX0_FIFO_SIZE+ TX1_FIFO_SIZE +TX2_FIFO_SIZE)/4) |
+                    ((TX3_FIFO_SIZE/4) << 16);
 
-  OTG->DOEPTSIZ0 =  (1 << 29) |         /* setup count = 1                    */
+  OTG->DIEPTXF[4] = ((RX_FIFO_SIZE + TX0_FIFO_SIZE + TX1_FIFO_SIZE + TX2_FIFO_SIZE + TX3_FIFO_SIZE)/4) |
+                    ((TX4_FIFO_SIZE/4) << 16);
+
+  DIEPTSIZ(0)     = (1 << 29) |         /* setup count = 1                    */
                     (1 << 19) |         /* packet count                       */
                      USBD_MAX_PACKET0;
 }
@@ -375,9 +375,9 @@ void USBD_Resume (void) {
  */
 
 void USBD_WakeUp (void) {
-  OTG->DCTL |= 1;                       /* remote wakeup signaling            */
+  OTG_DEV->DCTL |= 1;                   /* remote wakeup signaling            */
   usbd_stm32_delay (50);                /* Wait ~5 ms                         */
-  OTG->DCTL &= ~1;
+  OTG_DEV->DCTL &= ~1;
 }
 
 
@@ -400,7 +400,7 @@ void USBD_WakeUpCfg (BOOL cfg) {
 
 void USBD_SetAddress (uint32_t  adr, uint32_t setup) {
   if (setup) {
-    OTG->DCFG = (OTG->DCFG & ~(0x7f << 4)) | (adr << 4);
+    OTG_DEV->DCFG = (OTG_DEV->DCFG & ~(0x7f << 4)) | (adr << 4);
   }
 }
 
@@ -446,18 +446,19 @@ void USBD_ConfigEP (USB_ENDPOINT_DESCRIPTOR *pEPD) {
   type = pEPD->bmAttributes & USB_ENDPOINT_TYPE_MASK;
 
   if (pEPD->bEndpointAddress & USB_ENDPOINT_DIRECTION_MASK) {
-    OTG->DAINTMSK |= (1    << num);     /* unmask IN EP int                   */
     InPacketCnt[num] = 1;
-    DIEPCTL(num)   = (num  <<  22) |    /* fifo number                        */
-                     (type <<  18) |    /* ep type                            */
-                      val & 0x7FF;      /* max packet size                    */
+
+    OTG_DEV->DAINTMSK |= (1    << num);  /* unmask IN EP int                  */
+    DIEPCTL(num)       = (num  <<  22) | /* fifo number                       */
+                         (type <<  18) | /* ep type                           */
+                          val & 0x7FF;   /* max packet size                   */
     if ((type & 3) > 1)                 /* if interrupt or bulk EP            */
-      DIEPCTL(num) |= (1 << 28);        /* DATA0 PID                          */
+      DIEPCTL(num)    |= (1 << 28);     /* DATA0 PID                          */
   } else {
     OutMaxPacketSize[num] = val & 0x7FF;
     OutPacketCnt[num] = 1;
 
-    OTG->DAINTMSK |= (1 << (num + 16)); /* unmask OUT EP int                  */
+    OTG_DEV->DAINTMSK |= (1 << (num + 16)); /* unmask OUT EP int              */
 
     DOEPCTL(num)   = (type <<  18)|     /* EP type                            */
                      (val & 0x7FF);     /* max packet size                    */
@@ -536,7 +537,7 @@ void USBD_DisableEP (uint32_t EPNum) {
 
   /* Disable OUT Endpoint                                                     */
   } else {
-    OTG->DCTL |= (1 << 9);              /* set global out nak                 */
+    OTG_DEV->DCTL |= (1 << 9);          /* set global out nak                 */
 
     wcnt = 1000;
     while (!(OTG->GINTSTS & (1 << 7)))  /* wait until global NAK              */
@@ -550,7 +551,7 @@ void USBD_DisableEP (uint32_t EPNum) {
     wcnt = 1000;
     while(!(DOEPINT(EPNum) & (1 << 1)))   /* wait until EP disabled           */
       if ((wcnt--) == 0) break;
-    OTG->DCTL |= (1 << 10);               /* clear global nak                 */
+    OTG_DEV->DCTL |= (1 << 10);           /* clear global nak                 */
   }
 }
 
@@ -591,7 +592,7 @@ void USBD_SetStallEP (uint32_t EPNum) {
 
   /* Stall OUT Endpoint                                                       */
   if (!(EPNum & 0x80)) {
-    OTG->DCTL |= (1 << 9);              /* set global out nak                 */
+    OTG_DEV->DCTL |= (1 << 9);          /* set global out nak                 */
     wcnt = 1000;
     while (!(OTG->GINTSTS & (1 << 7)))    /* wait until global NAK            */
       if ((wcnt--) == 0) break;
@@ -603,8 +604,8 @@ void USBD_SetStallEP (uint32_t EPNum) {
     wcnt = 1000;
     while(!(DOEPINT(EPNum) & (1 << 1))) /* wait until EP disabled             */
       if ((wcnt--) == 0) break;
-      
-    OTG->DCTL |= (1 << 10);             /* clear global nak                   */
+
+    OTG_DEV->DCTL |= (1 << 10);         /* clear global nak                   */
 
   /* Stall IN endpoint                                                        */
   } else {
@@ -729,14 +730,14 @@ uint32_t USBD_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
       ptr = InPacketDataPtr[EPNum];
       val   = (cnt+3)/4;
       if (val) {
-        while (val--) {                   /* save data to intermediate buffer   */
+        while (val--) {                 /* save data to intermediate buffer   */
           *ptr++ = *((uint32_t *)pData);
           pData +=4;
         }
       }
-        InPacketDataReady |=  1 << EPNum;
-        DIEPCTL(EPNum)    |= (1 << 27); /* Set NAK to enable interrupt on NAK */
-        OTG->DIEPMSK   |= (1 <<  6);    /* INEPNEM = 1, IN EP NAK efective msk*/
+      InPacketDataReady |=  1 << EPNum;
+      DIEPCTL(EPNum)    |= (1 << 27); /* Set NAK to enable interrupt on NAK */
+      OTG_DEV->DIEPMSK   |= (1 <<  6);  /* INEPNEM = 1, IN EP NAK efective msk*/
     } else {                            /* If packet already loaded to buffer */
       return 0;
     }
@@ -768,7 +769,7 @@ uint32_t USBD_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
  */
 
 uint32_t USBD_GetFrame (void) {
-  return ((OTG->DSTS >> 8) & 0x3FFF);
+  return ((OTG_DEV->DSTS >> 8) & 0x3FFF);
 }
 
 
@@ -817,13 +818,13 @@ void USBD_Handler(void)
 
 /* speed enumeration completed                                                */
   if (istr & (1 << 13)) {
-    if (!((OTG_HS->DSTS >> 1) & 3)) {
+    if (!((OTG_DEV->DSTS >> 1) & 3)) {
       USBD_HighSpeed = 1;
     }
-    OTG->DIEPCTL0   &= ~0x3FF;
-    OTG->DIEPCTL0   |= OutMaxPacketSize[0] ;    /* EP0 max packet             */
-    OTG->DCTL       |= (1UL << 8);      /* clear global IN NAK                */
-    OTG->DCTL       |= (1UL << 10);     /* clear global OUT NAK               */
+    DIEPCTL(0)      &= ~0x3FF;
+    DIEPCTL(0)      |= OutMaxPacketSize[0] ;    /* EP0 max packet             */
+    OTG_DEV->DCTL   |= (1UL << 8);      /* clear global IN NAK                */
+    OTG_DEV->DCTL   |= (1UL << 10);     /* clear global OUT NAK               */
     OTG->GINTSTS    |= (1UL << 13);
   }
 
@@ -863,7 +864,7 @@ void USBD_Handler(void)
 
 /* OUT Packet                                                                 */
   if (istr & (1 << 19)) {
-    msk = (((OTG->DAINT & OTG->DAINTMSK) >> 16) & 0xFFFF);
+    msk = (((OTG_DEV->DAINT & OTG_DEV->DAINTMSK) >> 16) & 0xFFFF);
     i   = 0;
     while (msk) {
       num = 0;
@@ -907,7 +908,7 @@ void USBD_Handler(void)
 
 /* IN Packet                                                                  */
   if (istr & (1 << 18)) {
-    msk = (OTG->DAINT & OTG->DAINTMSK & 0xFFFF);
+    msk = (OTG_DEV->DAINT & OTG_DEV->DAINTMSK & 0xFFFF);
     i   = 0;
     while (msk) {
       num = 0;
@@ -926,25 +927,25 @@ void USBD_Handler(void)
 
       /* IN endpoint NAK effective                                            */
       if (DIEPINT(num) & (1 << 6)) {
-          if (InPacketDataPtr[num] && (InPacketDataReady & (1 << num))) {
-            SyncWriteEP = 1;
-            USBD_WriteEP (num, (uint8_t *)InPacketDataPtr[num], InPacketDataCnt[num]);
-            SyncWriteEP = 0;
-            if (!InPacketDataReady)     /* No more pending IN transfers       */
-              OTG->DIEPMSK &= ~(1 << 6);/* Disable IN NAK interrupts          */
-            continue;
-          } else
-              DIEPCTL(num) |= (1 << 26);
-            DIEPINT(num)    = (1 <<  6);
-        }
+        if (InPacketDataPtr[num] && (InPacketDataReady & (1 << num))) {
+          SyncWriteEP = 1;
+          USBD_WriteEP (num, (uint8_t *)InPacketDataPtr[num], InPacketDataCnt[num]);
+          SyncWriteEP = 0;
+          if (!InPacketDataReady)     /* No more pending IN transfers       */
+            OTG_DEV->DIEPMSK &= ~(1 << 6);/* Disable IN NAK interrupts      */
+          continue;
+        } else
+            DIEPCTL(num) |= (1 << 26);
+          DIEPINT(num)    = (1 <<  6);
+      }
 
       /* Transmit completed                                                   */
       if (DIEPINT(num) & 1) {
         DIEPINT(num) = 1;
         SyncWriteEP = 1;
-          if (USBD_P_EP[num]) {
-            USBD_P_EP[num](USBD_EVT_IN);
-          }
+        if (USBD_P_EP[num]) {
+          USBD_P_EP[num](USBD_EVT_IN);
+        }
         SyncWriteEP = 0;
       }
     }
