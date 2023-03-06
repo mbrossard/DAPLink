@@ -24,6 +24,10 @@
 
 void gpio_init(void)
 {
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
 }
 
 void gpio_set_hid_led(gpio_led_state_t state)
