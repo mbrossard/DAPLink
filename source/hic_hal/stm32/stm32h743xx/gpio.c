@@ -24,6 +24,11 @@
 
 void gpio_init(void)
 {
+    __GPIOA_CLK_ENABLE();
+    __GPIOB_CLK_ENABLE();
+    __GPIOC_CLK_ENABLE();
+    __GPIOH_CLK_ENABLE();
+    __GPIOI_CLK_ENABLE();
 }
 
 void gpio_set_hid_led(gpio_led_state_t state)
