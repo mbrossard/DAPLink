@@ -20,6 +20,7 @@
  */
 
 #include "gpio.h"
+#include "stm32f7xx_hal.h"
 
 void gpio_init(void)
 {
