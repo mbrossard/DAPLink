@@ -24,11 +24,11 @@
 #include "stm32f7xx_hal_pwr_ex.h"
 #include "util.h"
 
-#if defined(NUCLEO_F746ZG) && !defined(DISCOVERY_F746ZG)
-
-#if !defined(HSE_VALUE) || (HSE_VALUE != 8000000)
-#error "HSE_VALUE must be set to 8MHz"
+#if !defined(HSE_VALUE)
+#error "HSE_VALUE must be set"
 #endif
+
+#if defined(NUCLEO_F746ZG) && !defined(DISCOVERY_F746ZG)
 
 /**
   * @brief  System Clock Configuration
