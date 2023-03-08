@@ -3,6 +3,7 @@ common:
         # - FORCE_USB_FS
         # - USB_OTG_SET_FS_SPEED
         - DISCOVERY_F746ZG
+        - HSE_VALUE=25000000U
         - DAPLINK_DEBUG
         - DAPLINK_DEBUG_RTT
         - DEBUG_USBD
