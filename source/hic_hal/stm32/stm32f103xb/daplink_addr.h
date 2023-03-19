@@ -24,7 +24,7 @@
 
 /* ROM sizes */
 
-#ifndef STM32F103C8
+#if defined(INTERFACE_STM32F103XB)
 
 #define DAPLINK_ROM_START               0x08000000
 #define DAPLINK_ROM_SIZE                0x00020000
@@ -38,7 +38,7 @@
 #define DAPLINK_ROM_CONFIG_USER_START   0x0801FC00
 #define DAPLINK_ROM_CONFIG_USER_SIZE    0x00000400
 
-#else
+#elif defined(INTERFACE_STM32F103X8)
 
 #define DAPLINK_ROM_START               0x08000000
 #define DAPLINK_ROM_SIZE                0x00010000
@@ -79,12 +79,21 @@
 #define DAPLINK_ROM_UPDATE_START         DAPLINK_ROM_IF_START
 #define DAPLINK_ROM_UPDATE_SIZE          DAPLINK_ROM_IF_SIZE
 
+#if defined(INTERFACE_STM32F103X8)
+#error "stm32f103c8 HIC does not support bootloader"
+#endif
+
 #elif defined(DAPLINK_IF)
 
 #define DAPLINK_ROM_APP_START            DAPLINK_ROM_IF_START
 #define DAPLINK_ROM_APP_SIZE             DAPLINK_ROM_IF_SIZE
+#if defined(INTERFACE_STM32F103XB)
 #define DAPLINK_ROM_UPDATE_START         DAPLINK_ROM_BL_START
 #define DAPLINK_ROM_UPDATE_SIZE          DAPLINK_ROM_BL_SIZE
+#elif defined(INTERFACE_STM32F103X8)
+#define DAPLINK_ROM_UPDATE_START         DAPLINK_ROM_IF_START
+#define DAPLINK_ROM_UPDATE_SIZE          0
+#endif
 
 #else
 

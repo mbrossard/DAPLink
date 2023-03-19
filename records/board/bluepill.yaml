@@ -1,3 +1,6 @@
 common:
+    includes:
+        - source/board/bluepill
     macros:
+        - IO_CONFIG_OVERRIDE
         - STM32F103C8

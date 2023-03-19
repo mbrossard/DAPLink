@@ -3,7 +3,8 @@
  * @brief
  *
  * DAPLink Interface Firmware
- * Copyright (c) 2009-2016, ARM Limited, All Rights Reserved
+ * Copyright (c) 2023, Arm Limited, All Rights Reserved
+ * Copyright (c) 2023, mathias@brossard.org
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -18,13 +19,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#ifdef IO_CONFIG_OVERRIDE // Override if IO_CONFIG_OVERRIDE is defined
-#include "IO_Config_Override.h"
-#ifndef __IO_CONFIG_H__
-#define __IO_CONFIG_H__
-#endif
-#endif
 
 #ifndef __IO_CONFIG_H__
 #define __IO_CONFIG_H__
@@ -42,11 +36,6 @@ COMPILER_ASSERT((DAPLINK_HIC_ID == DAPLINK_HIC_ID_STM32F103XB) ||
 #define USB_CONNECT_PIN              GPIO_PIN_15
 #define USB_CONNECT_ON()             (USB_CONNECT_PORT->BSRR = USB_CONNECT_PIN)
 #define USB_CONNECT_OFF()            (USB_CONNECT_PORT->BRR  = USB_CONNECT_PIN)
-
-// Connected LED
-#define CONNECTED_LED_PORT           GPIOB
-#define CONNECTED_LED_PIN            GPIO_PIN_6
-#define CONNECTED_LED_PIN_Bit        6
 
 // When bootloader, disable the target port(not used)
 #define POWER_EN_PIN_PORT            GPIOB
@@ -89,26 +78,24 @@ COMPILER_ASSERT((DAPLINK_HIC_ID == DAPLINK_HIC_ID_STM32F103XB) ||
 #define JTAG_TDO_PIN_Bit             6
 
 // LEDs
-// USB status LED
-#define RUNNING_LED_PORT             GPIOA
-#define RUNNING_LED_PIN              GPIO_PIN_9
-#define RUNNING_LED_Bit              9
+#define CONNECTED_LED_PORT           GPIOB
+#define CONNECTED_LED_PIN            GPIO_PIN_5
+#define CONNECTED_LED_PIN_Bit        5
 
-#define PIN_HID_LED_PORT             GPIOA
-#define PIN_HID_LED                  GPIO_PIN_9
-#define PIN_HID_LED_Bit              9
+#define RUNNING_LED_PORT             GPIOB
+#define RUNNING_LED_PIN              GPIO_PIN_6
+#define RUNNING_LED_Bit              6
 
-#define PIN_CDC_LED_PORT             GPIOA
-#define PIN_CDC_LED                  GPIO_PIN_9
-#define PIN_CDC_LED_Bit              9
+#define PIN_HID_LED_PORT             GPIOB
+#define PIN_HID_LED                  GPIO_PIN_7
+#define PIN_HID_LED_Bit              7
 
-#define PIN_MSC_LED_PORT             GPIOA
+#define PIN_CDC_LED_PORT             GPIOB
+#define PIN_CDC_LED                  GPIO_PIN_8
+#define PIN_CDC_LED_Bit              8
+
+#define PIN_MSC_LED_PORT             GPIOB
 #define PIN_MSC_LED                  GPIO_PIN_9
 #define PIN_MSC_LED_Bit              9
-
-#include "Driver_USART.h"
-extern ARM_DRIVER_USART Driver_USART2;
-#define CMSIS_UART_INSTANCE          (Driver_USART2)
-#define CMSIS_UART_IRQ               (USART2_IRQn)
 
 #endif
