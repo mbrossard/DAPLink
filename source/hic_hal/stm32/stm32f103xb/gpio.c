@@ -132,18 +132,25 @@ void gpio_init(void)
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
     HAL_GPIO_Init(USB_CONNECT_PORT, &GPIO_InitStructure);
-    // configure LEDs
+
+    // Configure LEDs
+    HAL_GPIO_WritePin(CONNECTED_LED_PORT, CONNECTED_LED_PIN, GPIO_PIN_SET);
+    GPIO_InitStructure.Pin = CONNECTED_LED_PIN;
+    GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
+    HAL_GPIO_Init(CONNECTED_LED_PORT, &GPIO_InitStructure);
+
     HAL_GPIO_WritePin(RUNNING_LED_PORT, RUNNING_LED_PIN, GPIO_PIN_SET);
     GPIO_InitStructure.Pin = RUNNING_LED_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
     HAL_GPIO_Init(RUNNING_LED_PORT, &GPIO_InitStructure);
 
-    HAL_GPIO_WritePin(CONNECTED_LED_PORT, CONNECTED_LED_PIN, GPIO_PIN_SET);
-    GPIO_InitStructure.Pin = CONNECTED_LED_PIN;
+    HAL_GPIO_WritePin(PIN_HID_LED_PORT, PIN_HID_LED, GPIO_PIN_SET);
+    GPIO_InitStructure.Pin = PIN_HID_LED;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
-    HAL_GPIO_Init(CONNECTED_LED_PORT, &GPIO_InitStructure);
+    HAL_GPIO_Init(PIN_HID_LED_PORT, &GPIO_InitStructure);
 
     HAL_GPIO_WritePin(PIN_CDC_LED_PORT, PIN_CDC_LED, GPIO_PIN_SET);
     GPIO_InitStructure.Pin = PIN_CDC_LED;
