@@ -103,6 +103,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         // uart read
         int32_t read_len = 62;
         read_len = uart_read_data(response + 1, read_len);
+        main_blink_hid_led(MAIN_LED_DEF); // Cancel HID LED flash
         if (read_len) {
             main_blink_cdc_led(MAIN_LED_FLASH);
         }
@@ -116,6 +117,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         int32_t write_len = *request;
         request++;
         uart_write_data((uint8_t *)request, write_len);
+        main_blink_hid_led(MAIN_LED_DEF); // Cancel HID LED flash
         main_blink_cdc_led(MAIN_LED_FLASH);
         *response = 1;
         num += ((write_len + 1) << 16) | 1;
