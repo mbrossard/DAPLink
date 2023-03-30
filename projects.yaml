@@ -631,6 +631,15 @@ projects:
         - *module_if
         - *module_hic_stm32f103xb
         - records/board/ublox_evk_odin_w2.yaml
+    nrf52840_thingy91_if:
+        - *module_if
+        - *module_hic_nrf52840
+        - records/board/thingy91.yaml
+    nrf52840_dongle_if:
+        - *module_if
+        - *module_hic_nrf52840
+        - records/board/nrf52840_dongle.yaml
+
 
 
     # Test projects
