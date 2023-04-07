@@ -663,6 +663,10 @@ HAL_StatusTypeDef  USB_SetDevAddress(USB_TypeDef *USBx, uint8_t address)
     /* set device address and enable function */
     USBx->DADDR = (uint16_t)USB_DADDR_EF;
   }
+  else
+  {
+    USBx->DADDR = (uint16_t)(USB_DADDR_EF | address);
+  }
 
   return HAL_OK;
 }

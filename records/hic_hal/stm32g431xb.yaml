@@ -1,0 +1,49 @@
+common:
+    target:
+        - Cortex-M4
+    core:
+        - Cortex-M4
+    macros:
+        - INTERFACE_STM32G431XB
+        - USE_HAL_DRIVER
+        - STM32G431xx
+        - DAPLINK_HIC_ID=0x9507EC41  # DAPLINK_HIC_ID_STM32G431XB
+        - __packed=__packed          # Prevent redefinition of __packed with ARMCC
+        - DAPLINK_NO_ASSERT_FILENAMES
+        - OS_CLOCK=170000000
+    includes:
+        - source/hic_hal/stm32/stm32g431xb
+        - source/hic_hal/stm32/stm32g431xb/cmsis
+        - source/hic_hal/stm32/hal/STM32G4xx_HAL_Driver
+        - source/hic_hal/stm32/hal/STM32G4xx_HAL_Driver/Inc
+    sources:
+        hic_hal:
+            - source/hic_hal/stm32/stm32g431xb
+            - source/hic_hal/stm32/stm32g431xb/cmsis
+            - source/hic_hal/stm32/hal/STM32G4xx_HAL_Driver/Src
+
+tool_specific:
+    uvision:
+        misc:
+            ld_flags:
+                - --predefine="-I..\..\..\source\hic_hal\stm32\stm32g431xb"
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32g431xb/armcc
+    armcc:
+        misc:
+            asm_flags:
+                - --no_unaligned_access
+            c_flags:
+                - --no_unaligned_access
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32g431xb/armcc
+    armclang:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32g431xb/armcc
+    gcc_arm:
+        sources:
+            hic_hal:
+                - source/hic_hal/stm32/stm32g431xb/gcc
