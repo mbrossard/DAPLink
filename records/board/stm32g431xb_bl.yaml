@@ -1,0 +1,4 @@
+common:
+    sources:
+        board:
+            - source/board/stm32g431xb_bl.c
