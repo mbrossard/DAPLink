@@ -741,7 +741,7 @@ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle(UART_HandleTypeDef *huart, uint8_t *p
     uhMask = huart->Mask;
 
     /* In case of 9bits/No Parity transfer, pRxData needs to be handled as a uint16_t pointer */
-    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == UART_PARITY_NONE))
+    if ((huart->Init.WordLength == UART_WORDLENGTH_9B) && (huart->Init.Parity == HAL_UART_PARITY_NONE))
     {
       pdata8bits  = NULL;
       pdata16bits = (uint16_t *) pData;
