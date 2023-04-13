@@ -30,6 +30,7 @@
 #include "crc.h"
 #include "info.h"
 
+#if !defined(NRF_SECURE_BOOTLOADER)
 // Application start must be aligned to page write
 COMPILER_ASSERT(DAPLINK_ROM_APP_START % DAPLINK_MIN_WRITE_SIZE == 0);
 // Application size must be a multiple of write size
@@ -42,6 +43,7 @@ COMPILER_ASSERT(DAPLINK_ROM_APP_START % DAPLINK_SECTOR_SIZE == 0);
 COMPILER_ASSERT(DAPLINK_ROM_UPDATE_START % DAPLINK_SECTOR_SIZE == 0);
 // Update size must be a multiple of sector size
 COMPILER_ASSERT(DAPLINK_ROM_UPDATE_SIZE % DAPLINK_SECTOR_SIZE == 0);
+#endif
 
 typedef enum {
     STATE_CLOSED,
