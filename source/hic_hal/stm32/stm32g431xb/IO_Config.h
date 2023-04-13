@@ -65,5 +65,12 @@ COMPILER_ASSERT(DAPLINK_HIC_ID == DAPLINK_HIC_ID_STM32G431XB);
 #define PIN_MSC_LED                  GPIO_PIN_11
 #define PIN_MSC_LED_Bit              11
 
+//SWO
+#define MX_USART1                    1
+#define MX_USART1_VM                 VM_ASYNC
+
+#define PIN_SWO_RX_PORT              GPIOA
+#define PIN_SWO_RX                   GPIO_PIN_10
+#define PIN_SWO_RX_Bit               10
 
 #endif
