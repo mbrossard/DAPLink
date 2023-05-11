@@ -24,7 +24,6 @@
 #include "DAP_config.h"
 #include "gpio.h"
 #include "daplink.h"
-#include "hic_init.h"
 #include "fsl_clock.h"
 #include "fsl_iocon.h"
 #include "fsl_reset.h"
@@ -39,7 +38,7 @@ void gpio_init(void)
     // Enable hardfault on unaligned access for the interface only.
     // If this is done in the bootloader than then it might (will) break
     // older application firmware or firmware from 3rd party vendors.
-#if defined(DAPLINK_IF)
+#if defined(DAPLINK_IF) && defined(RL_USB)
     SCB->CCR |= SCB_CCR_UNALIGN_TRP_Msk;
 #endif
 
