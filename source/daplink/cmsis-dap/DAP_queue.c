@@ -22,7 +22,9 @@
 #include <string.h>
 #include "DAP_queue.h"
 #include "daplink_vendor_commands.h"
+#ifndef TINYDAP
 #include "main_interface.h"
+#endif
 
 void DAP_queue_init(DAP_queue * queue)
 {
@@ -76,9 +78,11 @@ int DAP_queue_execute_buf(DAP_queue * queue, const uint8_t *reqbuf, int len, uin
 {
     uint32_t rsize;
     if (queue->free_count > 0) {
+#ifndef TINYDAP
         if (DAP_activity_blink(reqbuf)) {
             main_blink_hid_led(MAIN_LED_FLASH);
         }
+#endif
 
         if (len > DAP_PACKET_SIZE) {
             len = DAP_PACKET_SIZE;

@@ -21,7 +21,6 @@
 
 #include <string.h>
 #include "info.h"
-#include "target_config.h"
 #include "read_uid.h"
 #include "util.h"
 #include "crc.h"
@@ -29,6 +28,7 @@
 #include "settings.h"
 #ifdef TARGET_BOARD
 #include "target_board.h"
+#include "target_config.h"
 #endif
 #include "flash_hal.h"
 

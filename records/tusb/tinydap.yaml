@@ -1,0 +1,24 @@
+common:
+    macros:
+        - TINYDAP
+        - DAPLINK_DEBUG
+        - DAPLINK_DEBUG_RTT
+        - DAPLINK_DEBUG_TUSB
+        - DAPLINK_IF
+        - DAPLINK_BUILD_KEY=0x9B939E8F
+
+    includes:
+        - source/daplink
+        - source/cmsis-core
+        - source/hic_hal
+        - source/hic_hal/cmsis-driver
+        - source/tusb/tdap
+        - source/tusb
+
+    sources:
+        dap:
+            - source/tusb/tdap
+            - source/daplink/info.c
+            - source/daplink/util.c
+            - source/daplink/daplink_debug.c
+            - source/daplink/interface/daplink.c

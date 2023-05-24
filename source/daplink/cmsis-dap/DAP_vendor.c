@@ -32,7 +32,9 @@
 #include "DAP.h"
 #include "info.h"
 #include "daplink.h"
+#ifndef TINYDAP
 #include DAPLINK_MAIN_HEADER
+#endif
 #include "uart.h"
 #include "settings.h"
 #include <string.h>
@@ -129,6 +131,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
     case ID_DAP_Vendor5:  break;
     case ID_DAP_Vendor6:  break;
     case ID_DAP_Vendor7:  break;
+#ifndef TINYDAP
     case ID_DAP_SetUSBTestMode: {
         *response = 1;
         if (0 == *request) {
@@ -150,6 +153,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         num += 1;
         break;
     }
+#endif
 #ifdef DRAG_N_DROP_SUPPORT
     case ID_DAP_MSD_Open: {
         // open mass storage device stream
