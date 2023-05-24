@@ -1,0 +1,9 @@
+common:
+    macros:
+        - MSC_ENDPOINT=1
+    includes:
+        - source/tusb/tinyusb/src/class/msc
+    sources:
+        msc:
+            - source/tusb/tinyusb/src/class/msc
+            - source/tusb/msc

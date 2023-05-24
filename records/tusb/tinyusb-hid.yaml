@@ -1,0 +1,9 @@
+common:
+    macros:
+        - HID_ENDPOINT=1
+    includes:
+        - source/tusb/tinyusb/src/class/hid
+    sources:
+        hid:
+            - source/tusb/tinyusb/src/class/hid
+            - source/tusb/hid

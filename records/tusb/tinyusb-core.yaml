@@ -1,0 +1,13 @@
+common:
+    includes:
+        - source/tusb/tinyusb/src
+        - source/tusb/tinyusb/src/common
+        - source/tusb/tinyusb/src/device
+        - source/tusb/tinyusb/src/osal
+        - source/tusb/core
+    sources:
+        tinyusb:
+            - source/tusb/tinyusb/src
+            - source/tusb/tinyusb/src/common
+            - source/tusb/tinyusb/src/device
+            - source/tusb/core
