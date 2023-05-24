@@ -1,0 +1,8 @@
+common:
+    macros:
+        - CDC_ENDPOINT=1
+    includes:
+        - source/tusb/tinyusb/src/class/cdc
+    sources:
+        bulk:
+            - source/tusb/tinyusb/src/class/cdc
