@@ -1,0 +1,45 @@
+#ifndef __GPIO_H
+#define __GPIO_H
+
+#include "gpio_fs.h"
+
+typedef enum {
+    GPIO_IO_TYPE_PERIPHERAL     = 0x00 << IO_BANK0_GPIO0_CTRL_OEOVER_Pos,
+    GPIO_IO_TYPE_INV_PERIPHERAL = 0x01 << IO_BANK0_GPIO0_CTRL_OEOVER_Pos,
+    GPIO_IO_TYPE_INPUT          = 0x02 << IO_BANK0_GPIO0_CTRL_OEOVER_Pos,
+    GPIO_IO_TYPE_OUTPUT         = 0x03 << IO_BANK0_GPIO0_CTRL_OEOVER_Pos,
+} eGPIO_IO_Type;
+
+typedef enum {
+    GPIO_OUTPUT_PERIPHERAL     = 0x00 << IO_BANK0_GPIO0_CTRL_OUTOVER_Pos,
+    GPIO_OUTPUT_PERIPHERAL_INV = 0x01 << IO_BANK0_GPIO0_CTRL_OUTOVER_Pos,
+    GPIO_OUTPUT_LOW            = 0x02 << IO_BANK0_GPIO0_CTRL_OUTOVER_Pos,
+    GPIO_OUTPUT_HIGH           = 0x03 << IO_BANK0_GPIO0_CTRL_OUTOVER_Pos,
+} eGPIO_Output;
+
+typedef enum {
+    GPIO_SPEED_LOW       = 0x00 << PADS_BANK0_GPIO0_DRIVE_Pos,
+    GPIO_SPEED_MEDIUM    = 0x01 << PADS_BANK0_GPIO0_DRIVE_Pos,
+    GPIO_SPEED_HIGH      = 0x02 << PADS_BANK0_GPIO0_DRIVE_Pos,
+    GPIO_SPEED_VERY_HIGH = 0x03 << PADS_BANK0_GPIO0_DRIVE_Pos,
+} eGPIO_Speed;
+
+typedef enum {
+    GPIO_NOPULL    = 0x00,
+    GPIO_PULL_UP   = PADS_BANK0_GPIO0_PUE_Msk,
+    GPIO_PULL_DOWN = PADS_BANK0_GPIO0_PDE_Msk,
+} eGPIO_Pull;
+
+#define GPIO_AF_NONE 0x1F
+
+#define GPIO_ENABLE_PULL(gpio, pull) MODIFY_REG(PADS_BANK0->GPIO##gpio, PADS_BANK0_GPIO##gpio##_PDE_Msk | PADS_BANK0_GPIO##gpio##_PUE_Msk, pull)
+#define GPIO_CLEAR_PULL(gpio)      CLEAR_BIT(PADS_BANK0->GPIO##gpio, PADS_BANK0_GPIO##gpio##_PDE_Msk | PADS_BANK0_GPIO##gpio##_PUE_Msk)
+
+#define GPIO_SET_IO_TYPE(gpio, io) MODIFY_REG(IO_BANK0->GPIO##gpio##_CTRL, IO_BANK0_GPIO##gpio##_CTRL_OUTOVER_Msk, io)
+
+#define GPIO_PIN_SET(gpio)   MODIFY_REG(IO_BANK0->GPIO##gpio##_CTRL, IO_BANK0_GPIO##gpio##_CTRL_OUTOVER_Msk, GPIO_OUTPUT_HIGH)
+#define GPIO_PIN_RESET(gpio) MODIFY_REG(IO_BANK0->GPIO##gpio##_CTRL, IO_BANK0_GPIO##gpio##_CTRL_OUTOVER_Msk, GPIO_OUTPUT_LOW)
+
+void GPIO_Init(uint32_t gpio_no, eGPIO_IO_Type io_type, eGPIO_Pull pu_pd, eGPIO_Speed speed, uint32_t alternate_function);
+
+#endif
