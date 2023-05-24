@@ -28,7 +28,6 @@
  *
  *---------------------------------------------------------------------------*/
 
-#include "rl_usb.h"
 #include "DAP_config.h"
 #include "DAP.h"
 #include "info.h"
@@ -36,13 +35,17 @@
 #include DAPLINK_MAIN_HEADER
 #include "uart.h"
 #include "settings.h"
-#include "target_family.h"
-#include "flash_manager.h"
 #include <string.h>
 #include "daplink_vendor_commands.h"
 
+#if defined(CDC_ENDPOINT) && defined(RL_USB)
+#include "rl_usb.h"
+#endif
+
 #ifdef DRAG_N_DROP_SUPPORT
+#include "flash_manager.h"
 #include "file_stream.h"
+#include "target_family.h"
 #endif
 
 //**************************************************************************************************
@@ -76,6 +79,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         num += (len + 1); // increment response count by ID length + length byte
         break;
     }
+#if defined(CDC_ENDPOINT) && defined(RL_USB)
     case ID_DAP_UART_GetLineCoding: {
         // get line coding
         int32_t read_len = sizeof(CDC_LINE_CODING);
@@ -121,6 +125,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         num += ((write_len + 1) << 16) | 1;
         break;
     }
+#endif
     case ID_DAP_Vendor5:  break;
     case ID_DAP_Vendor6:  break;
     case ID_DAP_Vendor7:  break;
@@ -167,7 +172,6 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         num += ((write_len + 1) << 16) | 1;
         break;
     }
-#endif
     case ID_DAP_SelectEraseMode: {
         // switching between chip erase and page erase
         //              COMMAND(OUT Packet)
@@ -187,6 +191,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         num += (1U << 16) | 1U; // increment request and response count each by 1
         break;
     }
+#endif
     case ID_DAP_Vendor14: break;
     case ID_DAP_Vendor15: break;
     case ID_DAP_Vendor16: break;

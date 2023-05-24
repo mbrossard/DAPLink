@@ -4,7 +4,7 @@
  *
  * DAPLink Interface Firmware
  * Copyright (c) 2009-2020, ARM Limited, All Rights Reserved
- * Copyright 2019, Cypress Semiconductor Corporation 
+ * Copyright 2019, Cypress Semiconductor Corporation
  * or a subsidiary of Cypress Semiconductor Corporation.
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -24,10 +24,10 @@
 #include <string.h>
 
 #include "settings.h"
-#include "target_config.h"
 #include "compiler.h"
 #include "cortex_m.h"
 #include "daplink.h"
+#include "util.h"
 
 // 'kvld' in hex - key valid
 #define CFG_KEY             0x6b766c64

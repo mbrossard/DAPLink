@@ -24,7 +24,6 @@
 #include "daplink.h"
 #include DAPLINK_MAIN_HEADER
 #include "cmsis_os2.h"
-#include "rl_usb.h"
 #include "virtual_fs.h"
 #include "vfs_manager.h"
 #include "daplink_debug.h"
@@ -35,6 +34,10 @@
 #include "IO_Config.h"
 #include "file_stream.h"
 #include "error.h"
+
+#if defined(RL_USB) && defined(MSC_ENDPOINT)
+#include "rl_usb.h"
+#endif
 
 // Set to 1 to enable debugging
 #define DEBUG_VFS_MANAGER     0
@@ -117,13 +120,13 @@ static const file_transfer_state_t default_transfer_state = {
 
 //Compile option not to include MSC at all, these will be dummy variables
 #ifndef MSC_ENDPOINT
-BOOL USBD_MSC_MediaReady = __FALSE;
-BOOL USBD_MSC_ReadOnly = __FALSE;
-U32 USBD_MSC_MemorySize;
-U32 USBD_MSC_BlockSize;
-U32 USBD_MSC_BlockGroup;
-U32 USBD_MSC_BlockCount;
-U8 *USBD_MSC_BlockBuf;
+uint32_t USBD_MSC_MediaReady = 0;
+uint32_t USBD_MSC_ReadOnly = 0;
+uint32_t USBD_MSC_MemorySize;
+uint32_t USBD_MSC_BlockSize;
+uint32_t USBD_MSC_BlockGroup;
+uint32_t USBD_MSC_BlockCount;
+uint8_t *USBD_MSC_BlockBuf;
 #endif
 
 static uint32_t usb_buffer[VFS_SECTOR_SIZE / sizeof(uint32_t)];

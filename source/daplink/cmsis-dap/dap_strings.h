@@ -21,7 +21,9 @@
 #include "cmsis_compiler.h"
 #include "info.h"
 #include "util.h"
+#ifdef TARGET_BOARD
 #include "target_board.h"
+#endif
 
 #if !defined(CMSIS_DAP_PRODUCT_NAME)
 #define CMSIS_DAP_PRODUCT_NAME "DAPLink CMSIS-DAP"
@@ -76,12 +78,16 @@ __STATIC_INLINE uint8_t DAP_GetSerNumString (char *str) {
 \return String length (including terminating NULL character) or 0 (no string).
 */
 __STATIC_INLINE uint8_t DAP_GetTargetDeviceVendorString (char *str) {
+#ifdef TARGET_BOARD
     if (g_board_info.target_cfg && g_board_info.target_cfg->target_vendor) {
         return return_dap_string(str, g_board_info.target_cfg->target_vendor);
     }
     else {
         return (0U);
     }
+#else
+    return (0U);
+#endif
 }
 
 /** Get Target Device Name string.
@@ -89,12 +95,16 @@ __STATIC_INLINE uint8_t DAP_GetTargetDeviceVendorString (char *str) {
 \return String length (including terminating NULL character) or 0 (no string).
 */
 __STATIC_INLINE uint8_t DAP_GetTargetDeviceNameString (char *str) {
+#ifdef TARGET_BOARD
     if (g_board_info.target_cfg && g_board_info.target_cfg->target_part_number) {
         return return_dap_string(str, g_board_info.target_cfg->target_part_number);
     }
     else {
         return (0U);
     }
+#else
+    return (0U);
+#endif
 }
 
 /** Get Target Board Vendor string.
@@ -102,12 +112,16 @@ __STATIC_INLINE uint8_t DAP_GetTargetDeviceNameString (char *str) {
 \return String length (including terminating NULL character) or 0 (no string).
 */
 __STATIC_INLINE uint8_t DAP_GetTargetBoardVendorString (char *str) {
+#ifdef TARGET_BOARD
     if (g_board_info.board_vendor) {
         return return_dap_string(str, g_board_info.board_vendor);
     }
     else {
         return (0U);
     }
+#else
+    return (0U);
+#endif
 }
 
 /** Get Target Board Name string.
@@ -115,12 +129,16 @@ __STATIC_INLINE uint8_t DAP_GetTargetBoardVendorString (char *str) {
 \return String length (including terminating NULL character) or 0 (no string).
 */
 __STATIC_INLINE uint8_t DAP_GetTargetBoardNameString (char *str) {
+#ifdef TARGET_BOARD
     if (g_board_info.board_name) {
         return return_dap_string(str, g_board_info.board_name);
     }
     else {
         return (0U);
     }
+#else
+    return (0U);
+#endif
 }
 
 /** Get Product Firmware Version string.
