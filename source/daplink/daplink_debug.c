@@ -23,8 +23,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include "cmsis_os2.h"
-#include "rl_usb.h"
 #include "util.h"
 
 #if defined (DAPLINK_DEBUG)
@@ -38,7 +36,7 @@ uint32_t daplink_debug(uint8_t *buf, uint32_t size)
     return SEGGER_RTT_Write(0, buf, size);
 }
 
-#else
+#elif defined (CDC_ENDPOINT)
 
 static const char error_msg[] = "\r\n<OVERFLOW>\r\n";
 

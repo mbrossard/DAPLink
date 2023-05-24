@@ -8,6 +8,7 @@ common:
         - DAPLINK_HIC_ID=0x97969921  # DAPLINK_HIC_ID_M48SSIDAE
         - OS_CLOCK=192000000
         - DAPLINK_IF
+        - RL_USB
     includes:
         - source/hic_hal/nuvoton/m48ssidae
         - source/hic_hal/nuvoton/m48ssidae/CMSIS/Include

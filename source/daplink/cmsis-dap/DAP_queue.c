@@ -35,10 +35,10 @@ void DAP_queue_init(DAP_queue * queue)
 /*
  *  Get the a buffer from the DAP_queue where the response to the request is stored
  *    Parameters:      queue - DAP queue, buf = return the buffer location, len = return the len of the response
- *    Return Value:    TRUE - Success, FALSE - Error
+ *    Return Value:    1 - Success, 0 - Error
  */
 
-BOOL DAP_queue_get_send_buf(DAP_queue * queue, uint8_t ** buf, int * len)
+int DAP_queue_get_send_buf(DAP_queue * queue, uint8_t ** buf, int * len)
 {
     if (queue->send_count) {
         queue->send_count--;
@@ -46,9 +46,9 @@ BOOL DAP_queue_get_send_buf(DAP_queue * queue, uint8_t ** buf, int * len)
         *len = queue->resp_size[queue->send_idx];
         queue->send_idx = (queue->send_idx + 1) % DAP_PACKET_COUNT;
         queue->free_count++;
-        return (__TRUE);
+        return 1;
     }
-    return (__FALSE);
+    return 0;
 }
 
 /*
@@ -68,11 +68,11 @@ __WEAK uint8_t DAP_activity_blink(const uint8_t *buf)
 /*
  *  Execute a request and store result to the DAP_queue
  *    Parameters:      queue - DAP queue, reqbuf = buffer with DAP request, len = of the request buffer, retbuf = buffer to peek on the result of the DAP operation
- *    Return Value:    TRUE - Success, FALSE - Error
+ *    Return Value:    1 - Success, 0 - Error
  */
 
 
-BOOL DAP_queue_execute_buf(DAP_queue * queue, const uint8_t *reqbuf, int len, uint8_t ** retbuf)
+int DAP_queue_execute_buf(DAP_queue * queue, const uint8_t *reqbuf, int len, uint8_t ** retbuf)
 {
     uint32_t rsize;
     if (queue->free_count > 0) {
@@ -90,7 +90,7 @@ BOOL DAP_queue_execute_buf(DAP_queue * queue, const uint8_t *reqbuf, int len, ui
         *retbuf = queue->USB_Request[queue->recv_idx];
         queue->recv_idx = (queue->recv_idx + 1) % DAP_PACKET_COUNT;
         queue->send_count++;
-        return (__TRUE);
+        return 1;
     }
-    return (__FALSE);
+    return 0;
 }

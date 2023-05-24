@@ -24,10 +24,10 @@
 #include <string.h>
 
 #include "settings.h"
-#include "target_config.h"
 #include "compiler.h"
 #include "cortex_m.h"
 #include "daplink.h"
+#include "util.h"
 
 // 'kvld' in hex - key valid
 #define CFG_KEY             0x6b766c64

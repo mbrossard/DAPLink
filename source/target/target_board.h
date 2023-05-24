@@ -25,7 +25,12 @@
 #include <stdint.h>
 #include "target_config.h"
 #include "target_family.h"
-#include "../drag-n-drop/virtual_fs.h"
+
+#ifdef DRAG_N_DROP_SUPPORT
+#include "virtual_fs.h"
+#else
+typedef char vfs_filename_t[11];
+#endif
 
 //! @brief Current board info version.
 //!

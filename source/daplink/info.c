@@ -27,7 +27,9 @@
 #include "crc.h"
 #include "daplink.h"
 #include "settings.h"
+#ifdef TARGET_BOARD
 #include "target_board.h"
+#endif
 #include "flash_hal.h"
 
 static char hex_to_ascii(uint8_t x)
@@ -103,7 +105,6 @@ const char *info_get_unique_id_string_descriptor(void)
 static void setup_basics(void)
 {
     uint8_t i = 0, idx = 0;
-    uint16_t family_id = get_family_id();
     memset(string_board_id, 0, sizeof(string_board_id));
     memset(string_host_id, 0, sizeof(string_host_id));
     memset(string_target_id, 0, sizeof(string_target_id));
@@ -129,11 +130,14 @@ static void setup_basics(void)
     idx = 0;
     idx += util_write_hex32(string_hic_id + idx, hic_id);
     string_hic_id[idx++] = 0;
+#ifdef TARGET_BOARD
     // Board ID
     memcpy(string_board_id, get_board_id(), 4);
     string_board_id[4] = 0;
     idx = 0;
-    //Family ID
+
+    uint16_t family_id = get_family_id();
+    // Family ID
     string_family_id[idx++] = hex_to_ascii(((family_id >> 12) & 0xF));
     string_family_id[idx++] = hex_to_ascii(((family_id >> 8) & 0xF));
 #if !(defined(DAPLINK_BL)) && defined(DRAG_N_DROP_SUPPORT) && !defined(DRAG_N_DROP_DISABLE)
@@ -152,6 +156,7 @@ static void setup_basics(void)
 #endif
     string_family_id[idx++] = hex_to_ascii(((family_id) & 0xF));
     string_family_id[idx++] = 0;
+#endif
     // Version
     idx = 0;
     string_version[idx++] = '0' + (DAPLINK_VERSION / 1000) % 10;

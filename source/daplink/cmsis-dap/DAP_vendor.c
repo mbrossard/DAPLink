@@ -28,7 +28,6 @@
  *
  *---------------------------------------------------------------------------*/
 
-#include "rl_usb.h"
 #include "DAP_config.h"
 #include "DAP.h"
 #include "info.h"
@@ -36,13 +35,21 @@
 #include DAPLINK_MAIN_HEADER
 #include "uart.h"
 #include "settings.h"
-#include "target_family.h"
 #include <string.h>
 #include "daplink_vendor_commands.h"
 
 #if defined(DRAG_N_DROP_SUPPORT) && !defined(DRAG_N_DROP_DISABLE)
-#include "file_stream.h"
+
+#if defined(CDC_ENDPOINT) && defined(RL_USB)
+#include "rl_usb.h"
+#endif
+
+#ifdef DRAG_N_DROP_SUPPORT
 #include "flash_manager.h"
+#include "file_stream.h"
+#include "target_family.h"
+#endif
+
 #endif
 
 //**************************************************************************************************
@@ -76,7 +83,7 @@ uint32_t DAP_ProcessVendorCommand(const uint8_t *request, uint8_t *response) {
         num += (len + 1); // increment response count by ID length + length byte
         break;
     }
-#if defined(CDC_ENDPOINT) && !defined(CDC_ENDPOINT_DISABLE)
+#if defined(CDC_ENDPOINT) && !defined(CDC_ENDPOINT_DISABLE) && defined(RL_USB)
     case ID_DAP_UART_GetLineCoding: {
         // get line coding
         int32_t read_len = sizeof(CDC_LINE_CODING);

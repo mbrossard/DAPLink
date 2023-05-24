@@ -11,6 +11,7 @@ common:
         - FLASH_DRIVER_IS_FLASH_RESIDENT=1
         - DAPLINK_NO_ASSERT_FILENAMES
         - OS_CLOCK=48000000
+        - RL_USB
     includes:
         - source/hic_hal/freescale/k20dx
         - source/hic_hal/freescale/k20dx/MK20D5
