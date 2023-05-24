@@ -38,6 +38,7 @@
 #include "sdk.h"
 #include "target_family.h"
 #include "target_board.h"
+#include "daplink_debug.h"
 
 #if defined(DRAG_N_DROP_SUPPORT) && !defined(DRAG_N_DROP_DISABLE)
 #include "vfs_manager.h"
@@ -340,6 +341,10 @@ void main_task(void * arg)
     usbd_connect(0);
     usb_state = USB_CONNECTING;
     usb_state_count = USB_CONNECT_DELAY;
+
+#if defined(DAPLINK_DEBUG)
+        debug_msg("DAPLink Interface starting");
+#endif
 
     // Start timer tasks
 #ifndef USE_LEGACY_CMSIS_RTOS

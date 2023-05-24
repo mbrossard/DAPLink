@@ -1,7 +1,10 @@
 common:
     macros:
-        # - TUSB_DAPLINK_DEFERRED
-        - TUSB_DAPLINK_DEFERRED_PARTIAL
+        - TUSB_DAPLINK_DEFERRED
+        # - TUSB_DAPLINK_DEFERRED_PARTIAL
+        - DAPLINK_DEBUG
+        - DAPLINK_DEBUG_RTT
+        - DAPLINK_DEBUG_TUSB
     sources:
         tinyusb:
             - source/tusb/daplink
