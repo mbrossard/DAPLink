@@ -23,7 +23,6 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
-#include "rl_usb.h"
 #include "main_interface.h"
 #include "gpio.h"
 #include "uart.h"
@@ -48,6 +47,16 @@
 
 #ifndef USE_LEGACY_CMSIS_RTOS
 #include "rtx_os.h"
+#endif
+
+#ifdef RL_USB
+#include "rl_usb.h"
+#else
+// USB Abstraction
+void  usbd_init(void);
+void  usbd_connect(uint32_t con);
+void USBD_Handler(void);
+uint32_t usbd_configured(void);
 #endif
 
 #if defined(__CC_ARM) || (defined(__ARMCC_VERSION) && (__ARMCC_VERSION >= 6010050))
