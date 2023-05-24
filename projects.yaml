@@ -744,3 +744,37 @@ projects:
         - records/daplink/cmsis-dap.yaml
         # - records/board/mcu_link.yaml
         - records/hic_hal/lpc55s69-tinyusb.yaml
+
+    rp2040_tinyusb_if:
+        # - *module_tools
+        - records/tools/gcc_arm_modern.yaml
+        - records/tools/version.yaml
+        - records/daplink/cmsis-dap.yaml
+        - records/daplink/drag-n-drop.yaml
+        - records/daplink/settings.yaml
+        - records/daplink/settings_rom.yaml
+        - records/daplink/interface.yaml
+        - records/daplink/target_family.yaml
+        - records/daplink/target_board.yaml
+        - records/rtos/rtos-cm0.yaml
+        - records/hic_hal/rp2040.yaml
+        - records/tusb/tinyusb-core.yaml
+        - records/tusb/tinyusb-hid.yaml
+        - records/tusb/tinyusb-daplink.yaml
+
+    rp2040_tinydap_if:
+        # - *module_tools
+        - records/tools/gcc_arm_modern.yaml
+        - records/tools/version.yaml
+        - records/daplink/cmsis-dap.yaml
+        - records/daplink/drag-n-drop.yaml
+        - records/daplink/settings.yaml
+        - records/daplink/settings_rom.yaml
+        - records/daplink/interface.yaml
+        - records/daplink/target_family.yaml
+        - records/daplink/target_board.yaml
+        - records/rtos/rtos-cm0.yaml
+        - records/hic_hal/rp2040.yaml
+        - records/tusb/tinyusb-core.yaml
+        - records/tusb/tinyusb-hid.yaml
+        - records/tusb/tinyusb-daplink.yaml
