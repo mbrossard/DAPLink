@@ -60,8 +60,6 @@ static bool interface_image_valid()
 
     computed_crc = info_get_crc_interface();
 
-    /* Note: If the current interface image was loaded from the .elf, this check will fail because
-     * the CRC is never written to the .elf output. */
     return computed_crc == stored_crc;
 }
 
