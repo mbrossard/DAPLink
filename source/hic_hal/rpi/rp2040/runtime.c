@@ -21,6 +21,7 @@
 
 void __attribute__((noreturn)) panic(const char *fmt, ...) {
 #if defined (DAPLINK_DEBUG)
+    va_list arg;
     va_start(arg, fmt);
     daplink_debug_print(fmt, arg);
     va_end(arg);

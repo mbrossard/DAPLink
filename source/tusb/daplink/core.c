@@ -20,11 +20,14 @@
  */
 
 #include "tusb.h"
+#include "cmsis_compiler.h"
 
 #if BULK_ENPOINT
 uint8_t TxDataBuffer[CFG_TUD_VENDOR_TX_BUFSIZE];
 uint8_t RxDataBuffer[CFG_TUD_VENDOR_RX_BUFSIZE];
 #endif
+
+__WEAK void daplink_tusb_init(void) {}
 
 extern void USBD_SignalHandler(void);
 extern void USBD_IntEnable(void);
@@ -32,6 +35,7 @@ extern void USBD_IntEnable(void);
 void usbd_init(void)
 {
     tusb_init();
+    daplink_tusb_init();
 }
 
 static uint32_t usbd_con = 0;
