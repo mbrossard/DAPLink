@@ -27,8 +27,6 @@
 #define FALSE	0
 #define TRUE	!FALSE
 
-typedef unsigned long  crc;
-
 #define CRC_NAME			"CRC-32"
 #define POLYNOMIAL			0x04C11DB7
 #define INITIAL_REMAINDER	0xFFFFFFFF
@@ -40,12 +38,12 @@ typedef unsigned long  crc;
 /*
  * Derive parameters from the standard-specific parameters in crc.h.
  */
-#define WIDTH    (8 * sizeof(crc))
+#define WIDTH    (8 * sizeof(uint32_t))
 #define TOPBIT   (1U << (WIDTH - 1))
 
 #if (REFLECT_DATA == TRUE)
 #undef  REFLECT_DATA
-#define REFLECT_DATA(X)			((unsigned char) reflect((X), 8))
+#define REFLECT_DATA(X)			((uint8_t) reflect((X), 8))
 #else
 #undef  REFLECT_DATA
 #define REFLECT_DATA(X)			(X)
@@ -53,7 +51,7 @@ typedef unsigned long  crc;
 
 #if (REFLECT_REMAINDER == TRUE)
 #undef  REFLECT_REMAINDER
-#define REFLECT_REMAINDER(X)	((crc) reflect((X), WIDTH))
+#define REFLECT_REMAINDER(X)	((uint32_t) reflect((X), WIDTH))
 #else
 #undef  REFLECT_REMAINDER
 #define REFLECT_REMAINDER(X)	(X)
@@ -72,8 +70,8 @@ typedef unsigned long  crc;
  * Returns:		The reflection of the original data.
  *
  *********************************************************************/
-static unsigned long
-reflect(unsigned long data, unsigned char nBits)
+static uint32_t
+reflect(uint32_t data, uint8_t nBits)
 {
     // util_assert(nBits <= 32);
     if (nBits == 32) {
@@ -82,8 +80,8 @@ reflect(unsigned long data, unsigned char nBits)
         return __RBIT(data);
     }
 
-    unsigned long  reflection = 0x00000000;
-    unsigned char  bit;
+    uint32_t  reflection = 0x00000000;
+    uint8_t  bit;
 
     /*
      * Reflect the data about the center bit.
@@ -117,10 +115,10 @@ reflect(unsigned long data, unsigned char nBits)
 __WEAK uint32_t
 crc32(const void *data, int nBytes)
 {
-    crc            remainder = INITIAL_REMAINDER;
-    int            byte;
-    unsigned char  bit;
-    unsigned char const *message = data;
+    uint32_t remainder = INITIAL_REMAINDER;
+    uint32_t byte;
+    uint8_t bit;
+    uint8_t const *message = data;
 
     /*
      * Perform modulo-2 division, a byte at a time.
@@ -166,10 +164,10 @@ crc32(const void *data, int nBytes)
 __WEAK uint32_t
 crc32_continue(uint32_t prev_crc, const void *data, int nBytes)
 {
-    crc            remainder = REFLECT_REMAINDER(prev_crc ^ FINAL_XOR_VALUE);
-    int            byte;
-    unsigned char  bit;
-    unsigned char const *message = data;
+    uint32_t remainder = REFLECT_REMAINDER(prev_crc ^ FINAL_XOR_VALUE);
+    uint32_t byte;
+    uint8_t bit;
+    uint8_t const *message = data;
 
     /*
      * Perform modulo-2 division, a byte at a time.
