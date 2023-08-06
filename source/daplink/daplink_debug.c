@@ -23,14 +23,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include "cmsis_os2.h"
-#include "rl_usb.h"
 #include "util.h"
 
 #if defined (DAPLINK_DEBUG)
 
 #if defined (DAPLINK_DEBUG_RTT)
-
 #include "debug/SEGGER_RTT.c"
 
 uint32_t daplink_debug(uint8_t *buf, uint32_t size)
@@ -38,7 +35,9 @@ uint32_t daplink_debug(uint8_t *buf, uint32_t size)
     return SEGGER_RTT_Write(0, buf, size);
 }
 
-#else
+#elif defined (DAPLINK_DEBUG_UART)
+#include "cmsis_os2.h"
+#include "rl_usb.h"
 
 static const char error_msg[] = "\r\n<OVERFLOW>\r\n";
 
@@ -67,6 +66,7 @@ uint32_t daplink_debug(uint8_t *buf, uint32_t size)
 }
 #endif
 
+#if defined (DAPLINK_DEBUG_RTT) || defined (DAPLINK_DEBUG_UART)
 static char daplink_debug_buf[128] = {0};
 uint32_t daplink_debug_print(const char *format, ...)
 {
@@ -86,5 +86,6 @@ uint32_t daplink_debug_print(const char *format, ...)
     daplink_debug((uint8_t *)daplink_debug_buf, r);
     return ret;
 }
+#endif
 
 #endif

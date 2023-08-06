@@ -31,34 +31,28 @@
 extern "C" {
 #endif
 
-#ifndef DAPLINK_DEBUG
-// #define DAPLINK_DEBUG
-#endif
-
 #if defined (DAPLINK_DEBUG)
 
+#if defined (DAPLINK_DEBUG_STDOUT)
+#include <stdio.h>
+#define daplink_debug_print(fmt, args...) printf(fmt, ## args)
+#define daplink_debug(buf, size)          fwrite(buf, size, 1, stdout)
+#else
 uint32_t daplink_debug_print(const char *format, ...);
 uint32_t daplink_debug(uint8_t *data, uint32_t size);
+#endif
 
 #else
 
-static inline uint32_t daplink_debug_print(const char *format, ...)
-{
-    return 1;
-}
-
-static inline uint32_t daplink_debug(uint8_t *data, uint32_t size)
-{
-    return 1;
-}
+#define daplink_debug_print(fmt, args...) (1)
+#define daplink_debug(buf, size)          (1)
 
 #endif
 
 #define debug_msg(fmt, args...) daplink_debug_print(fmt, ## args);
 #define debug_data(buf, size) daplink_debug(buf, size);
 
-#endif
-
 #ifdef __cplusplus
 }
+#endif
 #endif
