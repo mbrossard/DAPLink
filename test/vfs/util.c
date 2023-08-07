@@ -2,29 +2,12 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+#include "compiler.h"
 #include "cmsis_os2.h"
-/*
-uint32_t DAPLINK_ROM_START;
-uint32_t DAPLINK_ROM_SIZE;
-uint32_t DAPLINK_RAM_START;
-uint32_t DAPLINK_RAM_SIZE;
-uint32_t DAPLINK_ROM_BL_START;
-uint32_t DAPLINK_ROM_BL_SIZE;
-uint32_t DAPLINK_ROM_IF_START;
-uint32_t DAPLINK_ROM_IF_SIZE;
-uint32_t DAPLINK_ROM_CONFIG_USER_START;
-uint32_t DAPLINK_ROM_CONFIG_USER_SIZE;
-uint32_t DAPLINK_RAM_APP_START;
-uint32_t DAPLINK_RAM_APP_SIZE;
-uint32_t DAPLINK_RAM_SHARED_START;
-uint32_t DAPLINK_RAM_SHARED_SIZE;
-uint32_t DAPLINK_MIN_WRITE_SIZE;
-uint32_t DAPLINK_ROM_APP_START;
-uint32_t DAPLINK_ROM_APP_SIZE;
-uint32_t DAPLINK_ROM_UPDATE_START;
-uint32_t DAPLINK_ROM_UPDATE_SIZE;
-uint32_t DAPLINK_HIC_ID = 0x6E052820;
-*/
+#include "target_family.h"
+
+__WEAK const target_family_descriptor_t *g_target_family = NULL;
 
 bool config_get_auto_rst()
 {
