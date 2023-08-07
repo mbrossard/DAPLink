@@ -10,24 +10,24 @@
 
 #if defined(INTERFACE_NRF52820)
 #if defined(DAPLINK_BL)
-char *file_name = "nrf52820_microbit_if_crc.hex";
+char *file_name = "files/nrf52820_microbit_if_crc.hex";
 #elif defined(DAPLINK_IF)
-// char *file_name = "nrf52820_microbit_bl_crc.hex";
-char *file_name = "Out of box experience.hex";
+// char *file_name = "files/nrf52820_microbit_bl_crc.hex";
+char *file_name = "files/Out of box experience.hex";
 #endif
 #endif
 
 #if defined(INTERFACE_KL27Z)
 #if defined(DAPLINK_BL)
-char *file_name = "kl27z_microbit_if_crc.hex";
+char *file_name = "files/kl27z_microbit_if_crc.hex";
 #elif defined(DAPLINK_IF)
-// char *file_name = "kl27z_microbit_bl_crc.hex";
-char *file_name = "Out of box experience.hex";
+// char *file_name = "files/kl27z_microbit_bl_crc.hex";
+char *file_name = "files/Out of box experience.hex";
 #endif
 #endif
 
 #if defined(INTERFACE_KL26Z)
-char *file_name = "Out of box experience.hex";
+char *file_name = "files/Out of box experience.hex";
 #endif
 
 int main(int argc, char **argv)
@@ -66,6 +66,7 @@ int main(int argc, char **argv)
         i++;
     }
 
+    fclose(f);
     status = stream_close();
     if (status == ERROR_SUCCESS) {
         debug_msg("Success\r\n");
