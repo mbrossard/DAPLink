@@ -34,7 +34,9 @@
 #include "cmsis_compiler.h"
 
 // Set to 1 to enable debugging
+#ifndef DEBUG_FLASH_DECODER
 #define DEBUG_FLASH_DECODER     0
+#endif
 
 #if DEBUG_FLASH_DECODER
 #include "daplink_debug.h"
@@ -235,7 +237,7 @@ error_t flash_decoder_open(void)
 error_t flash_decoder_write(uint32_t addr, const uint8_t *data, uint32_t size)
 {
     error_t status;
-    flash_decoder_printf("flash_decoder_write(addr=0x%x, size=0x%x)\r\n", addr, size);
+    flash_decoder_printf("flash_decoder_write(addr=0x%x, size=%d (0x%x))\r\n", addr, size, size);
 
     if (DECODER_STATE_OPEN != state) {
         util_assert(0);
@@ -335,8 +337,8 @@ error_t flash_decoder_write(uint32_t addr, const uint8_t *data, uint32_t size)
     // Write data as normal if flash has been initialized
     if (flash_initialized) {
         status = flash_manager_data(addr, data, size);
-        flash_decoder_printf("    Writing data, addr=0x%x, size=0x%x, flash_manager_data ret %i\r\n",
-                             addr, size, status);
+        flash_decoder_printf("    Writing data, addr=0x%x, size=%d (0x%x), flash_manager_data ret=%i\r\n",
+                             addr, size, size, status);
 
         if (ERROR_SUCCESS != status) {
             state = DECODER_STATE_ERROR;
@@ -346,8 +348,8 @@ error_t flash_decoder_write(uint32_t addr, const uint8_t *data, uint32_t size)
 
     // Check if this is the end of data
     if (flash_decoder_is_at_end(addr, data, size)) {
-        flash_decoder_printf("    End of transfer detected - addr 0x%08x, size 0x%08x\r\n",
-                             addr, size);
+        flash_decoder_printf("    End of transfer detected - addr 0x%08x, size %d (0x%08x)\r\n",
+                             addr, size, size);
         state = DECODER_STATE_DONE;
         return ERROR_SUCCESS_DONE;
     }
@@ -370,7 +372,7 @@ error_t flash_decoder_close(void)
 
     if (flash_initialized) {
         status = flash_manager_uninit();
-        flash_decoder_printf("    flash_manager_uninit ret %i\r\n", status);
+        flash_decoder_printf("    flash_manager_uninit ret=%i\r\n", status);
     }
 
     if ((DECODER_STATE_DONE != prev_state) &&
