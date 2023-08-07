@@ -26,6 +26,18 @@
 #include "intelhex.h"
 #include "cmsis_compiler.h"
 
+// Set to 1 to enable debugging
+#ifndef DEBUG_INTELHEX
+#define DEBUG_INTELHEX     0
+#endif
+
+#if DEBUG_INTELHEX
+#include "daplink_debug.h"
+#define intelhex_printf    debug_msg
+#else
+#define intelhex_printf(...)
+#endif
+
 #if defined(__CC_ARM)
 #pragma push
 #pragma O3
@@ -177,6 +189,8 @@ hexfile_parse_status_t parse_hex_blob(const uint8_t *hex_blob, const uint32_t he
                                 switch (line.record_type) {
                                     case CUSTOM_METADATA_RECORD:
                                         binary_version = (uint16_t) line.data[0] << 8 | line.data[1];
+                                        intelhex_printf("parse_hex: binary_version = 0x%04x Expecting 0x%04x or 0x%04x\r\n",
+                                            binary_version, board_id_hex_default, board_id_hex);
                                         break;
 
                                     case DATA_RECORD:
