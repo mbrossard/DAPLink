@@ -10,6 +10,10 @@
 #include "target_board.h"
 #include "daplink_debug.h"
 
+extern uint32_t target_flash_addr;
+extern uint32_t target_flash_size;
+extern uint8_t target_flash_byte[];
+
 #define DEFAULT_PROGRAM_PAGE_MIN_SIZE   (256u)
 
 typedef enum {
@@ -153,6 +157,11 @@ static error_t target_flash_program_page(uint32_t addr, const uint8_t *buf, uint
         while (size > 0) {
             uint32_t write_size = MIN(size, flash->program_buffer_size);
             debug_msg("target_flash_program_page() flashing %d bytes at 0x%08x\n", write_size, addr);
+            if ((addr >= target_flash_addr) &&
+                ((addr + write_size) <= (target_flash_addr + target_flash_size))) {
+                memcpy(&(target_flash_byte[addr - target_flash_addr]), buf, write_size);
+            }
+
             addr += write_size;
             buf += write_size;
             size -= write_size;
@@ -169,17 +178,21 @@ static error_t target_flash_erase_sector(uint32_t addr)
     debug_msg("target_flash_erase_sector(0x%08x)\n", addr);
     if (g_board_info.target_cfg) {
         program_target_t * flash = current_flash_algo;
-
+        uint32_t erase_sector_size = target_flash_erase_sector_size(addr);
         if (!flash) {
             return ERROR_INTERNAL;
         }
 
         // Check to make sure the address is on a sector boundary
-        if ((addr % target_flash_erase_sector_size(addr)) != 0) {
+        if ((addr % erase_sector_size) != 0) {
             return ERROR_ERASE_SECTOR;
         } else {
-            debug_msg("target_flash_erase_sector: sector at 0x%08x has %d bytes size\n", addr,
-                   target_flash_erase_sector_size(addr));
+            if ((addr >= target_flash_addr) &&
+                ((addr + erase_sector_size) <= (target_flash_addr + target_flash_size))) {
+                memset(&(target_flash_byte[addr - target_flash_addr]), 0xFF, erase_sector_size);
+            }
+            debug_msg("target_flash_erase_sector: sector at 0x%08x has %d bytes size\n",
+                      addr, erase_sector_size);
         }
 
         return ERROR_SUCCESS;
@@ -202,6 +215,9 @@ static error_t target_flash_erase_chip(void)
                 continue;
             }
             debug_msg("target_flash_erase_chip: Calling erase_chip() on 0x%08x\n", flash_region->start);
+            if(flash_region->start == target_flash_addr) {
+                memset(target_flash_byte, 0xFF, target_flash_size);
+            }
         }
 
         // Reset and re-initialize the target after the erase if required
@@ -230,7 +246,7 @@ static uint32_t target_flash_program_page_min_size(uint32_t addr)
 
 static uint32_t target_flash_erase_sector_size(uint32_t addr)
 {
-    if (g_board_info.target_cfg){
+    if (g_board_info.target_cfg) {
         if(g_board_info.target_cfg->sector_info_length > 0) {
             int sector_index = g_board_info.target_cfg->sector_info_length - 1;
             for (; sector_index >= 0; sector_index--) {
@@ -247,6 +263,6 @@ static uint32_t target_flash_erase_sector_size(uint32_t addr)
     }
 }
 
-static uint8_t target_flash_busy(void){
+static uint8_t target_flash_busy(void) {
     return (state == STATE_OPEN);
 }
