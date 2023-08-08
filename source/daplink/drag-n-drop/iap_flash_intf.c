@@ -514,12 +514,14 @@ static error_t critical_erase_and_program(uint32_t addr, const uint8_t *data, ui
         return ERROR_ERASE_ALL;
     }
 
+#ifndef DAPLINK_VFS_TESTS
     // Program the interface's vector table
     iap_status = flash_program_page(addr, size, (uint8_t *)data);
 
     if (iap_status != 0) {
         return ERROR_IAP_WRITE;
     }
+#endif
 
     return ERROR_SUCCESS;
 }
