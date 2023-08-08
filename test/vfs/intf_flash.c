@@ -4,6 +4,11 @@
 #include "daplink_addr.h"
 #include "daplink_debug.h"
 #include "compiler.h"
+#include "util.h"
+
+uint32_t intf_flash_addr = DAPLINK_ROM_START;
+uint32_t intf_flash_size = DAPLINK_ROM_SIZE;
+uint8_t intf_flash_byte[DAPLINK_ROM_SIZE];
 
 uint32_t  flash_erase_sector(uint32_t addr)
 {
@@ -38,17 +43,26 @@ uint32_t UnInit(uint32_t fnc)
 uint32_t EraseChip(void)
 {
     debug_msg("EraseChip()\n");
-    return 0; //
+    memset(intf_flash_byte, 0xFF, intf_flash_size);
+    return 0;
 }
 
 uint32_t EraseSector(uint32_t adr)
 {
-    debug_msg("EraseSector(0x%08x)\n", adr);
-    return 0; //
+    debug_msg("EraseSector(0x%08x, %d (0x%x))\n", adr, DAPLINK_SECTOR_SIZE, DAPLINK_SECTOR_SIZE);
+    util_assert((adr >= intf_flash_addr) &&
+                ((adr + DAPLINK_SECTOR_SIZE) <= (intf_flash_addr + intf_flash_size)));
+    util_assert((adr % DAPLINK_SECTOR_SIZE) == 0);
+    memset(&(intf_flash_byte[adr - intf_flash_addr]), 0xFF, DAPLINK_SECTOR_SIZE);
+    return 0;
 }
 
 uint32_t ProgramPage(uint32_t adr, uint32_t sz, uint32_t *buf)
 {
-    debug_msg("ProgramPage(0x%08x, %d)\n", adr, sz);
-    return 0; //
+    debug_msg("ProgramPage(0x%08x, %d (0x%x))\n", adr, sz, sz);
+    util_assert((adr >= intf_flash_addr) &&
+                ((adr + sz) <= (intf_flash_addr + intf_flash_size)));
+    debug_msg("ProgramPage(0x%08x, %d (0x%x))\n", adr, sz, sz);
+    memcpy(&(intf_flash_byte[adr - intf_flash_addr]), (void *)buf, sz);
+    return 0;
 }
