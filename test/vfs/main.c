@@ -27,6 +27,11 @@ vfs_tests_t tests[] = {
         "files/nrf52820_microbit_if_crc.hex",
         "files/nrf52820_microbit_if_crc.bin",
         INTF_FLASH_IF
+    },
+    {
+        "files/nrf52820_microbit_if_crc.bin",
+        "files/nrf52820_microbit_if_crc.bin",
+        INTF_FLASH_IF
     }
 };
 #elif defined(DAPLINK_IF)
@@ -37,7 +42,22 @@ vfs_tests_t tests[] = {
         INTF_FLASH_BL
     },
     {
+        "files/nrf52820_microbit_bl_crc.bin",
+        "files/nrf52820_microbit_bl_crc.bin",
+        INTF_FLASH_BL
+    },
+    {
         "files/Out of box experience.hex",
+        "files/OOBE-9903.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9903.hex",
+        "files/OOBE-9903.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9903.bin",
         "files/OOBE-9903.bin",
         TARGET_FLASH
     },
@@ -52,6 +72,11 @@ vfs_tests_t tests[] = {
         "files/kl27z_microbit_if_crc.hex",
         "files/kl27z_microbit_if_crc.bin",
         INTF_FLASH_IF
+    },
+    {
+        "files/kl27z_microbit_if_crc.bin",
+        "files/kl27z_microbit_if_crc.bin",
+        INTF_FLASH_IF
     }
 };
 #elif defined(DAPLINK_IF)
@@ -62,7 +87,22 @@ vfs_tests_t tests[] = {
         INTF_FLASH_BL
     },
     {
+        "files/kl27z_microbit_bl_crc.bin",
+        "files/kl27z_microbit_bl_crc.bin",
+        INTF_FLASH_BL
+    },
+    {
         "files/Out of box experience.hex",
+        "files/OOBE-9903.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9903.hex",
+        "files/OOBE-9903.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9903.bin",
         "files/OOBE-9903.bin",
         TARGET_FLASH
     },
@@ -74,6 +114,16 @@ vfs_tests_t tests[] = {
 vfs_tests_t tests[] = {
     {
         "files/Out of box experience.hex",
+        "files/OOBE-9900.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9900.hex",
+        "files/OOBE-9900.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9900.bin",
         "files/OOBE-9900.bin",
         TARGET_FLASH
     },
@@ -164,7 +214,7 @@ int main(int argc, char **argv)
                 pos += l;
                 i++;
             }
-            fprintf(stderr, "Success\r\n");
+            fprintf(stderr, "Success (checked %d bytes)\r\n", pos);
         } else {
             fprintf(stderr, "Error closing stream: %s\r\n", error_get_string(status));
             exit(-1);
