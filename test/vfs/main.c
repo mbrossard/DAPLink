@@ -32,7 +32,12 @@ vfs_tests_t tests[] = {
         "files/nrf52820_microbit_if_crc.bin",
         "files/nrf52820_microbit_if_crc.bin",
         INTF_FLASH_IF
-    }
+    },
+    {
+        "files/nrf52820_microbit_if_crc.uf2",
+        "files/nrf52820_microbit_if_crc.bin",
+        INTF_FLASH_IF
+    },
 };
 #elif defined(DAPLINK_IF)
 vfs_tests_t tests[] = {
@@ -43,6 +48,11 @@ vfs_tests_t tests[] = {
     },
     {
         "files/nrf52820_microbit_bl_crc.bin",
+        "files/nrf52820_microbit_bl_crc.bin",
+        INTF_FLASH_BL
+    },
+    {
+        "files/nrf52820_microbit_bl_crc.uf2",
         "files/nrf52820_microbit_bl_crc.bin",
         INTF_FLASH_BL
     },
@@ -58,6 +68,11 @@ vfs_tests_t tests[] = {
     },
     {
         "files/OOBE-9903.bin",
+        "files/OOBE-9903.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9903.uf2",
         "files/OOBE-9903.bin",
         TARGET_FLASH
     },
@@ -77,7 +92,12 @@ vfs_tests_t tests[] = {
         "files/kl27z_microbit_if_crc.bin",
         "files/kl27z_microbit_if_crc.bin",
         INTF_FLASH_IF
-    }
+    },
+    {
+        "files/kl27z_microbit_if_crc.uf2",
+        "files/kl27z_microbit_if_crc.bin",
+        INTF_FLASH_IF
+    },
 };
 #elif defined(DAPLINK_IF)
 vfs_tests_t tests[] = {
@@ -88,6 +108,11 @@ vfs_tests_t tests[] = {
     },
     {
         "files/kl27z_microbit_bl_crc.bin",
+        "files/kl27z_microbit_bl_crc.bin",
+        INTF_FLASH_BL
+    },
+    {
+        "files/kl27z_microbit_bl_crc.uf2",
         "files/kl27z_microbit_bl_crc.bin",
         INTF_FLASH_BL
     },
@@ -103,6 +128,11 @@ vfs_tests_t tests[] = {
     },
     {
         "files/OOBE-9903.bin",
+        "files/OOBE-9903.bin",
+        TARGET_FLASH
+    },
+    {
+        "files/OOBE-9903.uf2",
         "files/OOBE-9903.bin",
         TARGET_FLASH
     },
@@ -214,9 +244,9 @@ int main(int argc, char **argv)
                 pos += l;
                 i++;
             }
-            fprintf(stderr, "Success (checked %d bytes)\r\n", pos);
+            fprintf(stderr, "Success '%s' (checked %d bytes)\r\n", tests[t].input_file, pos);
         } else {
-            fprintf(stderr, "Error closing stream: %s\r\n", error_get_string(status));
+            fprintf(stderr, "Error '%s' closing stream: %s\r\n", tests[t].input_file, error_get_string(status));
             exit(-1);
         }
 
