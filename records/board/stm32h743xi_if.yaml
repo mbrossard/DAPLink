@@ -1,6 +1,6 @@
 common:
     macros:
-        - OS_CLOCK=480000000
+        - OS_CLOCK=400000000
         - FORCE_USB_FS
         - HSE_VALUE=8000000
         - CSI_VALUE=4000000
