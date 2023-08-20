@@ -177,15 +177,15 @@ int32_t uart_set_configuration(UART_Configuration *config)
     s_configuration.Parity = config->Parity;
     if (config->Parity == UART_PARITY_ODD)
     {
-        s_uart_handle.Init.Parity = STM32_UART_PARITY_ODD;
+        s_uart_handle.Init.Parity = HAL_UART_PARITY_ODD;
     }
     else if (config->Parity == UART_PARITY_EVEN)
     {
-        s_uart_handle.Init.Parity = STM32_UART_PARITY_EVEN;
+        s_uart_handle.Init.Parity = HAL_UART_PARITY_EVEN;
     }
     else if (config->Parity == UART_PARITY_NONE)
     {
-        s_uart_handle.Init.Parity = STM32_UART_PARITY_NONE;
+        s_uart_handle.Init.Parity = HAL_UART_PARITY_NONE;
     }
     else
     {
@@ -218,7 +218,7 @@ int32_t uart_set_configuration(UART_Configuration *config)
     util_assert(config->DataBits == UART_DATA_BITS_8);
     s_configuration.DataBits = config->DataBits;
 
-    if (s_uart_handle.Init.Parity == STM32_UART_PARITY_ODD || s_uart_handle.Init.Parity == STM32_UART_PARITY_EVEN)
+    if (s_uart_handle.Init.Parity == HAL_UART_PARITY_ODD || s_uart_handle.Init.Parity == HAL_UART_PARITY_EVEN)
     {
         s_uart_handle.Init.WordLength = UART_WORDLENGTH_9B;
     }

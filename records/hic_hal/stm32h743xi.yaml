@@ -11,15 +11,15 @@ common:
         - __packed=__packed          # Prevent redefinition of __packed with ARMCC
         - DAPLINK_NO_ASSERT_FILENAMES
     includes:
+        - source/hic_hal/stm32/hal/STM32H7xx_HAL_Driver/Inc
         - source/hic_hal/stm32/stm32h743xi
         - source/hic_hal/stm32/stm32h743xi/cmsis
-        - source/hic_hal/stm32/stm32h743xi/STM32H7xx_HAL_Driver/Inc
         - source/hic_hal/stm32/shared/usb_otg
     sources:
         hic_hal:
+            - source/hic_hal/stm32/hal/STM32H7xx_HAL_Driver/Src
             - source/hic_hal/stm32/stm32h743xi
             - source/hic_hal/stm32/stm32h743xi/cmsis
-            - source/hic_hal/stm32/stm32h743xi/STM32H7xx_HAL_Driver/Src
             - source/hic_hal/stm32/shared/usb_otg
 tool_specific:
     armcc:
