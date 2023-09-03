@@ -9,6 +9,7 @@ common:
         - DAPLINK_HIC_ID=0x52502040  # DAPLINK_HIC_ID_RP2040
         - OS_CLOCK=125000000
         - PICO_NO_RAM_VECTOR_TABLE=1
+        - __INITIAL_SP=__StackTop
         - __VECTOR_TABLE=__isr_vector
         - __VECTOR_TABLE_ATTRIBUTE='__attribute__((used, section(".isr_vector")))'
 
