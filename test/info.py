@@ -259,6 +259,7 @@ SUPPORTED_CONFIGURATIONS = [
 
     # Test projects
     (   0x1102,     VENDOR_TO_FAMILY('Nordic', 2),      'lpc55s69_nrf52840dk_test_if',              'lpc55s69_bl',      'Nordic-nRF52840-DK'                    ),
+    (   0x1102,     VENDOR_TO_FAMILY('Nordic', 2),      'lpc55s26_nrf52840dk_test_if',              'lpc55s26_bl',      'Nordic-nRF52840-DK'                    ),
 ]
 
 # Add new HICs here
@@ -269,6 +270,7 @@ HIC_STRING_TO_ID = {
     'kl27z': 0x9796990B,
     'lpc11u35': 0x97969902,
     'lpc4322': 0x97969905,
+    'lpc55s26': 0x4C509955,
     'lpc55s69': 0x4C504355,
     'm48ssidae': 0x97969921,
     'max32620': 0x97969904,
