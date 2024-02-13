@@ -13,6 +13,7 @@ common:
         - __packed=__packed          # Prevent redefinition of __packed with ARMCC
         - DAPLINK_NO_ASSERT_FILENAMES
         - OS_CLOCK=216000000
+        - DISCOVERY # Temporary
 
     includes:
         - source/hic_hal/stm32/stm32f723ie
