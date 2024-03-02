@@ -54,9 +54,13 @@ extern void  usbd_msc_start_stop(BOOL start);
 /* USB Device user functions imported to USB Audio Class module               */
 extern void  usbd_adc_init(void);
 
-#ifdef CDC_ENDPOINT
+#if defined(CDC_ENDPOINT) && !defined(CDC_ENDPOINT_DISABLE)
 #ifndef USB_CDC_ACM_EP_COUNT
 #define USB_CDC_ACM_EP_COUNT 1
+#endif
+#else
+#ifndef USB_CDC_ACM_EP_COUNT
+#define USB_CDC_ACM_EP_COUNT 0
 #endif
 #endif
 

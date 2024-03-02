@@ -2447,7 +2447,7 @@ void USBD_RTX_TaskInit(void)
                                            USBD_MSC_ENABLE * USBD_MSC_DESC_LEN + USBD_CDC_ACM_ENABLE * USB_CDC_ACM_EP_COUNT * USBD_CDC_ACM_DESC_LEN)
 
 #define USBD_WTOTALLENGTH_MAX              (USB_CONFIGUARTION_DESC_SIZE +                 \
-                                           USBD_CDC_ACM_DESC_LEN * USB_CDC_ACM_EP_COUNT + \
+                                           USBD_CDC_ACM_DESC_LEN * USB_CDC_ACM_EP_COUNT * USBD_CDC_ACM_ENABLE+ \
                                            USBD_HID_DESC_LEN     * USBD_HID_ENABLE     + \
                                            (USB_INTERFACE_DESC_SIZE) * USBD_WEBUSB_ENABLE + \
                                            USBD_BULK_DESC_LEN     * USBD_BULK_ENABLE + \
