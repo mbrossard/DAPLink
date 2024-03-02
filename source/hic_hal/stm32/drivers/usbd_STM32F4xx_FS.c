@@ -32,14 +32,37 @@
 #include <rl_usb.h>
 #include <stm32f4xx.h>
 
+
+#include "usb_otg.h"
 #define __NO_USB_LIB_C
 #include "usb_config.c"
 
-#define RX_FIFO_SIZE        256
-#define TX0_FIFO_SIZE       64
-#define TX1_FIFO_SIZE       64
-#define TX2_FIFO_SIZE       64
-#define TX3_FIFO_SIZE       64
+#ifndef USB_OTG_BUFFER_SIZE
+#define USB_OTG_BUFFER_SIZE      1280U
+#endif
+#ifndef USBD_RX_FIFO_SIZE
+#define USBD_RX_FIFO_SIZE        512U
+#endif
+
+#if (USBD_EP_NUM > (USB_OTG_ENDPOINT_NUM + 1))
+#error "USB Device does not support enough endpoints"
+#endif
+
+#if ((USBD_RX_FIFO_SIZE + USBD_FIFO_SIZE_SUM) > USB_OTG_BUFFER_SIZE)
+#error "FIFO sizes too large for buffer"
+#endif
+
+// Endpoints runtime information
+const uint32_t FifoTxSizes[USB_OTG_ENDPOINT_NUM + 1] = { USBD_FIFO_SIZE_LIST };
+// static uint32_t OutMaxPacketSize[USB_OTG_ENDPOINT_NUM + 1];
+// static uint8_t  OutPacketCnt[USB_OTG_ENDPOINT_NUM + 1];
+// static uint8_t  InPacketCnt[USB_OTG_ENDPOINT_NUM + 1];
+
+#define RX_FIFO_SIZE        USBD_RX_FIFO_SIZE
+#define TX0_FIFO_SIZE       FifoTxSizes[0]
+#define TX1_FIFO_SIZE       FifoTxSizes[1]
+#define TX2_FIFO_SIZE       FifoTxSizes[2]
+#define TX3_FIFO_SIZE       FifoTxSizes[3]
 
 #define OTG                  USB_OTG_FS
 #define USB_OTG_PERIPH_BASE  USB_OTG_FS_PERIPH_BASE
