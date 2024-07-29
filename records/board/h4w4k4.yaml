@@ -1,0 +1,6 @@
+common:
+    sources:
+        board:
+            - source/board/h4w4k4.c
+        family:
+            - source/family/st/stm32l4xx_64/target.c
