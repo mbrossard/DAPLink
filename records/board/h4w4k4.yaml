@@ -3,4 +3,5 @@ common:
         board:
             - source/board/h4w4k4.c
         family:
-            - source/family/st/stm32l4xx_64/target.c
+            - source/family/nxp/lpc55S6X/target.c
+            - source/family/nxp/lpc55S6X/target_reset.c
