@@ -4,7 +4,9 @@ Based on STM32L412K8 chip ([Datasheet](https://www.st.com/resource/en/datasheet/
 - Cortex-M4 48 Mhz
 - 64 KB Flash
 - 40 KB RAM
-- USB 2.0 full-speed crystal less solution with LPM and BCD
+- Full-speed USB 2.0 crystal less: up to 8 bi-directional endpoints including EP0 (*)
+
+(*) "Configurable number of endpoints from 1 to 8", "up to 16 mono-directional or 8 bidirectional endpoints can be used". (source: [RM0394](https://www.st.com/resource/en/reference_manual/rm0394-stm32l41xxx42xxx43xxx44xxx45xxx46xxx-advanced-armbased-32bit-mcus-stmicroelectronics.pdf))
 
 ## Memory Map
 
