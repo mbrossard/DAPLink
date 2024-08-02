@@ -23,18 +23,21 @@ Because of the flash size limitation the DAPLink bootloader is not used.
 | Signal      | I/O | Symbol  | Pin |
 |-------------|:---:|---------|:---:|
 | SWD / JTAG  |
-| SWCLK / TCK |  O  | PB13    |  26 | SPI2_SCK / USART3_CTS / TIM1_CH1N
-| SWDIO / TMS |  O  | PB14    |  27 | SPI2_MISO / USRAT3_RTS / TIM1_CH2N
-| SWDIO / TMS |  I  | PB12    |  25 | SPI2_NSS/ I1C1_SMBA/ USART3_CK / TIM1_BKIN
-| SWO / TDO   |  I  | PA10    |  31 | USART1_RX / TIM1_CH3
-| nRESET      |  O  | PB0     |  18 | ADC12_IN8 / TIM3_CH3 / TIM1_CH2N
+| SWCLK / TCK |  O  | PA4    |  10 |
+| SWDIO / TMS |  O  | PA5    |  11 |
+| SWDIO / TMS |  I  | PA6    |  12 |
+| SWO / TDO   |  I  | PA10   |  20 |
+| nRESET      |  O  | PB0    |  14 |
 | UART        |
-| --UART RX     |  I  | PA2     |   8 | USART2_TX
-| --UART TX     |  O  | PA3     |   9 | USART2_RX
+| UART RX     |  I  | PA2    |   8 |
+| UART TX     |  O  | PA3    |   9 | 
 | Button      |
-| NF-RST But. |  I  | PB15    |  28 | SPI2_MOSI / TIM1_CH3N
+| NF-RST But. |  I  | PB5    |  28 |
 | LEDs        |
-| Connect. LED|  O  | PB6     |  42 | I2C1_SCL / TIM4_CH1 / USART1_TX
-| HID LED     |  O  | PA9     |  30 | USART1_TX / TIM1_CH2
-| CDC LED     |  O  | PA9     |  30 |
-| MSC LED     |  O  | PA9     |  30 |
+| Connect. LED|  O  | PB6    |  29 |
+| HID LED     |  O  | PA9    |  19 |
+| CDC LED     |  O  | PA9    |  19 |
+| MSC LED     |  O  | PA9    |  19 |
+| USB         |
+| USB DP      |     | PA12   |  22 |
+| USB DM      |     | PA11   |  21 |
