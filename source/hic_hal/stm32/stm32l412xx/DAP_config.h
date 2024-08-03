@@ -139,60 +139,41 @@ This information includes:
 
 __STATIC_INLINE void pin_out_init(GPIO_TypeDef* GPIOx, uint8_t pin_bit)
 {
-    if(pin_bit >= 8)
-    {
-        GPIOx->CRH &= ~(0x0000000F << ((pin_bit-8) << 2));
-        GPIOx->CRH |= ( ((uint32_t)(0x00|0x03) & 0x0F) << ((pin_bit-8) << 2) );
-    }
-    else
-    {
-        GPIOx->CRL &= ~(0x0000000F << ((pin_bit) << 2));
-        GPIOx->CRL |= ( ((uint32_t)(0x00|0x03) & 0x0F) << ((pin_bit) << 2) );
-    }
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = pin_bit;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOx, &GPIO_InitStruct);
 }
 
 __STATIC_INLINE void pin_out_od_init(GPIO_TypeDef* GPIOx, uint8_t pin_bit)
 {
-    if(pin_bit >= 8)
-    {
-        GPIOx->CRH &= ~(0x0000000F << ((pin_bit-8) << 2));
-        GPIOx->CRH |= ( ((uint32_t)(0x04|0x03) & 0x0F) << ((pin_bit-8) << 2) );
-    }
-    else
-    {
-        GPIOx->CRL &= ~(0x0000000F << ((pin_bit) << 2));
-        GPIOx->CRL |= ( ((uint32_t)(0x04|0x03) & 0x0F) << ((pin_bit) << 2) );
-    }
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = pin_bit;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOx, &GPIO_InitStruct);
 }
 
 __STATIC_INLINE void pin_in_init(GPIO_TypeDef* GPIOx, uint8_t pin_bit, uint8_t mode)
 {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
     uint8_t config;
     if(mode == 1)
-        config = 0x08; //Up
+        config = GPIO_PULLUP;
     else if(mode == 2)
-        config = 0x08; //down
+        config = GPIO_PULLDOWN;
     else
-        config = 0x00; //GPIO_Mode_AIN
+        config = GPIO_NOPULL;
 
-    if(pin_bit >= 8)
-    {
-        GPIOx->CRH &= ~(0x0000000F << ((pin_bit-8) << 2));
-        GPIOx->CRH |= ( ((uint32_t)(config) & 0x0F) << ((pin_bit-8) << 2) );
-        if(mode == 1)
-            GPIOx->BSRR = (((uint32_t)0x01) << pin_bit);
-        else if(mode == 2)
-            GPIOx->BRR = (((uint32_t)0x01) << pin_bit);
-    }
-    else
-    {
-        GPIOx->CRL &= ~(0x0000000F << ((pin_bit) << 2));
-        GPIOx->CRL |= ( ((uint32_t)(config) & 0x0F) << ((pin_bit) << 2) );
-        if(mode == 1)
-            GPIOx->BSRR = (((uint32_t)0x01) << pin_bit);
-        else if(mode == 2)
-            GPIOx->BRR = (((uint32_t)0x01) << pin_bit);
-    }
+    GPIO_InitStruct.Pin = GPIO_PIN_6;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = config;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 //**************************************************************************************************
 /**
