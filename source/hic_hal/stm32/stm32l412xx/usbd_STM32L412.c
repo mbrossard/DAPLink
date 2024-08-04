@@ -147,7 +147,7 @@ void __SVC_1(void)
 void          USBD_IntrEna(void)
 {
 #endif
-    NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
+    NVIC_EnableIRQ(USB_IRQn);
 }
 
 
@@ -159,7 +159,9 @@ void          USBD_IntrEna(void)
 
 void USBD_Init(void)
 {
-    RCC->APB1ENR |= (1 << 23);            /* enable clock for USB               */
+    RCC->CRRCR |= 1;                      /* enable clock for USB               */
+    RCC->APB1ENR1 |= (1 << 26);
+
     USBD_IntrEna();                       /* Enable USB Interrupts              */
     /* Control USB connecting via SW                                            */
     USB_CONNECT_OFF();
@@ -196,7 +198,7 @@ void USBD_Connect(BOOL con)
 
 void USBD_Reset(void)
 {
-    NVIC_DisableIRQ(USB_LP_CAN1_RX0_IRQn);
+    NVIC_DisableIRQ(USB_IRQn);
 
     /* Double Buffering is not yet supported                                    */
     ISTR = 0;                             /* Clear Interrupt Status             */
@@ -229,7 +231,7 @@ void USBD_Reset(void)
     EPxREG(0) = EP_CONTROL | EP_RX_VALID;
     DADDR = DADDR_EF | 0;                 /* Enable USB Default Address         */
 
-    NVIC_EnableIRQ(USB_LP_CAN1_RX0_IRQn);
+    NVIC_EnableIRQ(USB_IRQn);
 }
 
 
@@ -565,7 +567,7 @@ U32 USBD_GetError(void)
  *  USB Device Interrupt Service Routine
  */
 
-void USB_LP_CAN1_RX0_IRQHandler(void)
+void USB_IRQHandler(void)
 {
     uint32_t istr;
     uint32_t num;
