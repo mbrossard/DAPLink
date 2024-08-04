@@ -52,7 +52,7 @@
 /* Flash Programming Info */
 
 #define DAPLINK_SECTOR_SIZE             0x00000800
-#define DAPLINK_MIN_WRITE_SIZE          0x00000800
+#define DAPLINK_MIN_WRITE_SIZE          0x00000400
 
 /* Current build */
 
