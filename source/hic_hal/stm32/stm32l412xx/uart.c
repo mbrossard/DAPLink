@@ -144,13 +144,13 @@ int32_t uart_set_configuration(UART_Configuration *config)
     // parity
     configuration.Parity = config->Parity;
     if(config->Parity == HAL_UART_PARITY_ODD) {
-        uart_handle.Init.Parity = HAL_HAL_UART_PARITY_ODD;
+        uart_handle.Init.Parity = HAL_UART_PARITY_ODD;
     } else if(config->Parity == HAL_UART_PARITY_EVEN) {
-        uart_handle.Init.Parity = HAL_HAL_UART_PARITY_EVEN;
+        uart_handle.Init.Parity = HAL_UART_PARITY_EVEN;
     } else if(config->Parity == HAL_UART_PARITY_NONE) {
-        uart_handle.Init.Parity = HAL_HAL_UART_PARITY_NONE;
+        uart_handle.Init.Parity = HAL_UART_PARITY_NONE;
     } else {   //Other not support
-        uart_handle.Init.Parity = HAL_HAL_UART_PARITY_NONE;
+        uart_handle.Init.Parity = HAL_UART_PARITY_NONE;
         configuration.Parity = HAL_UART_PARITY_NONE;
     }
 
@@ -170,7 +170,7 @@ int32_t uart_set_configuration(UART_Configuration *config)
 
     //Only 8 bit support
     configuration.DataBits = UART_DATA_BITS_8;
-    if (uart_handle.Init.Parity == HAL_HAL_UART_PARITY_ODD || uart_handle.Init.Parity == HAL_HAL_UART_PARITY_EVEN) {
+    if (uart_handle.Init.Parity == HAL_UART_PARITY_ODD || uart_handle.Init.Parity == HAL_UART_PARITY_EVEN) {
         uart_handle.Init.WordLength = UART_WORDLENGTH_9B;
     } else {
         uart_handle.Init.WordLength = UART_WORDLENGTH_8B;
