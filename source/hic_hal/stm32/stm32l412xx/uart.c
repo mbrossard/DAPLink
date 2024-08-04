@@ -238,10 +238,10 @@ int32_t uart_read_data(uint8_t *data, uint16_t size)
 
 void CDC_UART_IRQn_Handler(void)
 {
-    const uint32_t sr = CDC_UART->SR;
+    const uint32_t sr = (CDC_UART->ISR) & 0x7FF;
 
-    if (sr & USART_SR_RXNE) {
-        uint8_t dat = CDC_UART->DR;
+    if (sr & USART_ISR_RXNE) {
+        uint8_t dat = CDC_UART->RDR;
         uint32_t free = circ_buf_count_free(&read_buffer);
         if (free > RX_OVRF_MSG_SIZE) {
             circ_buf_push(&read_buffer, dat);
@@ -252,9 +252,9 @@ void CDC_UART_IRQn_Handler(void)
         }
     }
 
-    if (sr & USART_SR_TXE) {
+    if (sr & USART_ISR_TXE) {
         if (circ_buf_count_used(&write_buffer) > 0) {
-            CDC_UART->DR = circ_buf_pop(&write_buffer);
+            CDC_UART->TDR = circ_buf_pop(&write_buffer);
         } else {
             CDC_UART->CR1 &= ~USART_IT_TXE;
         }
