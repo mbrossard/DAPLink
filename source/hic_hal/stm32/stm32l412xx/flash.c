@@ -1,5 +1,5 @@
 /**
- * @file    flash_hal_stm32k412xx.c
+ * @file    flash_hal_stm32l412xx.c
  * @brief
  *
  * DAPLink Interface Firmware
