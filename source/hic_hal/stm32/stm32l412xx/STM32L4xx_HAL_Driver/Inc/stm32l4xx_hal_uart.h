@@ -385,7 +385,7 @@ typedef  void (*pUART_RxEventCallbackTypeDef)
   * @{
   */
 #define UART_STOPBITS_0_5                    USART_CR2_STOP_0                     /*!< UART frame with 0.5 stop bit  */
-#define UART_STOPBITS_1                     0x00000000U                           /*!< UART frame with 1 stop bit    */
+#define UART_STOPBITS_1                     ((uint32_t)0x00000000)                           /*!< UART frame with 1 stop bit    */
 #define UART_STOPBITS_1_5                   (USART_CR2_STOP_0 | USART_CR2_STOP_1) /*!< UART frame with 1.5 stop bits */
 #define UART_STOPBITS_2                      USART_CR2_STOP_1                     /*!< UART frame with 2 stop bits   */
 /**
@@ -395,9 +395,9 @@ typedef  void (*pUART_RxEventCallbackTypeDef)
 /** @defgroup UART_Parity  UART Parity
   * @{
   */
-#define UART_PARITY_NONE                    0x00000000U                        /*!< No parity   */
-#define UART_PARITY_EVEN                    USART_CR1_PCE                      /*!< Even parity */
-#define UART_PARITY_ODD                     (USART_CR1_PCE | USART_CR1_PS)     /*!< Odd parity  */
+#define HAL_UART_PARITY_NONE                    0x00000000U                        /*!< No parity   */
+#define HAL_UART_PARITY_EVEN                    USART_CR1_PCE                      /*!< Even parity */
+#define HAL_UART_PARITY_ODD                     (USART_CR1_PCE | USART_CR1_PS)     /*!< Odd parity  */
 /**
   * @}
   */
@@ -1386,9 +1386,9 @@ typedef  void (*pUART_RxEventCallbackTypeDef)
   * @param __PARITY__ UART frame parity.
   * @retval SET (__PARITY__ is valid) or RESET (__PARITY__ is invalid)
   */
-#define IS_UART_PARITY(__PARITY__) (((__PARITY__) == UART_PARITY_NONE) || \
-                                    ((__PARITY__) == UART_PARITY_EVEN) || \
-                                    ((__PARITY__) == UART_PARITY_ODD))
+#define IS_UART_PARITY(__PARITY__) (((__PARITY__) == HAL_UART_PARITY_NONE) || \
+                                    ((__PARITY__) == HAL_UART_PARITY_EVEN) || \
+                                    ((__PARITY__) == HAL_UART_PARITY_ODD))
 
 /**
   * @brief Ensure that UART hardware flow control is valid.
