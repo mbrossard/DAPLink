@@ -107,9 +107,9 @@ uint32_t ProgramPage(uint32_t adr, uint32_t sz, uint32_t *buf)
 
     HAL_FLASH_Unlock();
 
-    util_assert(sz % 4 == 0);
-    for (i = 0; i < sz / 4; i++) {
-        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, adr + i * 4, buf[i]) != HAL_OK) {
+    util_assert(sz % 8 == 0);
+    for (i = 0; i < sz / 2; i = i + 2) {
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, adr + i * 4, (uint64_t) buf[i]) != HAL_OK) {
             ret = 1;
             break;
         }
