@@ -1,6 +1,6 @@
 /**
- * @file    lpc55S69xpresso.c
- * @brief   board ID for the NXP LPCXpresso55S69 board
+ * @file    h4w4k4.c
+ * @brief   board ID for the h4w4k4 board
  *
  * DAPLink Interface Firmware
  * Copyright (c) 2009-2019, ARM Limited, All Rights Reserved
@@ -24,7 +24,7 @@
 
 const board_info_t g_board_info = {
     .info_version = 1,
-    .board_id = "9999",
+    .board_id = "D002",
     .family_id = kNXP_LPC55xx_FamilyID,
     .flags = kEnablePageErase,
  //   .daplink_url_name =       "PRODINFOHTM",
