@@ -121,10 +121,23 @@ void gpio_init(void)
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOD_CLK_ENABLE();
     // Enable USB connect pin
-    __HAL_RCC_AFIO_CLK_ENABLE();
+    __HAL_RCC_SYSCFG_CLK_ENABLE();
     // Disable JTAG to free pins for other uses
     // Note - SWD is still enabled
-    __HAL_AFIO_REMAP_SWJ_NOJTAG();
+	GPIO_InitStructure.Pin = GPIO_PIN_15;
+	GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
+	GPIO_InitStructure.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+	GPIO_InitStructure.Pin = GPIO_PIN_3;
+	GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
+	GPIO_InitStructure.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+	GPIO_InitStructure.Pin = GPIO_PIN_4;
+	GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
+	GPIO_InitStructure.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
 
     USB_CONNECT_PORT_ENABLE();
     USB_CONNECT_OFF();
