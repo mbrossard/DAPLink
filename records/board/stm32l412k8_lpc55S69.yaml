@@ -1,7 +1,7 @@
 common:
     sources:
         board:
-            - source/board/h4w4k4.c
+            - source/board/stm32l412k8_lpc55S69.c
         family:
             - source/family/nxp/lpc55S6X/target.c
             - source/family/nxp/lpc55S6X/target_reset.c

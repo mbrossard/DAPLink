@@ -1,6 +1,6 @@
 /**
- * @file    h4w4k4.c
- * @brief   board ID for the h4w4k4 board
+ * @file    stm32l412k8_lpc55S69.c
+ * @brief   board ID for the stm32l412k8_lpc55S69 board
  *
  * DAPLink Interface Firmware
  * Copyright (c) 2009-2019, ARM Limited, All Rights Reserved
@@ -32,5 +32,5 @@ const board_info_t g_board_info = {
  //   .daplink_target_url = "",
     .target_cfg = &target_device,
     .board_vendor = "h4w4k4",
-    .board_name = "h4w4k4",
+    .board_name = "stm32l412k8_lpc55S69",
 };

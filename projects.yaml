@@ -696,7 +696,7 @@ projects:
     stm32l412xx_lpc55s69_if:
         - *module_if
         - *module_hic_stm32l412xx
-        - records/board/h4w4k4.yaml
+        - records/board/stm32l412k8_lpc55S69.yaml
 
 
     # Test projects
