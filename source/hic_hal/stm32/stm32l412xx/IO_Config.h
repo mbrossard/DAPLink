@@ -38,13 +38,13 @@ COMPILER_ASSERT(DAPLINK_HIC_ID == DAPLINK_HIC_ID_STM32L412XX);
 
 //Connected LED
 #define CONNECTED_LED_PORT           GPIOB
-#define CONNECTED_LED_PIN            GPIO_PIN_6
-#define CONNECTED_LED_PIN_Bit        6
+#define CONNECTED_LED_PIN            GPIO_PIN_7
+#define CONNECTED_LED_PIN_Bit        7
 
 //When bootloader, disable the target port(not used)
-#define POWER_EN_PIN_PORT            GPIOB
-#define POWER_EN_PIN                 GPIO_PIN_5
-#define POWER_EN_Bit                 5
+#define POWER_EN_PIN_PORT            GPIOA
+#define POWER_EN_PIN                 GPIO_PIN_14
+#define POWER_EN_Bit                 14
 
 // nRESET OUT Pin
 #define nRESET_PIN_PORT              GPIOB
@@ -70,17 +70,17 @@ COMPILER_ASSERT(DAPLINK_HIC_ID == DAPLINK_HIC_ID_STM32L412XX);
 #define RUNNING_LED_PIN              GPIO_PIN_6
 #define RUNNING_LED_Bit              6
 
-#define PIN_HID_LED_PORT             GPIOA
-#define PIN_HID_LED                  GPIO_PIN_9
-#define PIN_HID_LED_Bit              9
+#define PIN_HID_LED_PORT             GPIOB
+#define PIN_HID_LED                  GPIO_PIN_5
+#define PIN_HID_LED_Bit              5
 
-#define PIN_CDC_LED_PORT             GPIOA
-#define PIN_CDC_LED                  GPIO_PIN_9
-#define PIN_CDC_LED_Bit              9
+#define PIN_CDC_LED_PORT             GPIOB
+#define PIN_CDC_LED                  GPIO_PIN_4
+#define PIN_CDC_LED_Bit              4
 
-#define PIN_MSC_LED_PORT             GPIOA
-#define PIN_MSC_LED                  GPIO_PIN_9
-#define PIN_MSC_LED_Bit              9
+#define PIN_MSC_LED_PORT             GPIOB
+#define PIN_MSC_LED                  GPIO_PIN_3
+#define PIN_MSC_LED_Bit              3
 
 
 #endif

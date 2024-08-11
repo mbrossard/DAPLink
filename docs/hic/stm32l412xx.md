@@ -33,12 +33,13 @@ Because of the flash size limitation the DAPLink bootloader is not used.
 | UART RX     |  I  | PA2    |   8 | Target RX |
 | UART TX     |  O  | PA3    |   9 | Target TX |
 | Button      |
-| NF-RST But. |  I  | PB5    |  28 | Not used |
+| NF-RST But. |  I  | PA14   |  26 | Not used |
 | LEDs        |
-| Connect. LED|  O  | PB6    |  29 |
-| HID LED     |  O  | PA9    |  19 |
-| CDC LED     |  O  | PA9    |  19 |
-| MSC LED     |  O  | PA9    |  19 |
+| Connect. LED|  O  | PB7    |  30 |
+| Running LED |  O  | PB6    |  29 |
+| HID LED     |  O  | PB5    |  28 |
+| CDC LED     |  O  | PB4    |  27 |
+| MSC LED     |  O  | PB3    |  26 |
 | USB         |
 | USB DP      |     | PA12   |  22 | Connect 18pF to GND and 33R serie |
 | USB DM      |     | PA11   |  21 | Connect 18pF to GND and 33R serie |
