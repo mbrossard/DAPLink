@@ -119,9 +119,22 @@ module:
         - records/hic_hal/stm32h743xx.yaml
         - records/usb/usb-hid.yaml
     hic_stm32l412xx: &module_hic_stm32l412xx
+        - *module_tools
+        - records/usb/usb-core.yaml
+        - records/usb/usb-msc.yaml
+        - records/usb/usb-cdc.yaml
+        - records/usb/usb-winusb.yaml
+        - records/daplink/cmsis-dap.yaml
+        - records/daplink/drag-n-drop.yaml
+        - records/daplink/usb2uart.yaml
+        - records/daplink/settings.yaml
+        - records/daplink/settings_rom.yaml
+        - records/daplink/interface.yaml
+        - records/daplink/target_family.yaml
+        - records/daplink/target_board.yaml
         - records/rtos/rtos-cm4.yaml
         - records/hic_hal/stm32l412xx.yaml
-        - records/usb/usb-hid.yaml
+        - records/usb/usb-bulk.yaml
 
 projects:
     # HIC bootloaders and all target interfaces
@@ -249,7 +262,6 @@ projects:
         - records/family/all_family.yaml
         - records/usb/usb-bulk.yaml
     stm32l412xx_if:
-        - *module_if
         - *module_hic_stm32l412xx
         - records/family/all_family.yaml
         - records/usb/usb-bulk.yaml
@@ -694,7 +706,6 @@ projects:
         - records/usb/usb-bulk.yaml
         - records/board/stm32h743xx_udb_if.yaml # extends DAPLink with additional features for the UDB project
     stm32l412xx_lpc55s69_if:
-        - *module_if
         - *module_hic_stm32l412xx
         - records/board/stm32l412k8_lpc55S69.yaml
 
