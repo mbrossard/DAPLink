@@ -21,24 +21,24 @@ Because of the flash size limitation the DAPLink bootloader is not used.
 
 ## DAPLink default pin assignment
 
-| Signal      | I/O | Symbol  | Pin |
-|-------------|:---:|---------|:---:|
+| Signal      | I/O | Symbol  | Pin | Comment |
+|-------------|:---:|---------|:---:|---------|
 | SWD / JTAG  |
-| SWCLK / TCK |  O  | PA4    |  10 |
-| SWDIO / TMS |  O  | PA5    |  11 |
-| SWDIO / TMS |  I  | PA6    |  12 |
-| SWO / TDO   |  I  | PA10   |  20 |
-| nRESET      |  O  | PB0    |  14 |
+| SWCLK / TCK |  O  | PA4    |  10 | Target SWCLK |
+| SWDIO / TMS |  O  | PA5    |  11 | Target SWDIO |
+| SWDIO / TMS |  I  | PA6    |  12 | Connect to PA5 through 100R |
+| SWO / TDO   |  I  | PA10   |  20 | Target SWO   |
+| nRESET      |  O  | PB0    |  14 | Target nReset |
 | UART        |
-| UART RX     |  I  | PA2    |   8 |
-| UART TX     |  O  | PA3    |   9 | 
+| UART RX     |  I  | PA2    |   8 | Target RX |
+| UART TX     |  O  | PA3    |   9 | Target TX |
 | Button      |
-| NF-RST But. |  I  | PB5    |  28 |
+| NF-RST But. |  I  | PB5    |  28 | Not used |
 | LEDs        |
 | Connect. LED|  O  | PB6    |  29 |
 | HID LED     |  O  | PA9    |  19 |
 | CDC LED     |  O  | PA9    |  19 |
 | MSC LED     |  O  | PA9    |  19 |
 | USB         |
-| USB DP      |     | PA12   |  22 |
-| USB DM      |     | PA11   |  21 |
+| USB DP      |     | PA12   |  22 | Connect 18pF to GND and 33R serie |
+| USB DM      |     | PA11   |  21 | Connect 18pF to GND and 33R serie |
