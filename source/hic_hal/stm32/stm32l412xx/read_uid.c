@@ -27,8 +27,8 @@ void read_unique_id(uint32_t *id)
     uint32_t Device_Serial0, Device_Serial1, Device_Serial2;    
     
     Device_Serial0 = *(uint32_t*)(0x1FFF7590); 
-    Device_Serial1 = *(uint32_t*)(0x1FFF7598); 
-    Device_Serial2 = *(uint32_t*)(0x1FFF75A0);    
+    Device_Serial1 = *(uint32_t*)(0x1FFF7594);
+    Device_Serial2 = *(uint32_t*)(0x1FFF7598);
   
     id[0] = Device_Serial0;
     id[1] = Device_Serial1;
