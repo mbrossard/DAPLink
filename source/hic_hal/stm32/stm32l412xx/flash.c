@@ -25,6 +25,7 @@
 #include "util.h"
 #include "string.h"
 #include "target_board.h"
+#include "gpio.h"
 
 /*********************************************************************
 *
@@ -62,17 +63,25 @@ uint32_t EraseChip(void)
     uint32_t ret = 0;  // O.K.
     if (g_board_info.target_cfg) {
         HAL_FLASH_Unlock();
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_FASTERR);
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_MISERR);
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGSERR);
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_SIZERR);
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGAERR);
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_WRPERR);
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_OPERR);
         //bootloader, interface flashing only concerns 1 flash region
         util_assert((g_board_info.target_cfg->flash_regions[0].end - g_board_info.target_cfg->flash_regions[0].start) %
                     FLASH_PAGE_SIZE == 0);
         memset(&erase_init, 0, sizeof(erase_init));
-        erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
-        erase_init.Page = g_board_info.target_cfg->flash_regions[0].start;
-        erase_init.NbPages = (g_board_info.target_cfg->flash_regions[0].end - g_board_info.target_cfg->flash_regions[0].start) % FLASH_PAGE_SIZE;
+        erase_init.TypeErase= FLASH_TYPEERASE_PAGES;
+        erase_init.Banks    = FLASH_BANK_1;
+        erase_init.Page		= (g_board_info.target_cfg->flash_regions[0].start - DAPLINK_ROM_START) / DAPLINK_SECTOR_SIZE;
+        erase_init.NbPages 	= (g_board_info.target_cfg->flash_regions[0].end - g_board_info.target_cfg->flash_regions[0].start) / DAPLINK_SECTOR_SIZE;
         if (HAL_FLASHEx_Erase(&erase_init, &error) != HAL_OK) {
             ret = 1;
         }
-        
+
         HAL_FLASH_Lock();
     }else{
         ret = 1;
@@ -87,15 +96,23 @@ uint32_t EraseSector(uint32_t adr)
     uint32_t ret = 0;  // O.K.
 
     HAL_FLASH_Unlock();
-    
-    memset(&erase_init, 0, sizeof(erase_init));
-    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
-    erase_init.Page = adr;
-    erase_init.NbPages = 1;
-    if (HAL_FLASHEx_Erase(&erase_init, &error) != HAL_OK) {
-        ret = 1;
-    }
+    erase_init.TypeErase	= FLASH_TYPEERASE_PAGES;
+    erase_init.Banks       	= FLASH_BANK_1;
+    erase_init.Page        	= (adr - DAPLINK_ROM_START) / DAPLINK_SECTOR_SIZE;
+    erase_init.NbPages     	= 1;
 
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_FASTERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_MISERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGSERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_SIZERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGAERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_WRPERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_OPERR);
+
+	if (HAL_FLASHEx_Erase(&erase_init, &error) != HAL_OK)
+	{
+		ret = 1;
+	}
     HAL_FLASH_Lock();
     return ret;
 }
@@ -107,14 +124,28 @@ uint32_t ProgramPage(uint32_t adr, uint32_t sz, uint32_t *buf)
 
     HAL_FLASH_Unlock();
 
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_FASTERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_MISERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGSERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_SIZERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_PGAERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_WRPERR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_OPERR);
+
     util_assert(sz % 8 == 0);
-    for (i = 0; i < sz / 2; i = i + 2) {
-        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, adr + i * 4, (uint64_t) buf[i]) != HAL_OK) {
-            ret = 1;
+
+    uint64_t *dest = (uint64_t*) adr;
+    uint64_t *src = (uint64_t*) buf;
+
+    for (i = 0; i < sz / 2; i++) {
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, (uint32_t) dest, *src) == HAL_OK) {
+            src++;
+            dest++;
+        } else {
+               ret = 1;
             break;
         }
     }
-
     HAL_FLASH_Lock();
     return ret;
 }
