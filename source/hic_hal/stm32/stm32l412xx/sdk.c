@@ -53,16 +53,10 @@ void sdk_init()
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
 
-    SystemCoreClockUpdate();
-    HAL_Init();
-
-    /* Select HSI as system clock source to allow modification of the PLL configuration */
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_SYSCLK;
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK) {
-        /* Initialization Error */
-        util_assert(0);
-    }
+    __HAL_RCC_SYSCFG_CLK_ENABLE();
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    __HAL_RCC_DMA2_CLK_ENABLE();
 
     /* Enable HSE bypass Oscillator, select it as PLL source and finally activate the PLL */
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI;
@@ -75,7 +69,8 @@ void sdk_init()
     RCC_OscInitStruct.PLL.PLLN = 9;
     RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
     RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+    HAL_StatusTypeDef ret=HAL_RCC_OscConfig(&RCC_OscInitStruct);
+    if ( ret != HAL_OK) {
         /* Initialization Error */
         util_assert(0);
     }
@@ -86,10 +81,24 @@ void sdk_init()
     RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
     RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
+    ret = HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4);
+    if ( ret != HAL_OK) {
         /* Initialization Error */
         util_assert(0);
     }
+
+    /* Select HSI48 as USB clock source */
+    RCC_PeriphCLKInitTypeDef  PeriphClkInitStruct;
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USB;
+    PeriphClkInitStruct.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
+    ret = HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct);
+    if ( ret != HAL_OK) {
+        /* Initialization Error */
+        util_assert(0);
+    }
+
+    SystemCoreClockUpdate();
+    HAL_Init();
 }
 
 HAL_StatusTypeDef HAL_InitTick(uint32_t TickPriority)
