@@ -162,6 +162,7 @@ void USBD_Init(void)
     RCC->CRRCR |= 1;                      /* enable clock for USB               */
     RCC->APB1ENR1 |= (1 << 26);
 
+    SET_BIT(PWR->CR2, PWR_CR2_USV);		  /* turn on power for USB interface 	*/
     USBD_IntrEna();                       /* Enable USB Interrupts              */
     /* Control USB connecting via SW                                            */
     USB_CONNECT_OFF();
