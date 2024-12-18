@@ -55,8 +55,8 @@ void sdk_init()
 
     __HAL_RCC_SYSCFG_CLK_ENABLE();
     __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_RCC_DMA1_CLK_ENABLE();
-    __HAL_RCC_DMA2_CLK_ENABLE();
+    __HAL_RCC_USB_CLK_ENABLE();
+    __HAL_RCC_CRS_CLK_ENABLE();
 
     /* Enable HSE bypass Oscillator, select it as PLL source and finally activate the PLL */
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI;
@@ -81,7 +81,7 @@ void sdk_init()
     RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
     RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    ret = HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4);
+    ret = HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1);
     if ( ret != HAL_OK) {
         /* Initialization Error */
         util_assert(0);
@@ -97,7 +97,31 @@ void sdk_init()
         util_assert(0);
     }
 
+
+    /*Configure the clock recovery system (CRS)**********************************/
+    /* Used to automatically adjust the USB 48MHz HSI */
+    RCC_CRSInitTypeDef RCC_CRSInitStruct;
+
+    /* Default Synchro Signal division factor (not divided) */
+    RCC_CRSInitStruct.Prescaler = RCC_CRS_SYNC_DIV1;
+
+    /* Set the SYNCSRC[1:0] bits according to CRS_Source value */
+    RCC_CRSInitStruct.Source = RCC_CRS_SYNC_SOURCE_USB;
+
+    /* HSI48 is synchronized with USB SOF at 1KHz rate */
+    RCC_CRSInitStruct.ReloadValue =  RCC_CRS_RELOADVALUE_DEFAULT;
+    RCC_CRSInitStruct.ErrorLimitValue = RCC_CRS_ERRORLIMIT_DEFAULT;
+
+    RCC_CRSInitStruct.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+
+    /* Set the TRIM[5:0] to the default value*/
+    RCC_CRSInitStruct.HSI48CalibrationValue = RCC_CRS_HSI48CALIBRATION_DEFAULT;
+
+    /* Start automatic synchronization */
+    HAL_RCCEx_CRSConfig (&RCC_CRSInitStruct);
+
     SystemCoreClockUpdate();
+
     HAL_Init();
 }
 
