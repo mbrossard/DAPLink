@@ -32,7 +32,6 @@
 #include "IO_Config.h"
 #include "cortex_m.h"
 #include "string.h"
-
 #define __NO_USB_LIB_C
 #include "usb_config.c"
 
@@ -44,17 +43,24 @@
 
 #define USB_DBL_BUF_EP      0x0000
 
-#define EP_BUF_ADDR (sizeof(EP_BUF_DSCR)*(USBD_EP_NUM+1)) /* Endpoint Buf Adr */
+#define EP_BUF_ADDR (sizeof(EP_BUFF_DSCR)*(USBD_EP_NUM+1)) /* Endpoint Buf Adr */
 
-EP_BUF_DSCR *pBUF_DSCR = (EP_BUF_DSCR *)USB_PMA_ADDR; /* Ptr to EP Buf Desc   */
+volatile static EP_BUFF_DSCR  *pBUF_DSCR = (EP_BUFF_DSCR *) USB_PMA_ADDR; /* Ptr to EP Buf Desc   */
 
-U16 FreeBufAddr;                        /* Endpoint Free Buffer Address       */
+volatile uint16_t FreeBufAddr;                        /* Endpoint Free Buffer Address       */
 
 uint32_t StatQueue[(USBD_EP_NUM + 1) * 2 + 1];
 uint32_t StatQueueHead = 0;
 uint32_t StatQueueTail = 0;
 uint32_t LastIstr = 0;
 
+static void USB_ClearSRAM() {
+    char *buffer = (char*) USB_PMA_ADDR;
+
+    for (uint16_t i = 0; i < USB_PMA_SIZE; i++) {
+        buffer[i] = 0;
+    }
+}
 
 inline static void stat_enque(uint32_t stat)
 {
@@ -86,7 +92,6 @@ inline static uint32_t stat_is_empty()
     cortex_int_restore(state);
     return empty;
 }
-
 
 /*
  *  Reset Endpoint
@@ -159,10 +164,24 @@ void          USBD_IntrEna(void)
 
 void USBD_Init(void)
 {
-    RCC->CRRCR |= 1;                      /* enable clock for USB               */
-    RCC->APB1ENR1 |= (1 << 26);
+    GPIO_InitTypeDef GPIO_InitStructure;
+
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    GPIO_InitStructure.Alternate = GPIO_AF10_USB_FS;
+    GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStructure.Pin = USB_DM_PIN | USB_DP_PIN;
+    HAL_GPIO_Init(USB_DM_PIN_PORT, &GPIO_InitStructure);
 
     SET_BIT(PWR->CR2, PWR_CR2_USV);		  /* turn on power for USB interface 	*/
+
+    CNTR = USB_CNTR_FRES;
+    CNTR = 2;
+    CNTR = 0;
+    ISTR = 0;
+
+    EXTI->IMR1 |= EXTI_IMR1_IM17;
+
     USBD_IntrEna();                       /* Enable USB Interrupts              */
     /* Control USB connecting via SW                                            */
     USB_CONNECT_OFF();
@@ -200,9 +219,9 @@ void USBD_Connect(BOOL con)
 void USBD_Reset(void)
 {
     NVIC_DisableIRQ(USB_IRQn);
-
     /* Double Buffering is not yet supported                                    */
-    ISTR = 0;                             /* Clear Interrupt Status             */
+    CNTR = (uint16_t) 0x0;
+    ISTR = (uint16_t) 0x0;                             /* Clear Interrupt Status             */
     CNTR = CNTR_CTRM | CNTR_RESETM | CNTR_SUSPM | CNTR_WKUPM |
 #ifdef __RTX
            ((USBD_RTX_DevTask   != 0) ? CNTR_ERRM    : 0) |
@@ -215,22 +234,24 @@ void USBD_Reset(void)
            ((USBD_P_SOF_Event   != 0) ? CNTR_SOFM    : 0) |
            ((USBD_P_SOF_Event   != 0) ? CNTR_ESOFM   : 0);
 #endif
-    FreeBufAddr = EP_BUF_ADDR;
+
+    USB_ClearSRAM();
+    EPxREG(0) = EP_CONTROL | EP_RX_VALID;
+    DADDR = DADDR_EF | 0;                 /* Enable USB Default Address         */
+    FreeBufAddr = (uint16_t) EP_BUF_ADDR;
     BTABLE = 0x00;                        /* set BTABLE Address                 */
+
     /* Setup Control Endpoint 0 */
-    pBUF_DSCR->ADDR_TX = FreeBufAddr;
+    pBUF_DSCR->ADDR_TX = (uint16_t) FreeBufAddr;
     FreeBufAddr += USBD_MAX_PACKET0;
-    pBUF_DSCR->ADDR_RX = FreeBufAddr;
+    pBUF_DSCR->ADDR_RX =(uint16_t) FreeBufAddr;
     FreeBufAddr += USBD_MAX_PACKET0;
 
     if (USBD_MAX_PACKET0 > 62) {
-        pBUF_DSCR->COUNT_RX = ((USBD_MAX_PACKET0 << 5) - 1) | 0x8000;
+    	pBUF_DSCR->COUNT_RX = (uint16_t) (((USBD_MAX_PACKET0 << 5) - 1) | 0x8000);
     } else {
-        pBUF_DSCR->COUNT_RX =   USBD_MAX_PACKET0 << 9;
+    	pBUF_DSCR->COUNT_RX =  (uint16_t) (USBD_MAX_PACKET0 << 9);
     }
-
-    EPxREG(0) = EP_CONTROL | EP_RX_VALID;
-    DADDR = DADDR_EF | 0;                 /* Enable USB Default Address         */
 
     NVIC_EnableIRQ(USB_IRQn);
 }
@@ -331,17 +352,16 @@ void USBD_ConfigEP(USB_ENDPOINT_DESCRIPTOR *pEPD)
     val = pEPD->wMaxPacketSize;
 
     if (pEPD->bEndpointAddress & USB_ENDPOINT_DIRECTION_MASK) {
-        (pBUF_DSCR + num)->ADDR_TX = FreeBufAddr;
+        (pBUF_DSCR + num)->ADDR_TX = (uint16_t) FreeBufAddr;
         val = (val + 1) & ~1;
     } else {
-        (pBUF_DSCR + num)->ADDR_RX = FreeBufAddr;
-
+        (pBUF_DSCR + num)->ADDR_RX = (uint16_t) FreeBufAddr;
         if (val > 62) {
             val = (val + 31) & ~31;
-            (pBUF_DSCR + num)->COUNT_RX = ((val << 5) - 1) | 0x8000;
+            (pBUF_DSCR + num)->COUNT_RX = (uint16_t) (((val << 5) - 1) | 0x8000);
         } else {
             val = (val + 1)  & ~1;
-            (pBUF_DSCR + num)->COUNT_RX =   val << 9;
+            (pBUF_DSCR + num)->COUNT_RX = (uint16_t)  (val << 9);
         }
     }
 
@@ -484,17 +504,20 @@ void USBD_ClearEPBuf(U32 EPNum)
 U32 USBD_ReadEP(U32 EPNum, U8 *pData, U32 bufsz)
 {
     /* Double Buffering is not yet supported                                    */
-    U32 num, cnt, *pv, n;
+    U32 num, cnt,n;
+    uint16_t *pv, temp;
     num = EPNum & 0x0F;
-    pv  = (U32 *)(USB_PMA_ADDR + 2 * ((pBUF_DSCR + num)->ADDR_RX));
-    cnt = (pBUF_DSCR + num)->COUNT_RX & EP_COUNT_MASK;
+    pv  = (uint16_t *)(USB_PMA_ADDR + ((uint16_t) (pBUF_DSCR + num)->ADDR_RX));
+    cnt = ((uint16_t) (pBUF_DSCR + num)->COUNT_RX) & EP_COUNT_MASK;
     if (cnt > bufsz) {
         cnt = bufsz;
     }
 
     for (n = 0; n < (cnt + 1) / 2; n++) {
-        __UNALIGNED_UINT16_WRITE(pData, *pv++);
-        pData += 2;
+      //  __UNALIGNED_UINT16_WRITE(pData, (uint16_t) *pv++);
+        temp = (uint16_t) *pv++;
+        *pData++ = (uint8_t) (temp & 0x00FF);
+        *pData++ = (uint8_t) (temp >> 8);
     }
 
     EP_Status(EPNum, EP_RX_VALID);
@@ -515,17 +538,18 @@ U32 USBD_ReadEP(U32 EPNum, U8 *pData, U32 bufsz)
 U32 USBD_WriteEP(U32 EPNum, U8 *pData, U32 cnt)
 {
     /* Double Buffering is not yet supported                                    */
-    U32 num, *pv, n;
+    U32 num, n;
+    uint16_t *pv;
     U16 statusEP;
     num = EPNum & 0x0F;
-    pv  = (U32 *)(USB_PMA_ADDR + 2 * ((pBUF_DSCR + num)->ADDR_TX));
+    pv  = (uint16_t *)(USB_PMA_ADDR + ((uint16_t) (pBUF_DSCR + num)->ADDR_TX));
 
     for (n = 0; n < (cnt + 1) / 2; n++) {
-        *pv++ = __UNALIGNED_UINT16_READ(pData);
+        *pv++ = (uint16_t) ((((uint16_t) *(pData+1)) << 8) + *pData);
         pData += 2;
     }
 
-    (pBUF_DSCR + num)->COUNT_TX = cnt;
+    (pBUF_DSCR + num)->COUNT_TX = (uint16_t) cnt;
     statusEP = EPxREG(num);
 
     if ((statusEP & EP_STAT_TX) != EP_TX_STALL) {
@@ -587,7 +611,7 @@ void USB_IRQHandler(void)
             // Process and filter out the zero length status out endpoint to prevent
             // the next SETUP packet from being dropped.
             if ((0 == num) && (val & EP_CTR_RX) && !(val & EP_SETUP)
-                    && (0 == ((pBUF_DSCR + num)->COUNT_RX & EP_COUNT_MASK))) {
+                    && (0 == (((uint16_t) (pBUF_DSCR + num)->COUNT_RX) & EP_COUNT_MASK))) {
                 if (val & EP_CTR_TX) {
                     // Drop the RX event but not TX
                     stat_enque((((val & VAL_MASK) & ~EP_CTR_RX) << VAL_SHIFT) |
