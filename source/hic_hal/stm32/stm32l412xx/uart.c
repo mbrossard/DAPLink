@@ -82,11 +82,14 @@ int32_t uart_initialize(void)
 {
     GPIO_InitTypeDef GPIO_InitStructure;
 
-    CDC_UART->CR1 &= ~(USART_IT_TXE | USART_IT_RXNE);
+    CDC_UART->CR1 &= ~(USART_CR1_TXEIE | USART_CR1_RXNEIE);
     clear_buffers();
 
     CDC_UART_ENABLE();
     UART_PINS_PORT_ENABLE();
+
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    GPIO_InitStructure.Alternate = GPIO_AF7_USART2;
 
     //TX pin
     GPIO_InitStructure.Pin = UART_TX_PIN;
@@ -97,20 +100,20 @@ int32_t uart_initialize(void)
     GPIO_InitStructure.Pin = UART_RX_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStructure.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(UART_RX_PORT, &GPIO_InitStructure);
+
     //CTS pin, input
     GPIO_InitStructure.Pin = UART_CTS_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStructure.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(UART_CTS_PORT, &GPIO_InitStructure);
     //RTS pin, output low
     HAL_GPIO_WritePin(UART_RTS_PORT, UART_RTS_PIN, GPIO_PIN_RESET);
     GPIO_InitStructure.Pin = UART_RTS_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
     HAL_GPIO_Init(UART_RTS_PORT, &GPIO_InitStructure);
+
+    uart_set_configuration(&configuration);
 
     NVIC_EnableIRQ(CDC_UART_IRQn);
 
@@ -119,7 +122,7 @@ int32_t uart_initialize(void)
 
 int32_t uart_uninitialize(void)
 {
-    CDC_UART->CR1 &= ~(USART_IT_TXE | USART_IT_RXNE);
+    CDC_UART->CR1 &= ~(USART_CR1_TXEIE | USART_CR1_RXNEIE);
     clear_buffers();
     return 1;
 }
@@ -127,9 +130,9 @@ int32_t uart_uninitialize(void)
 int32_t uart_reset(void)
 {
     const uint32_t cr1 = CDC_UART->CR1;
-    CDC_UART->CR1 = cr1 & ~(USART_IT_TXE | USART_IT_RXNE);
+    CDC_UART->CR1 = cr1 & ~(USART_CR1_TXEIE | USART_CR1_RXNEIE);
     clear_buffers();
-    CDC_UART->CR1 = cr1 & ~USART_IT_TXE;
+    CDC_UART->CR1 = cr1 & ~USART_CR1_TXEIE;
     return 1;
 }
 
@@ -188,7 +191,7 @@ int32_t uart_set_configuration(UART_Configuration *config)
     uart_handle.Init.Mode = UART_MODE_TX_RX;
     
     // Disable uart and tx/rx interrupt
-    CDC_UART->CR1 &= ~(USART_IT_TXE | USART_IT_RXNE);
+    CDC_UART->CR1 &= ~(USART_CR1_TXEIE | USART_CR1_RXNEIE);
 
     clear_buffers();
 
@@ -198,7 +201,7 @@ int32_t uart_set_configuration(UART_Configuration *config)
     util_assert(HAL_OK == status);
     (void)status;
 
-    CDC_UART->CR1 |= USART_IT_RXNE;
+    CDC_UART->CR1 |= USART_CR1_RXNEIE;
 
     return 1;
 }
@@ -226,7 +229,7 @@ int32_t uart_write_free(void)
 int32_t uart_write_data(uint8_t *data, uint16_t size)
 {
     uint32_t cnt = circ_buf_write(&write_buffer, data, size);
-    CDC_UART->CR1 |= USART_IT_TXE;
+    CDC_UART->CR1 |= USART_CR1_TXEIE;
 
     return cnt;
 }
@@ -256,7 +259,7 @@ void CDC_UART_IRQn_Handler(void)
         if (circ_buf_count_used(&write_buffer) > 0) {
             CDC_UART->TDR = circ_buf_pop(&write_buffer);
         } else {
-            CDC_UART->CR1 &= ~USART_IT_TXE;
+            CDC_UART->CR1 &= ~USART_CR1_TXEIE;
         }
     }
 }
