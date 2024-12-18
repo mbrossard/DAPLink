@@ -119,56 +119,26 @@ void gpio_init(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
-    __HAL_RCC_GPIOD_CLK_ENABLE();
-    // Enable USB connect pin
-    __HAL_RCC_SYSCFG_CLK_ENABLE();
-    // Disable JTAG to free pins for other uses
-    // Note - SWD is still enabled
-	GPIO_InitStructure.Pin = GPIO_PIN_15;
-	GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStructure.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(GPIOA, &GPIO_InitStructure);
-
-	GPIO_InitStructure.Pin = GPIO_PIN_3;
-	GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStructure.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
-
-	GPIO_InitStructure.Pin = GPIO_PIN_4;
-	GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStructure.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
+    __HAL_RCC_GPIOH_CLK_ENABLE();
 
     USB_CONNECT_PORT_ENABLE();
     USB_CONNECT_OFF();
-    GPIO_InitStructure.Pin = USB_CONNECT_PIN;
-    GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
-    HAL_GPIO_Init(USB_CONNECT_PORT, &GPIO_InitStructure);
-    // configure LEDs
-    HAL_GPIO_WritePin(RUNNING_LED_PORT, RUNNING_LED_PIN, GPIO_PIN_SET);
-    GPIO_InitStructure.Pin = RUNNING_LED_PIN;
-    GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
-    HAL_GPIO_Init(RUNNING_LED_PORT, &GPIO_InitStructure);
 
     HAL_GPIO_WritePin(CONNECTED_LED_PORT, CONNECTED_LED_PIN, GPIO_PIN_SET);
     GPIO_InitStructure.Pin = CONNECTED_LED_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(CONNECTED_LED_PORT, &GPIO_InitStructure);
 
-    HAL_GPIO_WritePin(PIN_CDC_LED_PORT, PIN_CDC_LED, GPIO_PIN_SET);
-    GPIO_InitStructure.Pin = PIN_CDC_LED;
+    // Turn on power to the board. When the target is unpowered
+    // it holds the reset line low.
+    HAL_GPIO_WritePin(POWER_EN_PIN_PORT, POWER_EN_PIN, GPIO_PIN_RESET);
+    GPIO_InitStructure.Pin = POWER_EN_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
-    HAL_GPIO_Init(PIN_CDC_LED_PORT, &GPIO_InitStructure);
-
-    HAL_GPIO_WritePin(PIN_MSC_LED_PORT, PIN_MSC_LED, GPIO_PIN_SET);
-    GPIO_InitStructure.Pin = PIN_MSC_LED;
-    GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
-    HAL_GPIO_Init(PIN_MSC_LED_PORT, &GPIO_InitStructure);
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(POWER_EN_PIN_PORT, &GPIO_InitStructure);
 
     // reset button configured as gpio open drain output with a pullup
     HAL_GPIO_WritePin(nRESET_PIN_PORT, nRESET_PIN, GPIO_PIN_SET);
@@ -177,20 +147,41 @@ void gpio_init(void)
     GPIO_InitStructure.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(nRESET_PIN_PORT, &GPIO_InitStructure);
 
-    // Turn on power to the board. When the target is unpowered
-    // it holds the reset line low.
-    HAL_GPIO_WritePin(POWER_EN_PIN_PORT, POWER_EN_PIN, GPIO_PIN_RESET);
-    GPIO_InitStructure.Pin = POWER_EN_PIN;
+    // configure LEDs
+    HAL_GPIO_WritePin(RUNNING_LED_PORT, RUNNING_LED_PIN, GPIO_PIN_SET);
+    GPIO_InitStructure.Pin = RUNNING_LED_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
-    HAL_GPIO_Init(POWER_EN_PIN_PORT, &GPIO_InitStructure);
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(RUNNING_LED_PORT, &GPIO_InitStructure);
 
-    // Setup the 8MHz MCO
-    GPIO_InitStructure.Pin = GPIO_PIN_8;
+    HAL_GPIO_WritePin(PIN_HID_LED_PORT, PIN_HID_LED, GPIO_PIN_SET);
+    GPIO_InitStructure.Pin = PIN_HID_LED;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStructure.Mode = GPIO_MODE_AF_PP;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStructure);
-    output_clock_enable();
+    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(PIN_HID_LED_PORT, &GPIO_InitStructure);
+
+    HAL_GPIO_WritePin(PIN_CDC_LED_PORT, PIN_CDC_LED, GPIO_PIN_SET);
+    GPIO_InitStructure.Pin = PIN_CDC_LED;
+    GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(PIN_CDC_LED_PORT, &GPIO_InitStructure);
+
+    HAL_GPIO_WritePin(PIN_MSC_LED_PORT, PIN_MSC_LED, GPIO_PIN_SET);
+    GPIO_InitStructure.Pin = PIN_MSC_LED;
+    GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStructure.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(PIN_MSC_LED_PORT, &GPIO_InitStructure);
+
+    // Disable JTAG to free pins for other uses
+    // Note - SWD is still enabled
+	GPIO_InitStructure.Pin = GPIO_PIN_15;
+	GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
+	GPIO_InitStructure.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStructure);
 
     // Let the voltage rails stabilize.  This is especailly important
     // during software resets, since the target's 3.3v rail can take
