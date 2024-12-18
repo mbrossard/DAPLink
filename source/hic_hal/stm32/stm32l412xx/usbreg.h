@@ -15,7 +15,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 /*----------------------------------------------------------------------------
  *      RL-ARM - USB
  *----------------------------------------------------------------------------
@@ -31,7 +30,7 @@
 
 #define USB_BASE_ADDR   0x40006800  /* USB Registers Base Address */
 #define USB_PMA_ADDR    0x40006C00  /* USB Packet Memory Area Address */
-
+#define USB_PMA_SIZE	0x400		/* PMA is 1kB */
 
 /* Common Registers */
 #define CNTR    REG(USB_BASE_ADDR + 0x40)   /* Control Register */
@@ -39,6 +38,8 @@
 #define FNR     REG(USB_BASE_ADDR + 0x48)   /* Frame Number Register */
 #define DADDR   REG(USB_BASE_ADDR + 0x4C)   /* Device Address Register */
 #define BTABLE  REG(USB_BASE_ADDR + 0x50)   /* Buffer Table Address Register */
+//#define LMPCSR  REG(USB_BASE_ADDR + 0x54)   /* LPM Control and Status Register */
+//#define BCDR    REG(USB_BASE_ADDR + 0x58)   /* Battery charging detector Register */
 
 /* CNTR: Control Register Bit Definitions */
 #define CNTR_CTRM       0x8000      /* Correct Transfer Interrupt Mask */
@@ -95,7 +96,7 @@
 #define EP_EA           0x000F      /* EndPoint Address */
 
 /* EndPoint Register Mask (No Toggle Fields) */
-#define EP_MASK         (EP_CTR_RX|EP_SETUP|EP_TYPE|EP_KIND|EP_CTR_TX|EP_EA)
+#define EP_MASK         (EP_SETUP|EP_TYPE|EP_KIND|EP_CTR_TX|EP_EA)
 /* EndPoint Register Mask (Write zero to clear) */
 #define EP_MASK_RC_W0   (EP_CTR_RX|EP_CTR_TX)
 /* Mask off all toggle bits and set write zero to clear bits to 1.          */
@@ -125,14 +126,13 @@
 #define EP_RX_NAK       0x2000      /* NAKed */
 #define EP_RX_VALID     0x3000      /* Valid */
 
-
 /* Endpoint Buffer Descriptor */
-typedef struct _EP_BUF_DSCR {
-    U32 ADDR_TX;
-    U32 COUNT_TX;
-    U32 ADDR_RX;
-    U32 COUNT_RX;
-} EP_BUF_DSCR;
+typedef struct EP_BUFF_DSCR {
+	uint16_t ADDR_TX;
+	uint16_t COUNT_TX;
+	uint16_t ADDR_RX;
+	uint16_t COUNT_RX;
+} EP_BUFF_DSCR;
 
 #define EP_ADDR_MASK    0xFFFE      /* Address Mask */
 #define EP_COUNT_MASK   0x03FF      /* Count Mask */
