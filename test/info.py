@@ -258,6 +258,7 @@ SUPPORTED_CONFIGURATIONS = [
     (   0x0000,     VENDOR_TO_FAMILY('Stub', 1),        'nrf52820_if',                              None,               None                                    ),
     (   0x0000,     VENDOR_TO_FAMILY('Stub', 1),        'sam3u2c_if',                               None,               None                                    ),
     (   0x0000,     VENDOR_TO_FAMILY('Stub', 1),        'stm32f103xb_if',                           None,               None                                    ),
+    (   0xD002,     VENDOR_TO_FAMILY('NXP', 6),         'stm32l412xx_lpc55s69_if',                  None,               'LPCXpresso55S69'                       ),
 
     # Test projects
     (   0x1102,     VENDOR_TO_FAMILY('Nordic', 2),      'lpc55s69_nrf52840dk_test_if',              'lpc55s69_bl',      'Nordic-nRF52840-DK'                    ),
@@ -280,6 +281,7 @@ HIC_STRING_TO_ID = {
     'stm32f072x8': 0x530F0728,
     'stm32f072xb': 0x530F072B,
     'stm32f103xb': 0x97969908,
+    'stm32l412xx': 0x9796990e,
 }
 
 BOARD_ID_LOCKED_WHEN_ERASED = set([
@@ -340,6 +342,7 @@ BOARD_ID_SUPPORTING_PAGE_ERASE = set([
     0x4600,  # REALTEK-RTL8195AM
     0x5500,  # GR-PEACH
     0x5501,  # GR-LYCHEE
+    0xD002,  # stm32l412xx_lpc55s69
 ])
 
 #Hack until these targets have an image with a valid vector table
