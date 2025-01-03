@@ -98,3 +98,6 @@ mbed-os/
 
 #vscode editor
 .vscode
+
+#Test file
+!test_file/*
