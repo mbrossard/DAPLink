@@ -24,7 +24,7 @@ Test file for DAPLink testing, generated from [zdv](https://github.com/H4w4k4/zd
 Compile test software:
 - mbed api has been shutdown
 - Use "set" instead of "export" for PowerShell
-- GNUARMEMB_TOOLCHAIN_PATH cannot have withspace
+- GNUARMEMB_TOOLCHAIN_PATH cannot have whitespace
 ```
 $ virtualenv venv
 $ source venv/bin/activate
