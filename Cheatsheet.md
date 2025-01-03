@@ -32,7 +32,7 @@ $ mkdir zdv-workspace
 $ cd zdv-workspace
 $ export ZEPHYR_TOOLCHAIN_VARIANT=gnuarmemb
 $ export GNUARMEMB_TOOLCHAIN_PATH=/<CHANGE_ME>/gcc-arm-none-eabi-10.3-2021.10
-$ west init -m https://github.com/mbrossard/zdv.git
+$ west init -m https://github.com/H4w4k4/zdv
 $ west update
 $ pip3 install -r zephyr/scripts/requirements.txt
 $ make -f zdv/build.mk
