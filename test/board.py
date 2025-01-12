@@ -713,7 +713,7 @@ class DaplinkBoard(object):
         if DaplinkBoard.KEY_HIC_ID in details_txt:
             details_hic_id = details_txt[DaplinkBoard.KEY_HIC_ID]
         if details_unique_id is not None:
-            if details_unique_id != self.unique_id:
+            if details_unique_id.lower() != self.unique_id.lower():
                 test_info.failure("Unique ID mismatch in details.txt "
                                   "details.txt=%s, usb=%s" %
                                   (details_unique_id, self.unique_id))
