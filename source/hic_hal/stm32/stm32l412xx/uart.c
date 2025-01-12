@@ -99,7 +99,7 @@ int32_t uart_initialize(void)
     //RX pin
     GPIO_InitStructure.Pin = UART_RX_PIN;
     GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStructure.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStructure.Mode = GPIO_MODE_AF_PP;
     HAL_GPIO_Init(UART_RX_PORT, &GPIO_InitStructure);
 
     //CTS pin, input
