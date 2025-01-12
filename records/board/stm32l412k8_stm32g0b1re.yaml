@@ -1,0 +1,6 @@
+common:
+    sources:
+        board:
+            - source/board/stm32l412k8_stm32g0b1re.c
+        family:
+            - source/family/st/stm32g0bx_512/target.c

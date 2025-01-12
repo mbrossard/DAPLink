@@ -259,6 +259,7 @@ SUPPORTED_CONFIGURATIONS = [
     (   0x0000,     VENDOR_TO_FAMILY('Stub', 1),        'sam3u2c_if',                               None,               None                                    ),
     (   0x0000,     VENDOR_TO_FAMILY('Stub', 1),        'stm32f103xb_if',                           None,               None                                    ),
     (   0xD002,     VENDOR_TO_FAMILY('NXP', 6),         'stm32l412xx_lpc55s69_if',                  None,               'LPCXpresso55S69'                       ),
+    (   0xD003,     VENDOR_TO_FAMILY('NXP', 6),         'stm32l412xx_stm32g0b1re_if',               None,               'ST-Nucleo-G0B1RE'                      ),
 
     # Test projects
     (   0x1102,     VENDOR_TO_FAMILY('Nordic', 2),      'lpc55s69_nrf52840dk_test_if',              'lpc55s69_bl',      'Nordic-nRF52840-DK'                    ),
