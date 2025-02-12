@@ -11,7 +11,11 @@ Run test:
 $ python test/run_test.py --targetdir P:/git/daplink/test_file/ --noloadif
 ```
 
-If the board is not part of PyOCD, PyOCD can be ported. Another solution is to modify `test/tests/test_hid.py`, line 41 to add your target as option when PyOCD is called:
+If the board is not part of PyOCD, PyOCD can be ported. Another solution is to modify:
+- `test/tests/test_hid.py` line 41
+- `test/board.py` line 367
+- `test/test/test_msd.py` line 431
+ and add your target as option when PyOCD is called:
 ```
 with ConnectHelper.session_with_chosen_probe(options={"target_override": "lpc55s69"}) as session:
 ```
