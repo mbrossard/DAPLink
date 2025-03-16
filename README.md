@@ -1,4 +1,7 @@
+## Fork note
+This fork was initially create to port DAPLink for a new HIC (stm32l412k8) and adapt it for the target LPC55S69. Development for the target LPC55S69 has been stopped. Another new target (stm32g0b1re) has been added and the new HIC has been tested with it.
 
+----
 [![DAPLink](/docs/images/daplink-website-logo-link.png)](https://daplink.io/)
 
 [![Linux Build (main)](https://github.com/ARMmbed/DAPLink/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/ARMmbed/DAPLink/actions/workflows/linux.yml)
