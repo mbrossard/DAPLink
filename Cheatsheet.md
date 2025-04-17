@@ -1,8 +1,20 @@
 DAPLink
 ---
 
+Installing make (assuming you have git bash):
+- Go to [ezwinports](https://sourceforge.net/projects/ezwinports/files/).
+- Download `make-4.1-2-without-guile-w32-bin.zip` (get the version without guile).
+- Extract zip.
+- Copy the contents to your `Git\mingw64\` merging the folders, but do NOT overwrite/replace any existing files. 
+
+Install gcc:
+- [GNU Arm Embedded Toolchain](https://developer.arm.com/tools-and-software/open-source-software/developer-tools/gnu-toolchain/gnu-rm/downloads) . This compiler will be identified as `gcc_arm`. It is recommended to use version `10.3-2021.10`. 
+- Install to: `C:\gcc\10.2021.10\`
+
 Compiling software:
 ```
+$ export PATH=$PATH:/c/gcc/10.2021.10/bin/
+$ source venv/Scripts/activate
 $ python tools/progen_compile.py -t make_gcc_arm --clean --parallel stm32l412xx_lpc55s69_if
 ```
 
