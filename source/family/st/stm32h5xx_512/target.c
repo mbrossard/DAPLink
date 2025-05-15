@@ -36,5 +36,5 @@ target_cfg_t target_device = {
     .ram_regions[0].start           = 0x20000000,
     .ram_regions[0].end             = 0x20024000,
     .target_vendor                  = "STMicroelectronics",
-    .target_part_number             = "STM32H523RE",
+    .target_part_number             = "STM32H523RETx",
 };
