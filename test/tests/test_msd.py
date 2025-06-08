@@ -428,7 +428,7 @@ def test_mass_storage(workspace, parent_test, quick=False):
         # Test page erase, a.k.a. sector erase by generating iHex with discrete addresses,
         # programing the device then comparing device memory against expected content.
         test = MassStorageTester(board, test_info, "Sector Erase")
-        with ConnectHelper.session_with_chosen_probe(unique_id=board.get_unique_id(), open_session=False) as session:
+        with ConnectHelper.session_with_chosen_probe(open_session=False) as session:
             memory_map = session.target.memory_map
         flash_regions = list(memory_map.iter_matching_regions(type=MemoryType.FLASH))
 

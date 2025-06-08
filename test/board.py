@@ -364,8 +364,7 @@ class DaplinkBoard(object):
 
     def read_target_memory(self, addr, size, resume=True):
         assert self.get_mode() == self.MODE_IF
-        with ConnectHelper.session_with_chosen_probe(unique_id=self.get_unique_id(),
-                                                     resume_on_disconnect=resume) as session:
+        with ConnectHelper.session_with_chosen_probe(resume_on_disconnect=resume) as session:
             data = session.target.read_memory_block8(addr, size)
         return bytearray(data)
 
