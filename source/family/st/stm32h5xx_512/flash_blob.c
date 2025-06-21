@@ -57,7 +57,7 @@ static const uint32_t flash_size = 0x00080000;
 * at address flash_start + flash_size.
 */
 static const sector_info_t sectors_info[] = {
-    0x08000000, 0x00002000,
+    {0x08000000, 0x00002000},
 };
 
 static const program_target_t flash = {
