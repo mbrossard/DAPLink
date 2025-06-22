@@ -32,8 +32,8 @@
 #endif
 #if (SWO_STREAM != 0)
 #include "cmsis_os2.h"
-#define   osObjectsExternal
-#include "osObjects.h"
+//#define   osObjectsExternal
+//#include "osObjects.h"
 #endif
 
 #if (SWO_STREAM != 0)
