@@ -76,6 +76,15 @@ static uint32_t swd_get_apsel(uint32_t adr)
         return apsel;
 }
 
+static uint32_t swd_get_csw(void)
+{
+    uint32_t csw = target_get_swd_csw();
+    if (!csw)
+        return CSW_VALUE;
+    else
+        return csw;
+}
+
 void swd_set_reset_connect(SWD_CONNECT_TYPE type)
 {
     reset_connect = type;
@@ -259,7 +268,7 @@ static uint8_t swd_write_block(uint32_t address, uint8_t *data, uint32_t size)
     size_in_words = size / 4;
 
     // CSW register
-    if (!swd_write_ap(AP_CSW, CSW_VALUE | CSW_SIZE32)) {
+    if (!swd_write_ap(AP_CSW, swd_get_csw() | CSW_SIZE32)) {
         return 0;
     }
 
@@ -302,7 +311,7 @@ static uint8_t swd_read_block(uint32_t address, uint8_t *data, uint32_t size)
 
     size_in_words = size / 4;
 
-    if (!swd_write_ap(AP_CSW, CSW_VALUE | CSW_SIZE32)) {
+    if (!swd_write_ap(AP_CSW, swd_get_csw() | CSW_SIZE32)) {
         return 0;
     }
 
@@ -403,7 +412,7 @@ static uint8_t swd_write_data(uint32_t address, uint32_t data)
 // Read 32-bit word from target memory.
 uint8_t swd_read_word(uint32_t addr, uint32_t *val)
 {
-    if (!swd_write_ap(AP_CSW, CSW_VALUE | CSW_SIZE32)) {
+    if (!swd_write_ap(AP_CSW, swd_get_csw() | CSW_SIZE32)) {
         return 0;
     }
 
@@ -417,7 +426,7 @@ uint8_t swd_read_word(uint32_t addr, uint32_t *val)
 // Write 32-bit word to target memory.
 uint8_t swd_write_word(uint32_t addr, uint32_t val)
 {
-    if (!swd_write_ap(AP_CSW, CSW_VALUE | CSW_SIZE32)) {
+    if (!swd_write_ap(AP_CSW, swd_get_csw() | CSW_SIZE32)) {
         return 0;
     }
 
@@ -433,7 +442,7 @@ uint8_t swd_read_byte(uint32_t addr, uint8_t *val)
 {
     uint32_t tmp;
 
-    if (!swd_write_ap(AP_CSW, CSW_VALUE | CSW_SIZE8)) {
+    if (!swd_write_ap(AP_CSW, swd_get_csw() | CSW_SIZE8)) {
         return 0;
     }
 
@@ -450,7 +459,7 @@ uint8_t swd_write_byte(uint32_t addr, uint8_t val)
 {
     uint32_t tmp;
 
-    if (!swd_write_ap(AP_CSW, CSW_VALUE | CSW_SIZE8)) {
+    if (!swd_write_ap(AP_CSW, swd_get_csw() | CSW_SIZE8)) {
         return 0;
     }
 

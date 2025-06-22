@@ -59,6 +59,7 @@ __WEAK const target_family_descriptor_t g_toshiba_tz_family = {0};
 __WEAK const target_family_descriptor_t g_ambiq_ama3b1kk = {0};
 __WEAK const target_family_descriptor_t g_maxim_max3262x_family = {0};
 __WEAK const target_family_descriptor_t g_maxim_max3266x_family = {0};
+__WEAK const target_family_descriptor_t g_m33_series = {0};
 
 //! @brief Terminator value for g_families list.
 //!
@@ -92,6 +93,7 @@ const target_family_descriptor_t * const g_families[] = {
     &g_ambiq_ama3b1kk,
     &g_maxim_max3262x_family,
     &g_maxim_max3266x_family,
+    &g_m33_series,
     FAMILY_LIST_TERMINATOR // list terminator
 };
 
@@ -167,6 +169,15 @@ uint32_t target_get_apsel()
 {
     if (g_target_family && g_target_family->apsel) {
         return g_target_family->apsel;
+    } else {
+        return 0;
+    }
+}
+
+uint32_t target_get_swd_csw()
+{
+    if (g_target_family && g_target_family->csw) {
+        return g_target_family->csw;
     } else {
         return 0;
     }

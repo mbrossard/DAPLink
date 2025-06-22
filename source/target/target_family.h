@@ -91,6 +91,7 @@ typedef enum _family_id {
     kStub_HWReset_FamilyID = CREATE_FAMILY_ID(kStub_VendorID, 1),
     kStub_SWVectReset_FamilyID = CREATE_FAMILY_ID(kStub_VendorID, 2),
     kStub_SWSysReset_FamilyID = CREATE_FAMILY_ID(kStub_VendorID, 3),
+    kStub_M33_FamilyID = CREATE_FAMILY_ID(kStub_VendorID, 4),
     kNXP_KinetisK_FamilyID = CREATE_FAMILY_ID(kNXP_VendorID, 1),
     kNXP_KinetisL_FamilyID = CREATE_FAMILY_ID(kNXP_VendorID, 2),
     kNXP_Mimxrt_FamilyID = CREATE_FAMILY_ID(kNXP_VendorID, 3),
@@ -123,6 +124,7 @@ typedef struct target_family_descriptor {
     uint8_t (*validate_bin_nvic)(const uint8_t *buf);       /*!< Validate a bin file to be flash by drag and drop */
     uint8_t (*validate_hexfile)(const uint8_t *buf);        /*!< Validate a hex file to be flash by drag and drop */
     uint32_t apsel;                             /*!< APSEL for the family */
+    uint32_t csw;                               /*!< CSW for the APSEL for the family */
 } target_family_descriptor_t;
 
 //! @brief The active family used by the board.
@@ -148,6 +150,9 @@ void swd_set_target_reset(uint8_t asserted);
 
 //! @brief Get the APSEL for the AHB-AP to use for controlling the target.
 uint32_t target_get_apsel(void);
+
+//! @brief Get the CSW register value to use for the target.
+uint32_t target_get_swd_csw(void);
 
 #ifdef __cplusplus
 }

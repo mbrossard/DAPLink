@@ -20,6 +20,7 @@
  */
 
 #include "target_config.h"
+#include "target_family.h"
 
 // The file flash_blob.c must only be included in target.c
 #include "flash_blob.c"
@@ -34,7 +35,28 @@ target_cfg_t target_device = {
     .flash_regions[0].flags         = kRegionIsDefault,
     .flash_regions[0].flash_algo    = (program_target_t *) &flash,
     .ram_regions[0].start           = 0x20000000,
-    .ram_regions[0].end             = 0x20024000,
+    .ram_regions[0].end             = 0x2001FFFF,
+    .ram_regions[1].start           = 0x20020000,
+    .ram_regions[1].end             = 0x20033FFF,
+    .ram_regions[2].start           = 0x20034000,
+    .ram_regions[2].end             = 0x20043FFF,
     .target_vendor                  = "STMicroelectronics",
     .target_part_number             = "STM32H523RETx",
 };
+
+static uint8_t validate_bin_m33(const uint8_t *buf)
+{
+    // BIN file not supported for Cortex M33
+    util_assert(0);
+    return 0;
+}
+
+const target_family_descriptor_t g_m33_series = {
+    .family_id = kStub_M33_FamilyID, //ID not maching the predefined family ids
+    .default_reset_type = kHardwareReset,
+    .validate_bin_nvic = validate_bin_m33,
+    .apsel = (1 << 24), // AP1, Cortex M33 debug access port AHB-AP
+    .csw = 0x43000050,
+};
+
+const target_family_descriptor_t *g_target_family = &g_m33_series;
