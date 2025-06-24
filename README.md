@@ -1,9 +1,18 @@
-## Fork note
-This fork was initially create to port DAPLink for a new HIC (stm32l412k8) and adapt it for the target LPC55S69. Development for the target LPC55S69 has been stopped. 
+# Fork note
+This fork was initially create to port DAPLink for a new HIC (stm32l412k8) and adapt it for the target LPC55S69. Development for the target LPC55S69 has been stopped and replace by
+stm32h523retx.
 
-New targets:
-- stm32g0b1re: tested with DAPLink test.
-- stm32h523re: to be tested.
+Added targets:
+- NXP LPC55S69: development stopped
+- ST stm32g0b1re: Not fully tested, but should work.
+- ST stm32h523re: Working, DAPLink integration test are passing. (SWO not tested)
+
+
+Infos
+---
+- stm32l412k8 HIC info [here](/docs/hic/stm32l412xx.md)
+- Installation and usefull infos [here](Cheatsheet.md).
+- stm32h523retx test program [here](https://github.com/H4w4k4/DAPLink_Test).
 
 ----
 [![DAPLink](/docs/images/daplink-website-logo-link.png)](https://daplink.io/)

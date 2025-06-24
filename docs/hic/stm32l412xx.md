@@ -1,7 +1,7 @@
 # stm32l412xx HIC
 
 Based on STM32L412K8 chip ([Datasheet](https://www.st.com/resource/en/datasheet/stm32l412k8.pdf)):
-- Cortex-M4 48 Mhz
+- Cortex-M4 80 MHz (Configured @ 72MHz)
 - 64 KB Flash
 - 40 KB RAM
 - Full-speed USB 2.0 crystal less: up to 8 bi-directional endpoints including EP0 (*)
@@ -29,11 +29,14 @@ Because of the flash size limitation the DAPLink bootloader is not used.
 | SWDIO / TMS |  I  | PA6    |  12 | Connect to PA5 through 100R |
 | SWO / TDO   |  I  | PA10   |  20 | Target SWO   |
 | nRESET      |  O  | PB0    |  14 | Target nReset |
+|
 | UART        |
 | UART RX     |  I  | PA2    |   8 | Target RX |
 | UART TX     |  O  | PA3    |   9 | Target TX |
+|
 | Button      |
 | NF-RST But. |  I  | PA14   |  26 | Not used |
+|
 | LEDs        |
 | Connect. LED|  O  | PB7    |  30 |
 | Running LED |  O  | PB6    |  29 |
