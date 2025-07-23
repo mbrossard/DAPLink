@@ -29,20 +29,21 @@ Because of the flash size limitation the DAPLink bootloader is not used.
 | SWDIO / TMS |  I  | PA6    |  12 | Connect to PA5 through 100R |
 | SWO / TDO   |  I  | PA10   |  20 | Target SWO   |
 | nRESET      |  O  | PB0    |  14 | Target nReset |
-|
+||
 | UART        |
-| UART RX     |  I  | PA2    |   8 | Target RX |
-| UART TX     |  O  | PA3    |   9 | Target TX |
-|
+| RX     |  I  | PA2    |   8 | Target RX |
+| TX     |  O  | PA3    |   9 | Target TX |
+||
 | Button      |
 | NF-RST But. |  I  | PA14   |  26 | Not used |
-|
+||
 | LEDs        |
-| Connect. LED|  O  | PB7    |  30 |
-| Running LED |  O  | PB6    |  29 |
-| HID LED     |  O  | PB5    |  28 |
-| CDC LED     |  O  | PB4    |  27 |
-| MSC LED     |  O  | PB3    |  26 |
+| Connect. |  O  | PB7    |  30 |
+| Running |  O  | PB6    |  29 |
+| HID    |  O  | PB5    |  28 |
+| CDC    |  O  | PB4    |  27 |
+| MSC     |  O  | PB3    |  26 |
+||
 | USB         |
-| USB DP      |     | PA12   |  22 | Connect 18pF to GND and 33R serie |
-| USB DM      |     | PA11   |  21 | Connect 18pF to GND and 33R serie |
+| DP      |     | PA12   |  22 | Connect 18pF to GND and 33R serie |
+| DM      |     | PA11   |  21 | Connect 18pF to GND and 33R serie |
