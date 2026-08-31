@@ -1,0 +1,25 @@
+[package]
+name = "daplink-flash"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Flash-algorithm runtime for daplink-rs"
+
+# Own workspace: resolves independently of any root.
+[workspace]
+
+[features]
+default = []
+# Std-only helpers (the host mock lives behind this or `cfg(test)`).
+std = []
+# Routes diagnostics through defmt; mutually exclusive with `log`.
+defmt = ["dep:defmt"]
+# Routes host-side diagnostics through the `log` crate; mutually exclusive with `defmt`.
+log = ["dep:log"]
+
+[dependencies]
+dap-rs = { git = "https://github.com/probe-rs/dap-rs.git", rev = "a867ca7b41547b24aaad52b913528575685a5df5" }
+daplink-core = { path = "../daplink-core" }
+embedded-hal = "1.0"
+defmt = { version = "1", optional = true }
+log = { version = "0.4", optional = true }

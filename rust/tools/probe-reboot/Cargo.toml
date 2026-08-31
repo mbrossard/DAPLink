@@ -1,0 +1,18 @@
+[package]
+name = "probe-reboot"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Reboot a daplink-rs probe into its ROM bootloader"
+publish = false
+
+# Own workspace: this host tool talks USB directly (nusb) and resolves independently of the
+# host root workspace so its dependency graph never perturbs the library crates' resolution.
+[workspace]
+
+[dependencies]
+# The USB identity constants (DAPLink VID/PID); zero-dependency and host-buildable.
+daplink-core = { path = "../../crates/daplink-core" }
+nusb = "0.2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

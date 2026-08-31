@@ -1,0 +1,32 @@
+[package]
+name = "test-rp2350"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: pins its own embedded target.
+[workspace]
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+embassy-rp = { version = "0.10.0", features = ["unstable-pac", "critical-section-impl", "rp235xa"] }
+panic-halt = "0.2"
+rtt-target = "0.5"
+
+daplink-test-protocol = { path = "../../crates/daplink-test-protocol" }
+pl011-baud = { path = "../../../crates/pl011-baud" }
+daplink-rp-dma-uart = { path = "../../../platform/daplink-rp-dma-uart", features = ["rp235x"] }
+
+[[bin]]
+name = "test-rp2350"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 2
+panic = "abort"
+overflow-checks = false

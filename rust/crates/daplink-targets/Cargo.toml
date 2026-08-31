@@ -1,0 +1,39 @@
+[package]
+name = "daplink-targets"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Generated flash-target registry and selection seam"
+
+# Own workspace: resolves independently of the host root so a standalone build here does not
+# leave an untracked lockfile. Host tests run with `cargo test` in this directory.
+[workspace]
+
+[features]
+default = []
+# A synthetic, non-hardware target used as a host test fixture.
+synthetic = []
+# Shared flash-controller algorithm modules. Selected transitively by the chip features that
+# reference them; not meant to be enabled directly.
+_algo_stm32f4 = []
+_algo_rp2040 = []
+_algo_rp2350 = []
+# Hand-written per-family reset/unlock sequence modules. Selected transitively by the chip
+# features whose targets reference them; not meant to be enabled directly.
+_family_rp2040 = []
+_family_rp2350 = []
+# Real generated chip targets. Each enables the shared algorithm and family modules it references.
+# STM32F401CE (the WeAct Black Pill F401 part): 512 KiB of non-uniformly sectored F4 flash.
+stm32f401ce = ["_algo_stm32f4"]
+rp2040 = ["_algo_rp2040", "_family_rp2040"]
+# RP2350 (Pico 2 family): dormant-wake + ADIv6 debug bring-up and identity, referencing the
+# RAM-resident `rp235x` bootrom-shim flash algorithm.
+rp2350 = ["_algo_rp2350", "_family_rp2350"]
+
+[dependencies]
+# Re-exports the flash-algorithm/target description types (and dap-rs transitively).
+daplink-flash = { path = "../daplink-flash", default-features = false }
+
+[dev-dependencies]
+# Backs the scratch-buffer accessor `target_table!` emits; the tests invoke the macro.
+static_cell = "2"

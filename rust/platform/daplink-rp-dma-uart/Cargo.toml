@@ -1,0 +1,17 @@
+[package]
+name = "daplink-rp-dma-uart"
+version = "0.1.0"
+edition = "2021"
+description = "PL011 over RP-series DMA: the shared channel sequence, and a polled ring above it"
+license = "Apache-2.0"
+
+[dependencies]
+daplink-core = { path = "../../crates/daplink-core" }
+# Raw register access only, no runtime: the probe seam and the DUT images both compose this.
+rp-pac = { version = "7.0", default-features = false, optional = true }
+
+# Chip-agnostic: the consumer selects the chip. Without one, only the ring arithmetic and its
+# host tests build.
+[features]
+rp2040 = ["dep:rp-pac", "rp-pac/rp2040"]
+rp235x = ["dep:rp-pac", "rp-pac/rp235x"]

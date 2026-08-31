@@ -1,0 +1,47 @@
+[package]
+name = "stlinkv2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: this firmware pins its own embedded target and HAL feature graph.
+[workspace]
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+rtic = { version = "2.1", features = ["thumbv7-backend"] }
+stm32f1xx-hal = { version = "0.11", features = ["stm32f103"] }
+
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-stm32f1-hal = { path = "../../platform/daplink-stm32f1-hal" }
+daplink-usb-device = { path = "../../platform/daplink-usb-device" }
+# Backs the caller-owned DAP command queue.
+static_cell = "2"
+
+panic-halt = "0.2"
+
+# No defmt feature, deliberately: the fleet's defmt-RTT shape overflows the C8's 64 KiB at this
+# profile (it fits only at opt-level "z"), and no rig exists to capture RTT from this hardware.
+
+[features]
+default = ["guard"]
+# `guard` bounds-checks each report against the engine's consumption before dispatch.
+guard = ["daplink-rs/guard"]
+
+[[bin]]
+name = "stlinkv2"
+test = false
+bench = false
+
+[profile.release]
+# opt-level "s", not the sibling F1 image's 2 (the F1 bit-bang sweet spot): "s" fits with 24840
+# bytes spare and 2 now fits too, with 14816. Moving to 2 needs a fresh SWD_FIXED_WORK_CYCLES
+# sweep, and no rig exists for this hardware, so the wire-speed trade stays unmeasured.
+opt-level = "s"
+lto = true
+codegen-units = 1
+# Keep debug info in the ELF (probe-rs uses it); flashable images are unaffected.
+debug = 2
+panic = "abort"
+overflow-checks = false

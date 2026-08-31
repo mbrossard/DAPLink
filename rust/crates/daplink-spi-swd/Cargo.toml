@@ -1,0 +1,14 @@
+[package]
+name = "daplink-spi-swd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SPI-session SWD transport (plus GPIO JTAG) over a chip-supplied register seam"
+
+# Own workspace: resolves independently of any root. Host tests run with `cargo test` here.
+[workspace]
+
+[dependencies]
+# The CMSIS-DAP engine seams this crate implements (`swd::Swd`, `swj::Dependencies`,
+# `jtag::Jtag`) plus the pin/delay traits it is generic over; same revision as the tree.
+dap-rs = { git = "https://github.com/probe-rs/dap-rs.git", rev = "a867ca7b41547b24aaad52b913528575685a5df5" }

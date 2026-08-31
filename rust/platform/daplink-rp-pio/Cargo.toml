@@ -1,0 +1,24 @@
+[package]
+name = "daplink-rp-pio"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "PIO SWD wire backend for daplink-rs on RP microcontrollers"
+
+# Own workspace: pins its own embedded target and PAC feature graph.
+[workspace]
+
+[dependencies]
+daplink-rs = { path = "../../crates/daplink-rs" }
+# Raw register access only, no runtime: both the embassy and the RTIC firmware can compose this.
+rp-pac = { version = "7.0", default-features = false, optional = true }
+# thumbv6m has no atomic CAS; portable-atomic routes StaticCell's CAS through critical-section.
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+
+# Chip-agnostic: the consumer selects the chip. Without one, only the runtime-neutral logic and
+# its host tests build.
+[features]
+rp2040 = ["dep:rp-pac", "rp-pac/rp2040"]
+rp235x = ["dep:rp-pac", "rp-pac/rp235x"]
+clock-180mhz = []
+clock-200mhz = []

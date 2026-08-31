@@ -1,0 +1,41 @@
+[package]
+name = "daplink-rp-embassy"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "embassy-rp platform support for daplink-rs"
+
+# Own workspace: pulls an embedded HAL, so it resolves independently of any root.
+[workspace]
+
+[dependencies]
+embassy-rp = { version = "0.10.0", features = ["unstable-pac", "time-driver", "critical-section-impl"] }
+# The reboot-to-bootloader thread-mode trigger (`reboot_watch`): a spawned task every build
+# carries, so the self-update path is never feature-gated away.
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = "0.5"
+embassy-usb = "0.6.0"
+embedded-io = "0.7"
+embedded-io-async = "0.7"
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-embassy-usb = { path = "../daplink-embassy-usb" }
+# The DMA channel sequence -- arming, the abort handshake, the errata waits -- shared with the
+# DUT images so the per-chip register knowledge is written once.
+daplink-rp-dma-uart = { path = "../daplink-rp-dma-uart" }
+# The PL011 divisor arithmetic, shared with `daplink-rp-hal` and both RP DUT images.
+pl011-baud = { path = "../../crates/pl011-baud" }
+static_cell = "2"
+cortex-m = "0.7"
+# thumbv6m has no atomic CAS; portable-atomic routes through critical-section.
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+
+# `carrier-leds` wires the Pico-family carrier's five-LED debug bank (GP10/11/12/14/15).
+# Exactly one chip feature; `rp2040` is default only so the crate builds and lints on its own,
+# and the RP2350 firmware opts out of defaults.
+[features]
+default = ["rp2040"]
+rp2040 = ["embassy-rp/rp2040", "daplink-rp-dma-uart/rp2040"]
+rp2350 = ["embassy-rp/rp235xa", "daplink-rp-dma-uart/rp235x"]
+carrier-leds = []
+clock-180mhz = []
+clock-200mhz = []

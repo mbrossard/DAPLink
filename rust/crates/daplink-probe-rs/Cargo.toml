@@ -1,0 +1,17 @@
+[package]
+name = "daplink-probe-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host transport shim for the dap-rs SWD seam over probe-rs"
+
+# Own workspace: resolves independently of the host root so a standalone build here does not
+# leave an untracked lockfile. Host tests run with `cargo test` in this directory.
+[workspace]
+
+[dependencies]
+# Only the raw ARM DAP surface is used; builtin-targets is intentionally dropped. cmsisdap_v1
+# keeps HID-transport support for classic probes that expose no CMSIS-DAP v2 bulk interface.
+probe-rs = { version = "0.32", default-features = false, features = ["cmsisdap_v1"] }
+# The `dap-rs` SWD seam is reached through daplink-flash's `dap_rs` re-export, not a direct pin.
+daplink-flash = { path = "../daplink-flash" }

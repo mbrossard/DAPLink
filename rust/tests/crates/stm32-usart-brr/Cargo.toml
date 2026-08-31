@@ -1,0 +1,10 @@
+[package]
+name = "stm32-usart-brr"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: pure divisor arithmetic for the F401 DUT image; its tests run on the host.
+[workspace]
+
+[dependencies]

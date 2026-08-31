@@ -1,0 +1,82 @@
+[package]
+name = "stm32f103-embassy"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: this firmware pins its own embedded target and HAL feature graph.
+[workspace]
+
+[dependencies]
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-stm32 = { version = "0.6.0", features = ["stm32f103cb", "unstable-pac", "memory-x", "time-driver-any"] }
+embassy-usb = "0.6.0"
+embassy-futures = "0.1"
+# The pipelined DAP loop's two edge-triggered signals between its reader and executor futures.
+embassy-sync = "0.8"
+embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
+
+daplink-rs = { path = "../../crates/daplink-rs" }
+# The SPI-session SWD engine this firmware supplies a register seam for; `accel` only.
+daplink-spi-swd = { path = "../../crates/daplink-spi-swd", optional = true }
+daplink-stm32f1-embassy = { path = "../../platform/daplink-stm32f1-embassy" }
+daplink-embassy-usb = { path = "../../platform/daplink-embassy-usb" }
+daplink-vfs = { path = "../../crates/daplink-vfs", optional = true }
+daplink-targets = { path = "../../crates/daplink-targets", default-features = false, optional = true }
+
+static_cell = "2"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+# Optional defmt-RTT bring-up logging, off by default.
+defmt = { version = "1", optional = true }
+defmt-rtt = { version = "1", optional = true }
+panic-probe = { version = "1", optional = true, features = ["print-defmt"] }
+
+[features]
+default = ["guard"]
+# `guard` bounds-checks each report against the engine's consumption before dispatch.
+guard = ["daplink-rs/guard"]
+# nanoDAP V2.3 board wiring: the D+ pull-up switched from PB15 (active low), a single LED on
+# PC13, JTAG composed with TDO on PA5, and no SWO route.
+nanodap = []
+# `flash` adds the drag-n-drop mass-storage drive and the vendor flash commands over the
+# flash-wins mux; it is the target-less spine, so a `flash-<chip>` row must select the target.
+# nanodap-only: the flash composition is that board's, and only that shape has a benched rig.
+flash = ["dep:daplink-vfs", "dep:daplink-targets", "daplink-embassy-usb/flash"]
+flash-stm32f401 = ["flash", "daplink-targets/stm32f401ce"]
+# `accel` drives SWD through SPI-assisted sessions on the same probe pads: the target-driven
+# read-data span runs on SPI2 (SCK = PB13, the wire observed on its MISO pad PB14), everything
+# the byte-frame-only block cannot render stays GPIO. JTAG stays bit-bang. nanodap-only: the
+# seam's pin map is that board's.
+accel = ["dep:daplink-spi-swd", "daplink-stm32f1-embassy/spi-swd"]
+# RTT-backed defmt logging, captured by a probe attached over SWD; host-side only (no image
+# growth beyond the `.defmt` string table, which the linker keeps out of the loadable image).
+defmt = [
+    "dep:defmt",
+    "dep:defmt-rtt",
+    "dep:panic-probe",
+    "embassy-executor/defmt",
+    "embassy-stm32/defmt",
+    "daplink-rs/defmt",
+]
+
+[[bin]]
+name = "stm32f103-embassy"
+test = false
+bench = false
+
+[profile.release]
+# opt-level 2, not the fleet's 3, is a considered choice: a build at 3, flashed and swept
+# against the same STM32F4 DUT, reads within this rig's run-to-run spread on both ladders
+# (the host-visible ceiling here is the USB round trip, not the wire), so 3 buys nothing
+# measurable -- while every swept timing constant in this image (the bit cell's fixed work,
+# the accel JTAG floor) is bracketed at level 2 and a level change would demand a re-sweep.
+opt-level = 2
+lto = true
+codegen-units = 1
+# Keep debug info in the ELF (probe-rs uses it); flashable images are unaffected.
+debug = 2
+panic = "abort"
+overflow-checks = false

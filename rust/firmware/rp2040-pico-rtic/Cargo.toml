@@ -1,0 +1,82 @@
+[package]
+name = "rp2040-pico-rtic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: this firmware pins its own embedded target and HAL feature graph.
+[workspace]
+
+[dependencies]
+# critical-section-single-core is sound here only because core1 is never started.
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+rtic = { version = "2.1", features = ["thumbv6-backend"] }
+rp2040-hal = { version = "0.10", features = ["rt"] }
+rp2040-boot2 = "0.3"
+
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-rp-hal = { path = "../../platform/daplink-rp-hal" }
+daplink-rp-pio = { path = "../../platform/daplink-rp-pio", features = ["rp2040"], optional = true }
+daplink-usb-device = { path = "../../platform/daplink-usb-device" }
+daplink-vfs = { path = "../../crates/daplink-vfs", optional = true }
+daplink-targets = { path = "../../crates/daplink-targets", default-features = false, optional = true }
+# Backs the caller-owned DAP command queue in every build; the flash spine's one-shot statics
+# (mux, target registry, page buffers, volume) also use it.
+static_cell = { version = "2" }
+
+panic-halt = "0.2"
+# thumbv6m has no atomic CAS; portable-atomic routes through critical-section (from cortex-m).
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+
+# Optional defmt-RTT bring-up logging, off by default.
+defmt = { version = "1", optional = true }
+defmt-rtt = { version = "1", optional = true }
+panic-probe = { version = "1", optional = true, features = ["print-defmt"] }
+
+# `accel` drives SWD from PIO and fuses JTAG words. `bitbang` selects the CPU engine and wins
+# when both features are enabled, so it can override the accelerated default.
+[features]
+default = ["accel", "guard"]
+accel = ["dep:daplink-rp-pio", "daplink-rs/rp2040-jtag-accel"]
+bitbang = []
+overclock-200mhz = ["daplink-rp-hal/clock-200mhz", "daplink-rp-pio?/clock-200mhz"]
+# RTT-backed defmt logging, captured by a probe attached over SWD; host-side only (no image
+# growth beyond the `.defmt` string table, which the linker keeps out of the loadable image).
+# rtic itself exposes no defmt feature (its macros generate logging-agnostic code), so this
+# forwards only to the HAL and the shared DAP crate.
+defmt = [
+    "dep:defmt",
+    "dep:defmt-rtt",
+    "dep:panic-probe",
+    "rp2040-hal/defmt",
+    "daplink-rs/defmt",
+]
+# `flash` adds the drag-n-drop mass-storage drive and the vendor flash commands over the
+# flash-wins mux; it is the target-less spine, so a `flash-<chip>` row must select the target.
+flash = [
+    "dep:daplink-vfs",
+    "dep:daplink-targets",
+    "daplink-usb-device/flash",
+]
+flash-rp2040 = ["flash", "daplink-targets/rp2040"]
+flash-stm32f401 = ["flash", "daplink-targets/stm32f401ce"]
+# `guard` bounds-checks each report against the engine's consumption before dispatch.
+guard = ["daplink-rs/guard"]
+# `carrier-leds` claims the Pico-family carrier's four wired debug-bank LEDs (GP10/11/12/14);
+# GP15 (SWO) has no cheap activity tap on this firmware and stays dark.
+carrier-leds = ["daplink-rp-hal/carrier-leds"]
+
+[[bin]]
+name = "rp2040-pico-rtic"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Keep debug info in the ELF (probe-rs uses it); flashable images are unaffected.
+debug = 2
+panic = "abort"
+overflow-checks = false

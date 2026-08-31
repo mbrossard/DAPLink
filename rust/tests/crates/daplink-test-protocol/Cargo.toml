@@ -1,0 +1,12 @@
+[package]
+name = "daplink-test-protocol"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: no_std wire logic shared by the harness and the DUT firmwares.
+[workspace]
+
+[dependencies]
+# For `DAP_FW_REVISION`: the DUT stamp is the one the probe images already carry.
+daplink-core = { path = "../../../crates/daplink-core" }

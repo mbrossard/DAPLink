@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+daplink-decoder = { path = "../crates/daplink-decoder" }
+# BOOTSEL-drive flashing (Bootloader::BootselUf2 rows) talks the PUT's 0x9F reboot vendor
+# command directly over USB, the same way tools/probe-reboot does.
+nusb = "0.2"

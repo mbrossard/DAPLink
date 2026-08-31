@@ -1,0 +1,15 @@
+[package]
+name = "daplink-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Zero-dependency daplink-rs foundation"
+
+# Own workspace: resolves independently of any root. Host tests run with `cargo test` here.
+[workspace]
+
+[features]
+# Exposes `msc_bot_cases` to a USB adapter's host tests; no firmware enables it.
+bot-fixtures = []
+
+[dependencies]

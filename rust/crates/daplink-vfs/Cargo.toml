@@ -1,0 +1,45 @@
+[package]
+name = "daplink-vfs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Virtual FAT16 volume and drag-n-drop transfer engine for daplink-rs"
+
+# Own workspace: resolves independently of any root.
+[workspace]
+
+[dependencies]
+daplink-decoder = { path = "../daplink-decoder", default-features = false }
+daplink-core = { path = "../daplink-core", default-features = false }
+static_cell = "2"
+heapless = "0.8"
+critical-section = "1"
+# thumbv6m has no atomic CAS; portable-atomic routes StaticCell's CAS through critical-section.
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+# Optional defmt-RTT tracing of the transfer engine's per-sector decisions. Off by default; a
+# firmware enables it (with defmt-rtt as the global logger) for bring-up on real hardware.
+defmt = { version = "1", optional = true }
+
+[features]
+# Emit a defmt log at each transfer-engine decision point (per data sector and per root-dir
+# transition). Purely diagnostic: no behavior change, and it costs nothing when off.
+defmt = ["dep:defmt"]
+
+[dev-dependencies]
+# The reply slot uses a critical section; the host test binary supplies the std-backed
+# implementation. Firmware builds do not enable this and provide their own (single-core) impl.
+critical-section = { version = "1", features = ["std"] }
+# Integration tests drive the transfer engine into a mock flash backend (the FlashBackend port);
+# `bot-fixtures` carries the shared Bulk-Only case table the transport tests replay.
+daplink-core = { path = "../daplink-core", default-features = false, features = [
+    "bot-fixtures",
+] }
+daplink-decoder = { path = "../daplink-decoder", default-features = false, features = [
+    "std",
+] }
+# Test-only: the write-order replay sweeps every chip record's real flash/RAM windows.
+daplink-targets = { path = "../daplink-targets", default-features = false, features = [
+    "rp2040",
+    "stm32f401ce",
+] }
+

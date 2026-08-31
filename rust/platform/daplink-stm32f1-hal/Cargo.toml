@@ -1,0 +1,20 @@
+[package]
+name = "daplink-stm32f1-hal"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "stm32f1xx-hal platform support for polled STM32F1 daplink-rs probes"
+
+# Own workspace: pins its own embedded target and HAL feature graph.
+[workspace]
+
+[dependencies]
+stm32f1xx-hal = { version = "0.11", features = ["stm32f103"] }
+usb-device = "0.3"
+cortex-m = "0.7"
+static_cell = "2"
+# The USB serial string is cached in a static behind a critical section.
+critical-section = "1"
+
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-usb-device = { path = "../daplink-usb-device" }

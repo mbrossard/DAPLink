@@ -1,0 +1,95 @@
+[package]
+name = "mculink"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: this firmware pins its own embedded target and HAL feature graph.
+[workspace]
+
+[dependencies]
+# critical-section-single-core is sound here only because core1 is never released from reset.
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+# Locked to 2.2: the 2.3 macros assert Send on task-local resources, which the flash build's
+# shared mux handle deliberately is not (single-context by construction).
+rtic = { version = "2.1", features = ["thumbv8main-backend"] }
+# Supplies the `raw` PAC for the RTIC `device` path; rev matches the platform crate's pin.
+lpc55-hal = { git = "https://github.com/mbrossard/lpc55-hal.git", rev = "1ae21b1eedca9226eec35d47574fbf32bcd713ad", features = ["rt"] }
+
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-lpc55-hal = { path = "../../platform/daplink-lpc55-hal" }
+daplink-usb-device = { path = "../../platform/daplink-usb-device" }
+daplink-vfs = { path = "../../crates/daplink-vfs", optional = true }
+daplink-targets = { path = "../../crates/daplink-targets", default-features = false, optional = true }
+# Backs the caller-owned DAP command queue; the flash spine's one-shot statics (mux, target
+# registry, page buffers, volume) also use it.
+static_cell = "2"
+
+panic-halt = "0.2"
+
+# Optional defmt-RTT bring-up logging, off by default.
+defmt = { version = "1", optional = true }
+defmt-rtt = { version = "1", optional = true }
+panic-probe = { version = "1", optional = true, features = ["print-defmt"] }
+
+[features]
+default = ["accel", "guard"]
+# `guard` bounds-checks each report against the engine's consumption before dispatch.
+guard = ["daplink-rs/guard"]
+# One wire engine per image: `bitbang` is the CPU-driven wire and wins where both are on, so a
+# row can select it without first clearing the default `accel`.
+bitbang = []
+# Renegotiate when the device settles at full speed. Its descriptors declare 512-byte bulk
+# endpoints, so a full-speed attachment is one the host must refuse: retrying the chirp is the
+# difference between a probe that recovers and one that goes dark. Off until measured.
+usb-hs-retry = []
+# Bench-only: time the USB1 pass and count FLEXCOMM0 entries into statics a debugger reads over
+# SWD. Never in a shipping row -- it exists to say where the interrupt's time goes.
+probe-timing = ["daplink-lpc55-hal/probe-timing"]
+# Bench-only: count what re-entered the USB1 pass and what the pass did, into one static a
+# debugger polls over SWD. Answers the question `probe-timing` cannot -- not how long a pass
+# takes, but why the next one starts. Adding `defmt` on top also logs a summary line twice a
+# second, at the cost of a `.data` section: see `pass_trace` for why that is not always affordable.
+pass-trace = []
+# `accel` (default) drives the SWD word path through the platform's masked-GPIO engine and
+# gives JTAG the fast word scans; `flash` wins the engine choice, so in flash builds `accel`
+# has no effect.
+accel = ["daplink-lpc55-hal/masked-swd"]
+# Select the 96 MHz FRO instead of the default 150 MHz PLL0 core clock. Orthogonal to the wire
+# engine; USB, VCOM, and SWO clocks remain core-independent.
+core-96mhz = ["daplink-lpc55-hal/core-96mhz"]
+# RTT-backed defmt logging, captured by a probe attached over SWD; host-side only (no image
+# growth beyond the `.defmt` string table, which the linker keeps out of the loadable image).
+# rtic itself exposes no defmt feature (its macros generate logging-agnostic code); flash
+# builds also log the volume's detach/remount ladder and the transport's stall decisions.
+defmt = [
+    "dep:defmt",
+    "dep:defmt-rtt",
+    "dep:panic-probe",
+    "daplink-rs/defmt",
+    "daplink-usb-device/defmt",
+    "daplink-vfs?/defmt",
+]
+# `flash` adds the drag-n-drop mass-storage drive and the vendor flash commands over the
+# flash-wins mux; it is the target-less spine, so a `flash-<chip>` row must select the target.
+flash = [
+    "dep:daplink-vfs",
+    "dep:daplink-targets",
+    "daplink-usb-device/flash",
+]
+flash-stm32f401 = ["flash", "daplink-targets/stm32f401ce"]
+
+[[bin]]
+name = "mculink"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Keep debug info in the ELF (probe-rs uses it); flashable images are unaffected.
+debug = 2
+panic = "abort"
+overflow-checks = false

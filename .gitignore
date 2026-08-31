@@ -98,3 +98,7 @@ mbed-os/
 
 #vscode editor
 .vscode
+
+# raw run output from the rust/ test tools; unanchored, because a tool run from a worktree or a
+# subdirectory resolves its own checkout root and writes there
+artifacts/

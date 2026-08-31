@@ -1,0 +1,5 @@
+# Only the build tool resolves here; every library and firmware crate is its own workspace.
+[workspace]
+members = ["xtask"]
+exclude = ["crates", "firmware", "platform", "tests"]
+resolver = "2"

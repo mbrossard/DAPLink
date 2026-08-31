@@ -1,0 +1,20 @@
+[package]
+name = "vcom-bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side VCOM measurement bench"
+publish = false
+
+# Own workspace: host-only, resolved independently of any other crate's dependency graph.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dap-bench = { path = "../dap-bench" }
+daplink-test-protocol = { path = "../../tests/crates/daplink-test-protocol" }
+object = "0.36"
+nusb = "0.2"
+probe-rs = "0.32"
+serialport = "4"

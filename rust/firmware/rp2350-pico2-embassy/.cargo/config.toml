@@ -1,0 +1,12 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "probe-rs run --chip RP235x"
+
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+# defmt's log-level filter is a compile-time proc-macro decision (default, with this unset, is
+# `error`-only -- see defmt-macros' `EnvFilter`), not a runtime one. Pin it here so a `defmt`
+# build is never silently empty because the invoking shell didn't happen to export it; inert
+# (unread) when the `defmt` feature is off. Override per-build with `DEFMT_LOG=...`.
+[env]
+DEFMT_LOG = "info"

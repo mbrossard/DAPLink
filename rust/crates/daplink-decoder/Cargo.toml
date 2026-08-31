@@ -1,0 +1,17 @@
+[package]
+name = "daplink-decoder"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Streaming bin/Intel-hex/uf2 firmware image decoders"
+
+# Own workspace: resolves independently of the host root so a standalone build here does not
+# leave an untracked lockfile. Host tests run with `cargo test` in this directory.
+[workspace]
+
+[features]
+default = ["std"]
+# Enables the `std` facade (host tests, std-only helpers).
+std = []
+
+[dependencies]

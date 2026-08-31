@@ -1,0 +1,19 @@
+[package]
+name = "daplink-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: host-only, and probe-rs's dependency graph stays out of every other crate.
+[workspace]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+daplink-core = { path = "../../crates/daplink-core" }
+daplink-test-protocol = { path = "../crates/daplink-test-protocol" }
+# Decodes the probe firmware's defmt stream for the bench capture; 1.x pairs with defmt 1.x.
+defmt-decoder = "1"
+nusb = "0.2"
+object = "0.36"
+probe-rs = "0.32"
+serialport = "4"

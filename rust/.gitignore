@@ -1,0 +1,8 @@
+target/
+# Library crates: the firmwares, tools and test firmwares that consume them carry their own
+# lockfiles, and those are what pin a build. A lockfile here binds nothing and only has to be
+# remembered when a dependency revision moves. The root lockfile is not one of these -- it
+# resolves xtask, which is a binary.
+crates/*/Cargo.lock
+platform/*/Cargo.lock
+tests/crates/*/Cargo.lock

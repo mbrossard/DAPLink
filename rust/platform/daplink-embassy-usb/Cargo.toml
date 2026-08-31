@@ -1,0 +1,42 @@
+[package]
+name = "daplink-embassy-usb"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "embassy-usb adapter for daplink-rs probe firmware"
+
+# Own workspace: pulls an embedded USB stack, so it resolves independently of any root.
+[workspace]
+
+# HAL-agnostic: generic over the embassy-usb driver, which the platform crates supply.
+[dependencies]
+embassy-usb = "0.6.0"
+embassy-futures = "0.1"
+embassy-sync = "0.8"
+daplink-rs = { path = "../../crates/daplink-rs" }
+static_cell = "2"
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+# Mass-storage drive (the `flash` feature): the virtual volume and the class loop's idle timer.
+daplink-vfs = { path = "../../crates/daplink-vfs", optional = true }
+# The VCOM bridge's coalescing deadline needs a timer, so this is no longer optional. Every
+# consumer is an embassy firmware and already carried it transitively.
+embassy-time = "0.5"
+
+# Never add a `default` entry here. Every platform crate takes this one with default features on,
+# so Cargo's feature unification turns a default-on feature back on for the whole graph and no
+# firmware can switch it off -- silently, since nothing fails to build. Compose a class out by
+# naming a different constructor (`usb_device_dap_only`), not by turning a feature off.
+[features]
+# Compose the mass-storage class; off by default, so the DAP+VCOM image is unchanged.
+flash = ["dep:daplink-vfs"]
+# Bench-only: count CDC packets and how many of them were short, into statics a debugger reads
+# over SWD. Answers whether a saturated link is carrying full packets or wasting frame slots.
+usb-counters = []
+
+# The host test binary supplies the critical-section impl the sync primitives link against, and
+# the manually advanced time driver the class task's timers and clock resolve against.
+[dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+embassy-time = { version = "0.5", features = ["mock-driver", "generic-queue-8"] }
+# Naming the transfer-sink trait's image format, for the sink a reconnect test composes.
+daplink-decoder = { path = "../../crates/daplink-decoder", default-features = false }

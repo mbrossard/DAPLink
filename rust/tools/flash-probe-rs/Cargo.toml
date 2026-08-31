@@ -1,0 +1,28 @@
+[package]
+name = "flash-probe-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Flash a target through a CMSIS-DAP probe via probe-rs"
+publish = false
+
+# Own workspace: this host tool pulls in probe-rs and resolves independently of the host
+# root workspace so its dependency graph never perturbs the library crates' resolution.
+[workspace]
+
+[dependencies]
+daplink-probe-rs = { path = "../../crates/daplink-probe-rs" }
+# `log` routes daplink-flash's host-side flow diagnostics through the `log` crate, which the
+# tracing subscriber below captures.
+daplink-flash = { path = "../../crates/daplink-flash", features = ["log"] }
+daplink-targets = { path = "../../crates/daplink-targets", features = [
+    "stm32f401ce",
+    "rp2040",
+] }
+# Only the raw ARM DAP surface is used as the wire; cmsisdap_v1 keeps HID-transport support
+# for classic probes that expose no CMSIS-DAP v2 bulk interface.
+probe-rs = { version = "0.32", default-features = false, features = ["cmsisdap_v1"] }
+embedded-hal = "1.0"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

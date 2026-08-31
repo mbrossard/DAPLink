@@ -1,0 +1,32 @@
+[package]
+name = "daplink-lpc55-hal"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "lpc55-hal platform support for polled LPC55S69 daplink-rs probes"
+
+# Own workspace: pins its own embedded target and HAL feature graph.
+[workspace]
+
+[dependencies]
+# Maintained lpc55-hal fork (branch: embedded-hal-10), rev-pinned.
+lpc55-hal = { git = "https://github.com/mbrossard/lpc55-hal.git", rev = "1ae21b1eedca9226eec35d47574fbf32bcd713ad", features = ["rt"] }
+usb-device = "0.3"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+critical-section = "1"
+static_cell = "2"
+
+daplink-rs = { path = "../../crates/daplink-rs" }
+# Shared SWD framing helpers and the fast-JTAG scan seam the masked backend plugs into.
+daplink-spi-swd = { path = "../../crates/daplink-spi-swd", optional = true }
+
+[features]
+# Masked-GPIO accelerated SWD word path plus the shared fast JTAG scans, composed by a
+# firmware's `accel` feature in place of the generic bit-bang engine.
+masked-swd = ["dep:daplink-spi-swd"]
+
+# Bench-only: count transmit transfers and the bytes in them into statics a debugger reads over
+# SWD. Never in a shipping row -- it exists to measure what a transfer carries.
+probe-timing = []
+# Select the 96 MHz FRO instead of the default 150 MHz PLL0 core clock.
+core-96mhz = []

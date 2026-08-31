@@ -1,0 +1,40 @@
+[package]
+name = "daplink-rs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "DAP debug-probe composition over dap-rs"
+
+# Own workspace: resolves independently of any root.
+[workspace]
+
+[dependencies]
+daplink-core = { path = "../daplink-core" }
+dap-rs = { git = "https://github.com/probe-rs/dap-rs.git", rev = "a867ca7b41547b24aaad52b913528575685a5df5" }
+embedded-hal = "1.0"
+# Serializes the SwdMux adapter; header-only here, firmware supply the implementation.
+critical-section = "1"
+# Flash spine: the algorithm runtime and the target-selection seam. The generated registry ships
+# no chip target unless a firmware selects one.
+daplink-flash = { path = "../daplink-flash", default-features = false }
+daplink-targets = { path = "../daplink-targets", default-features = false }
+# Caller-owned 'static storage newtypes (scan chain).
+static_cell = "2"
+# Fixed-capacity flash-range tables in HwBackend.
+heapless = "0.8"
+# Optional flash-session tracing; a firmware supplies the global logger.
+defmt = { version = "1", optional = true }
+
+# `guard` bounds-checks each report against the engine's consumption before dispatch.
+[features]
+guard = []
+defmt = ["dep:defmt", "daplink-flash/defmt"]
+# Historical name retained so existing RP2040 images remain byte-identical; the generic Rust
+# shifter is also used by RP2350 compositions.
+rp2040-jtag-accel = []
+
+[dev-dependencies]
+# The mux's critical sections need an implementation in the host test binary.
+critical-section = { version = "1", features = ["std"] }
+# Pin-transaction expectations for the LED drivers' host tests.
+embedded-hal-mock = "0.11"

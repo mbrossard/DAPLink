@@ -1,0 +1,53 @@
+[package]
+name = "debugprobe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: this firmware pins its own embedded target and HAL feature graph.
+[workspace]
+
+[dependencies]
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-rp = { version = "0.10.0", features = ["unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
+embassy-futures = "0.1"
+# The pipelined DAP loop's two edge-triggered signals between its reader and executor futures.
+embassy-sync = "0.8"
+
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-rp-embassy = { path = "../../platform/daplink-rp-embassy" }
+daplink-embassy-usb = { path = "../../platform/daplink-embassy-usb" }
+daplink-rp-pio = { path = "../../platform/daplink-rp-pio", features = ["rp2040"], optional = true }
+
+static_cell = "2"
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+# thumbv6m has no atomic CAS; portable-atomic routes through critical-section (from embassy-rp).
+portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
+
+[features]
+default = ["accel", "guard"]
+# `accel` drives SWD from a PIO state machine over the board's split SWDIO pads.
+accel = ["dep:daplink-rp-pio"]
+# `bitbang` picks the CPU-driven wire and wins over the default `accel`, so the A/B row keeps
+# defaults enabled and adds `--features bitbang`.
+bitbang = []
+# `guard` bounds-checks each report against the engine's consumption before dispatch.
+guard = ["daplink-rs/guard"]
+# Non-default 180 MHz system clock; PIO builds use the uniform five-cycle SWCLK cell.
+overclock-180mhz = ["daplink-rp-embassy/clock-180mhz", "daplink-rp-pio?/clock-180mhz"]
+
+[[bin]]
+name = "debugprobe"
+test = false
+bench = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Keep debug info in the ELF (probe-rs uses it); flashable images are unaffected.
+debug = 2
+panic = "abort"
+overflow-checks = false

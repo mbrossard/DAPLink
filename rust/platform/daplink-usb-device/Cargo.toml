@@ -1,0 +1,31 @@
+[package]
+name = "daplink-usb-device"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Polled (usb-device) USB adapter for daplink-rs"
+
+# Own workspace: pulls an embedded USB stack, so it resolves independently of any root.
+[workspace]
+
+# Never add a `default` entry here. Every platform crate takes this one with default features on,
+# so Cargo's feature unification turns a default-on feature back on for the whole graph and no
+# firmware can switch it off -- silently, since nothing fails to build. Compose a class out by
+# naming a different device type (`DapUsbNoVcom`), not by turning a feature off.
+[features]
+# Add the mass-storage class, so a firmware can publish the drag-n-drop volume.
+flash = ["dep:daplink-vfs"]
+# defmt logging at the mass-storage transport's stall decisions; off by default.
+defmt = ["dep:defmt"]
+
+[dependencies]
+usb-device = "0.3"
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-vfs = { path = "../../crates/daplink-vfs", optional = true }
+defmt = { version = "1", optional = true }
+
+[dev-dependencies]
+# `bot-fixtures` carries the shared Bulk-Only case table; it is host-test data, never firmware.
+daplink-core = { path = "../../crates/daplink-core", features = ["bot-fixtures"] }
+# The volume's reply slot takes a critical section; the host test binary supplies the impl.
+critical-section = { version = "1", features = ["std"] }

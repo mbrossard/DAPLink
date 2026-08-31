@@ -1,0 +1,10 @@
+[package]
+name = "pl011-baud"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace: pure PL011 divisor arithmetic for the RP seams; its tests run on the host.
+[workspace]
+
+[dependencies]
