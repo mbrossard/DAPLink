@@ -1,13 +1,9 @@
 #![no_std]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-//! Zero-dependency streaming decoders for firmware images plus content detection.
-//!
-//! A consumer expresses the set of formats it accepts by composing the per-format descriptor
-//! types ([`Uf2Format`]) it wires together; [`FormatDecoder`] ties each descriptor to its
-//! streaming decoder, canonical extension, and [`Format`] tag.
+//! Zero-dependency streaming firmware-image decoding and format detection; UF2 is the only format.
 
-#[cfg(feature = "std")]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 pub mod decoder;
@@ -24,7 +20,7 @@ pub use error::Error;
 pub use format::FormatDecoder;
 pub use uf2::{Uf2Decoder, Uf2Format};
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -39,9 +35,7 @@ mod tests {
         }
     }
 
-    /// End-to-end through the public facade: a consumer picks a format by composing its
-    /// [`FormatDecoder`] descriptor, feeds a malformed block, and gets the guard-rejection
-    /// `Error` back rather than a panic or a silently accepted write.
+    /// A malformed block through the public facade returns an error, not a panic or a write.
     #[test]
     fn uf2_facade_rejects_malformed_block() {
         let mut dec = <Uf2Format as FormatDecoder>::make();

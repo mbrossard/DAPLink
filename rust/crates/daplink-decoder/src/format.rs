@@ -1,13 +1,9 @@
-//! The compile-time per-format descriptor seam: a consumer composes its accepted-format set out
-//! of unit descriptor types ([`Uf2Format`](crate::Uf2Format)) rather than setting a build flag.
+//! Compile-time per-format descriptors a consumer composes into its accepted-format set.
 
 use crate::decoder::Decoder;
 use crate::detect::Format;
 
-/// A compile-time descriptor for one image format.
-///
-/// Implementors are zero-sized unit types used only as type-level tags; a consumer composes them
-/// into an accepted-format set and never constructs a value of the descriptor itself.
+/// A zero-sized, type-level descriptor for one image format.
 pub trait FormatDecoder {
     /// The streaming decoder this format constructs.
     type Running: Decoder;

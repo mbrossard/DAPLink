@@ -2,17 +2,15 @@
 
 use crate::Target;
 
-/// A hint derived from the dropped image: the resolved target must match it, and a mismatch is a
-/// hard rejection rather than a guess.
+/// An image hint that the selected target must match.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImageHint {
-    /// The UF2 family id declared by the dropped image, or `None` for `.bin`/`.hex` (or a UF2
-    /// with no family id).
+    /// The declared UF2 family, or `None` when no family flag is present.
     pub uf2_family: Option<u32>,
 }
 
 impl ImageHint {
-    /// An empty hint (no image family known): no cross-check.
+    /// An empty hint, accepted only when the selection policy permits it.
     pub const NONE: ImageHint = ImageHint { uf2_family: None };
 
     /// A hint carrying the dropped UF2 image's family id.
@@ -28,15 +26,13 @@ impl ImageHint {
 pub enum SelectError {
     /// No composed target matched (or the table is empty).
     NoTarget,
-    /// A target was resolved, but it disagrees with the dropped image -- the image is for a
-    /// different chip than the one composed.
+    /// The family is missing, unsupported, or matches more than one composed entry.
     ImageMismatch,
 }
 
 /// Strategy for picking a target from a registry table.
 pub trait TargetSelector {
-    /// Select a target from `table`, consulting `hint` for any image-format cross-check. Returns
-    /// the resolved target, or a [`SelectError`] describing why none was chosen.
+    /// Select a target from `table`, cross-checking the image hint.
     fn select<'t>(
         &mut self,
         hint: ImageHint,
@@ -44,7 +40,7 @@ pub trait TargetSelector {
     ) -> Result<&'t dyn Target, SelectError>;
 }
 
-/// A selector that returns the first table entry, still cross-checking any image hint against it.
+/// With no family hint, the sole composed target; with one, the unique target of that UF2 family.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FixedTarget;
 
@@ -54,12 +50,21 @@ impl TargetSelector for FixedTarget {
         hint: ImageHint,
         table: &'t [&'t dyn Target],
     ) -> Result<&'t dyn Target, SelectError> {
-        let target = *table.first().ok_or(SelectError::NoTarget)?;
-        if let Some(family) = hint.uf2_family {
-            // A single-entry table still cross-checks the image family against the sole target.
-            if target.uf2_family() != Some(family) {
-                return Err(SelectError::ImageMismatch);
-            }
+        let first = *table.first().ok_or(SelectError::NoTarget)?;
+        let Some(family) = hint.uf2_family else {
+            return if table.len() == 1 {
+                Ok(first)
+            } else {
+                Err(SelectError::ImageMismatch)
+            };
+        };
+        let mut matches = table
+            .iter()
+            .copied()
+            .filter(|t| t.accepts_uf2_family(family));
+        let target = matches.next().ok_or(SelectError::ImageMismatch)?;
+        if matches.next().is_some() {
+            return Err(SelectError::ImageMismatch);
         }
         Ok(target)
     }

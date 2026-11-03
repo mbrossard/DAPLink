@@ -2,16 +2,16 @@
 
 use crate::delay::CycleDelay;
 use crate::swo::{uart0_swo, SwoProducer, Uart0Swo};
+use crate::UsbBus;
 use crate::{clocks, usb_bus, IoPin};
 use daplink_rs::daplink_core::serial::{format_serial, SERIAL_LEN};
 use daplink_rs::daplink_core::DEFAULT_VCOM_BAUD;
-use daplink_rs::{JtagLines, LateJtagDeps, ScanChainStorage};
+use daplink_rs::{LateJtagDeps, ScanChainStorage};
 use daplink_usb_device::UsbBusAllocator;
 use rp2040_hal::fugit::RateExtU32;
 use rp2040_hal::gpio::FunctionUart;
 use rp2040_hal::pac::{self, UART1};
 use rp2040_hal::uart::{DataBits, StopBits, UartConfig, UartPeripheral};
-use rp2040_hal::usb::UsbBus;
 use rp2040_hal::{gpio::Pins, watchdog::Watchdog, Clock, Sio};
 use static_cell::StaticCell;
 
@@ -24,18 +24,18 @@ fn flash_uid() -> [u8; 8] {
     uid
 }
 
-/// Off-target there is no boot ROM to read, and only the host gate builds this arm.
+/// Off-target there is no boot ROM to read.
 #[cfg(not(all(target_arch = "arm", target_os = "none")))]
 fn flash_uid() -> [u8; 8] {
     [0u8; 8]
 }
 
 /// The wired bit-bang dependencies the DAP engine is assembled from.
-pub type ProbeDeps = LateJtagDeps<IoPin, CycleDelay>;
+pub type ProbeDeps<const CPU_HZ: u32> = LateJtagDeps<IoPin, CycleDelay<CPU_HZ>>;
 
 /// The built probe pieces for the Pico layout.
-pub struct PicoParts {
-    pub deps: ProbeDeps,
+pub struct PicoParts<const CPU_HZ: u32> {
+    pub deps: ProbeDeps<CPU_HZ>,
     pub serial: &'static str,
     pub usb_alloc: &'static mut UsbBusAllocator<UsbBus>,
     /// The interrupt and USB halves of the VCOM transport.
@@ -46,18 +46,20 @@ pub struct PicoParts {
     pub swo_producer: SwoProducer,
     /// Onboard status LED pin (GP25).
     pub status_pin: crate::StatusLedPin,
-    #[cfg(feature = "carrier-leds")]
     pub carrier_pins: crate::CarrierPins,
 }
 
-/// Bring the probe up in the Pico wiring (SWCLK=GP2, SWDIO=GP3, nRESET=GP1, TDI=GP6, TDO=GP7);
-/// call once per image.
-///
-/// # Panics
-/// Panics if the clock/PLL configuration fails; it is fixed and valid, so that is a hardware fault.
-pub fn probe_parts_pico(mut pac: pac::Peripherals, delay: CycleDelay) -> PicoParts {
+/// Bring the probe up in the Pico wiring (SWCLK=GP2, SWDIO=GP3, nRESET=GP1, TDI=GP6, TDO=GP7).
+#[inline(always)]
+pub fn probe_parts_pico<const CPU_HZ: u32>(
+    mut pac: pac::Peripherals,
+    profile: crate::ClockProfile,
+    delay: CycleDelay<CPU_HZ>,
+) -> PicoParts<CPU_HZ> {
+    assert_eq!(CPU_HZ, profile.cpu_hz());
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let clocks = clocks(
+        profile,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -140,12 +142,11 @@ pub fn probe_parts_pico(mut pac: pac::Peripherals, delay: CycleDelay) -> PicoPar
         swo,
         swo_producer,
         status_pin: pins.gpio25.into_push_pull_output(),
-        #[cfg(feature = "carrier-leds")]
         carrier_pins: crate::CarrierPins {
-            heartbeat: pins.gpio10.into_push_pull_output(),
-            dap: pins.gpio11.into_push_pull_output(),
-            flash: pins.gpio12.into_push_pull_output(),
-            vcom: pins.gpio14.into_push_pull_output(),
+            gpio10: pins.gpio10,
+            gpio11: pins.gpio11,
+            gpio12: pins.gpio12,
+            gpio14: pins.gpio14,
         },
     }
 }
@@ -160,26 +161,26 @@ pub struct PicoAccelParts {
     pub swo: Uart0Swo,
     /// Producer half of the SWO ring, held by the UART0 interrupt.
     pub swo_producer: SwoProducer,
-    /// Second handles to the four JTAG pads; TCK/TMS ride SWCLK/SWDIO over the pad loan.
-    pub jtag_lines: JtagLines<IoPin>,
     /// GPIO numbers the PIO bring-up claims.
     pub swclk: u8,
     pub swdio: u8,
+    pub tdi: u8,
+    pub tdo: u8,
     pub nreset: u8,
     /// Onboard status LED pin (GP25).
     pub status_pin: crate::StatusLedPin,
-    #[cfg(feature = "carrier-leds")]
     pub carrier_pins: crate::CarrierPins,
 }
 
-/// Bring the probe up in the Pico wiring with SWCLK/SWDIO left for a PIO state machine; the
-/// firmware owns PIO0 and those pads from here, so call once per image.
-///
-/// # Panics
-/// Panics if the clock/PLL configuration fails; it is fixed and valid, so that is a hardware fault.
-pub fn probe_parts_pico_accel(mut pac: pac::Peripherals) -> PicoAccelParts {
+/// Bring up the Pico wiring with the SWJ pads and both PIO blocks reserved for the firmware.
+#[inline(always)]
+pub fn probe_parts_pico_accel(
+    mut pac: pac::Peripherals,
+    profile: crate::ClockProfile,
+) -> PicoAccelParts {
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let clocks = clocks(
+        profile,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -203,8 +204,8 @@ pub fn probe_parts_pico_accel(mut pac: pac::Peripherals) -> PicoAccelParts {
     let _ = pins.gpio6.into_pull_up_input();
     let _ = pins.gpio7.into_pull_up_input();
 
-    // PIO0 is handed to the firmware's raw-register bring-up, which addresses it by block.
-    let _ = pac.PIO0;
+    // Both whole blocks are handed to raw-register bring-up; optimized engines also use PIO1.
+    let _ = (pac.PIO0, pac.PIO1);
 
     static USB_ALLOC: StaticCell<UsbBusAllocator<UsbBus>> = StaticCell::new();
     let usb_alloc = USB_ALLOC.init(usb_bus(
@@ -251,17 +252,17 @@ pub fn probe_parts_pico_accel(mut pac: pac::Peripherals) -> PicoAccelParts {
         vcom,
         swo,
         swo_producer,
-        jtag_lines: JtagLines::new(IoPin::new(2), IoPin::new(3), IoPin::new(6), IoPin::new(7)),
         swclk: 2,
         swdio: 3,
+        tdi: 6,
+        tdo: 7,
         nreset: 1,
         status_pin: pins.gpio25.into_push_pull_output(),
-        #[cfg(feature = "carrier-leds")]
         carrier_pins: crate::CarrierPins {
-            heartbeat: pins.gpio10.into_push_pull_output(),
-            dap: pins.gpio11.into_push_pull_output(),
-            flash: pins.gpio12.into_push_pull_output(),
-            vcom: pins.gpio14.into_push_pull_output(),
+            gpio10: pins.gpio10,
+            gpio11: pins.gpio11,
+            gpio12: pins.gpio12,
+            gpio14: pins.gpio14,
         },
     }
 }

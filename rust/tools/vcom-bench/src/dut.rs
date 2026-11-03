@@ -46,8 +46,7 @@ pub struct Dut {
 }
 
 impl Dut {
-    /// Find the RTT control block at the ELF's `_SEGGER_RTT` symbol if `dut_elf` is given, by RAM
-    /// scan otherwise.
+    /// Find the RTT control block at the ELF's `_SEGGER_RTT` symbol if given, else by RAM scan.
     pub fn open(selector: &str, chip: &str, dut_elf: Option<&str>) -> Result<Dut> {
         let selector = DebugProbeSelector::from_str(selector)
             .with_context(|| format!("parse probe selector '{selector}'"))?;
@@ -69,8 +68,7 @@ impl Dut {
         })
     }
 
-    /// An over-ceiling rung can wedge the DUT's UART receive path hard enough that only a reset
-    /// clears it.
+    /// An over-ceiling rung can wedge the DUT's UART receive path until a reset.
     pub fn reset(&mut self) -> Result<()> {
         self.session
             .core(0)
@@ -95,8 +93,7 @@ impl Dut {
         self.exchange("PING\n", |text| text.contains(proto::OK_PONG).then_some(()))
     }
 
-    /// Drains earlier replies first; [`Dut::await_reply`] collects the answer, so tty traffic can
-    /// run concurrently.
+    /// Drains earlier replies first; [`Dut::await_reply`] collects the answer.
     fn send(&mut self, line: &str) -> Result<()> {
         let mut core = self.session.core(0).context("reach core 0")?;
         let mut buf = [0u8; 256];
@@ -116,8 +113,7 @@ impl Dut {
         Ok(())
     }
 
-    /// A partial trailing line is never parsed, since a truncated number could parse as a wrong
-    /// one.
+    /// A partial trailing line is never parsed, since a truncated number could parse wrong.
     fn await_reply<T>(
         &mut self,
         what: &str,
@@ -129,24 +125,13 @@ impl Dut {
             .rtt
             .up_channel(0)
             .ok_or_else(|| anyhow!("no RTT up channel"))?;
-        let mut buf = [0u8; 256];
-        let mut seen = Vec::new();
-        loop {
-            let n = up
-                .read(&mut core, &mut buf)
-                .context("RTT up-channel read")?;
-            seen.extend_from_slice(&buf[..n]);
-            let text = String::from_utf8_lossy(&seen);
-            if let Some(end) = text.rfind('\n') {
-                if let Some(value) = parse(&text[..=end]) {
-                    return Ok(value);
-                }
-            }
-            if Instant::now() >= deadline {
-                bail!("no reply to {what:?} in time (saw {text:?})");
-            }
-            std::thread::sleep(POLL);
-        }
+        await_reply_with(
+            what,
+            parse,
+            deadline,
+            |buf| up.read(&mut core, buf).context("RTT up-channel read"),
+            || std::thread::sleep(POLL),
+        )
     }
 
     fn exchange<T>(&mut self, line: &str, parse: impl Fn(&str) -> Option<T>) -> Result<T> {
@@ -183,8 +168,7 @@ impl Dut {
         })
     }
 
-    /// Arms a run; the DUT suspends its echo and transmits and verifies on its own until its
-    /// budget, with no further control traffic.
+    /// Arms a run; the DUT then transmits and verifies on its own until its budget.
     pub fn v1_start(&mut self, line: &str) -> Result<()> {
         let armed = self.exchange(line, |text| {
             if text.contains(proto::v1::OK_V1_START) {
@@ -253,6 +237,46 @@ impl Dut {
     }
 }
 
+fn await_reply_with<T>(
+    what: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    deadline: Instant,
+    mut read: impl FnMut(&mut [u8]) -> Result<usize>,
+    mut poll: impl FnMut(),
+) -> Result<T> {
+    let mut buf = [0u8; 256];
+    let mut seen = Vec::new();
+    loop {
+        let n = read(&mut buf)?;
+        seen.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&seen);
+        if let Some(value) = parse_reply(what, &text, &parse)? {
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            bail!("no reply to {what:?} in time (saw {text:?})");
+        }
+        poll();
+    }
+}
+
+fn parse_reply<T>(what: &str, text: &str, parse: impl Fn(&str) -> Option<T>) -> Result<Option<T>> {
+    let Some(end) = text.rfind('\n') else {
+        return Ok(None);
+    };
+    let complete = &text[..=end];
+    if complete
+        .lines()
+        .any(|line| line == proto::ERR_DMA_ABORT_TIMEOUT)
+    {
+        bail!(
+            "DUT rejected {what:?}: {}; transfer ownership is unresolved",
+            proto::ERR_DMA_ABORT_TIMEOUT
+        );
+    }
+    Ok(parse(complete))
+}
+
 fn attach_rtt(session: &mut Session, region: &ScanRegion) -> Result<Rtt> {
     let mut core = session.core(0).context("reach core 0")?;
     let deadline = Instant::now() + ATTACH_TIMEOUT;
@@ -279,6 +303,47 @@ fn rtt_symbol(elf: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abort_rejection_waits_for_a_complete_line_then_fails_without_parsing_success() {
+        let parse = |_: &str| -> Option<()> { panic!("rejected reply must not be accepted") };
+        assert!(parse_reply("V1 RESET", "ERR dma_abort_", parse)
+            .unwrap()
+            .is_none());
+        for command in ["V1 START", "V1 RESET", "BAUD 115200"] {
+            let error = parse_reply(command, "ERR dma_abort_timeout\n", parse).unwrap_err();
+            assert!(error.to_string().contains(command));
+            assert!(error.to_string().contains("ownership is unresolved"));
+        }
+        assert_eq!(
+            parse_reply("V1 RESET", "OK V1 RESET\npartial", |line| {
+                (line == "OK V1 RESET\n").then_some(())
+            })
+            .unwrap(),
+            Some(())
+        );
+    }
+
+    #[test]
+    fn reply_loop_returns_a_fragmented_abort_error_before_another_poll_or_read() {
+        let mut reads = [b"ERR dma_abort_".as_slice(), b"timeout\n"].into_iter();
+        let mut polls = 0;
+        let error = await_reply_with::<()>(
+            "V1 RESET",
+            |_| panic!("must not parse a rejected command as success"),
+            Instant::now() + EXCHANGE_TIMEOUT,
+            |buf| {
+                let part = reads.next().expect("no read after rejection");
+                buf[..part.len()].copy_from_slice(part);
+                Ok(part.len())
+            },
+            || polls += 1,
+        )
+        .unwrap_err();
+        assert_eq!(polls, 1);
+        assert!(error.to_string().contains("ERR dma_abort_timeout"));
+        assert!(!error.to_string().contains("no reply"));
+    }
 
     #[test]
     fn chip_lookup_knows_the_supported_targets_and_rejects_strangers() {

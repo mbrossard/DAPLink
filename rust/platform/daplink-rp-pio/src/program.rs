@@ -1,92 +1,7 @@
-//! The two PIO program variants, assembled by a const encoder so the crate needs no assembler.
+//! The generic SWD and JTAG PIO programs, assembled by the const encoder in `asm`.
 
-/// A PIO instruction destination (the `out`/`set` target field, bits 7:5).
-#[derive(Copy, Clone)]
-enum Dest {
-    Pins = 0,
-    X = 1,
-    PinDirs = 4,
-    Pc = 5,
-}
-
-/// A PIO `jmp` condition (bits 7:5 of a JMP instruction).
-#[derive(Copy, Clone)]
-enum Cond {
-    Always = 0,
-    XPostDec = 2,
-}
-
-/// How the 5-bit delay/side-set field splits for a variant.
-#[derive(Copy, Clone)]
-struct SideSet {
-    /// Side-set data bits; an enable bit is always present because both variants use `opt`.
-    data_bits: u8,
-}
-
-impl SideSet {
-    /// Total side-set field width, including the `opt` enable bit.
-    const fn total_bits(self) -> u8 {
-        self.data_bits + 1
-    }
-
-    /// Encode the 5-bit `[12:8]` delay/side-set field; `side` is `None` to leave the pins alone.
-    const fn field(self, side: Option<u8>, delay: u8) -> u16 {
-        let total = self.total_bits();
-        let delay_bits = 5 - total;
-        let (enable, value) = match side {
-            Some(v) => (1u16, v as u16),
-            None => (0, 0),
-        };
-        // Side-set data sits just below the enable bit; delay fills the low bits.
-        let mut field = (delay as u16) & ((1 << delay_bits) - 1);
-        field |= value << delay_bits;
-        field |= enable << (total - 1) << delay_bits;
-        field
-    }
-}
-
-/// Assemble one instruction: opcode in 15:13, delay/side-set in 12:8, opcode-specific low byte.
-const fn instr(opcode: u16, field: u16, low: u16) -> u16 {
-    (opcode << 13) | (field << 8) | low
-}
-
-const OP_JMP: u16 = 0b000;
-const OP_IN: u16 = 0b010;
-const OP_OUT: u16 = 0b011;
-const OP_PUSHPULL: u16 = 0b100;
-const OP_MOV: u16 = 0b101;
-
-const fn jmp(ss: SideSet, cond: Cond, addr: u8, side: Option<u8>, delay: u8) -> u16 {
-    instr(
-        OP_JMP,
-        ss.field(side, delay),
-        ((cond as u16) << 5) | (addr as u16),
-    )
-}
-const fn out(ss: SideSet, dest: Dest, count: u8, side: Option<u8>, delay: u8) -> u16 {
-    // A count of 32 encodes as 0; every count here is below 32.
-    instr(
-        OP_OUT,
-        ss.field(side, delay),
-        ((dest as u16) << 5) | (count as u16),
-    )
-}
-const fn in_pins(ss: SideSet, count: u8, side: Option<u8>, delay: u8) -> u16 {
-    // Source = PINS (0).
-    instr(OP_IN, ss.field(side, delay), count as u16)
-}
-const fn pull(ss: SideSet, side: Option<u8>, delay: u8) -> u16 {
-    // PULL, blocking: bit 7 = 1 (pull), bit 5 = 1 (block).
-    instr(OP_PUSHPULL, ss.field(side, delay), 0b1010_0000)
-}
-const fn push(ss: SideSet, side: Option<u8>, delay: u8) -> u16 {
-    // PUSH, blocking: bit 7 = 0 (push), bit 5 = 1 (block).
-    instr(OP_PUSHPULL, ss.field(side, delay), 0b0010_0000)
-}
-const fn nop(ss: SideSet, side: Option<u8>, delay: u8) -> u16 {
-    // Canonical NOP = `mov y, y`.
-    instr(OP_MOV, ss.field(side, delay), (2 << 5) | 2)
-}
+use crate::asm::{clear_isr, in_pins, jmp, nop, out, pull, push, Cond, Dest, SideSet};
+use crate::clock::{jtag_timing, swd_cycles_per_bit, JtagTiming};
 
 /// Which assembled variant a wiring uses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -100,7 +15,7 @@ pub enum Variant {
 /// Entry-point offsets within a program, relative to its load offset.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ProgramLabels {
-    /// Released turnaround loop entry.
+    /// Released turnaround loop entry; no in-tree engine dispatches to it.
     pub turnaround_cmd: u8,
     /// Driven write loop entry.
     pub write_cmd: u8,
@@ -115,7 +30,7 @@ pub struct ProgramLabels {
 /// Absolute entry PCs after loading at a known offset; these go in the command word.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ProgramEntries {
-    /// Absolute address of the released turnaround loop entry.
+    /// Absolute address of the released turnaround loop entry; no in-tree engine uses it.
     pub turnaround_cmd: u8,
     /// Absolute address of the driven write loop entry.
     pub write_cmd: u8,
@@ -125,6 +40,21 @@ pub struct ProgramEntries {
     pub read_cmd: u8,
     /// Absolute address of the completion barrier entry.
     pub release_cmd: u8,
+}
+
+/// Absolute entry PCs for the JTAG dispatcher and its two fixed-TMS loops.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct JtagProgramEntries {
+    /// Dispatcher / park site; it leaves the last TCK/TMS levels unchanged while stalled.
+    pub get_next_cmd: u8,
+    /// TMS-low entry that pulls a separate data word.
+    pub tms_low_data_cmd: u8,
+    /// TMS-low entry that shifts data embedded in the command word.
+    pub tms_low_inline_cmd: u8,
+    /// TMS-high entry that pulls a separate data word.
+    pub tms_high_data_cmd: u8,
+    /// TMS-high entry that shifts data embedded in the command word.
+    pub tms_high_inline_cmd: u8,
 }
 
 /// One assembled variant: instruction words plus the metadata the state machine set-up needs.
@@ -145,6 +75,22 @@ pub struct PioProgram {
     pub variant: Variant,
 }
 
+/// The PIO JTAG program loaded after the direct SWD program.
+pub struct JtagProgram {
+    /// The 16-bit instruction words, already relocated for their fixed load offset.
+    pub instructions: &'static [u16],
+    /// First instruction-memory slot occupied by this program.
+    pub load_offset: u8,
+    /// Wrap-target address.
+    pub wrap_target: u8,
+    /// Wrap address.
+    pub wrap: u8,
+    /// Side-set data bits, excluding the optional enable bit.
+    pub side_set_bits: u8,
+    /// Absolute entry PCs.
+    pub entries: JtagProgramEntries,
+}
+
 impl PioProgram {
     /// The absolute entry PCs; internal jumps require a zero load offset.
     pub const fn entries(&self, load_offset: u8) -> ProgramEntries {
@@ -160,17 +106,6 @@ impl PioProgram {
 }
 
 const SS1: SideSet = SideSet { data_bits: 1 };
-
-const LOW_DELAY: u8 = if cfg!(any(feature = "clock-180mhz", feature = "clock-200mhz")) {
-    2
-} else {
-    1
-};
-const READ_NOP_DELAY: u8 = if cfg!(any(feature = "clock-180mhz", feature = "clock-200mhz")) {
-    1
-} else {
-    0
-};
 
 /// Single bidirectional (or split drive/readback) SWDIO, 1-bit side-set on SWCLK.
 pub static DIRECT: PioProgram = PioProgram {
@@ -189,34 +124,49 @@ pub static DIRECT: PioProgram = PioProgram {
     variant: Variant::Direct,
 };
 
-static DIRECT_WORDS: [u16; 13] = [
-    // 0 write_cmd / turnaround_cmd: pull the data (or dummy 0 for high-Z).
-    pull(SS1, None, 0),
-    // 1 write_bitloop: drive the bit with SWCLK low.
-    out(SS1, Dest::Pins, 1, Some(0), LOW_DELAY),
-    // 2 jmp x-- write_bitloop [1] side 1  (SWCLK rises, target samples).
-    jmp(SS1, Cond::XPostDec, 1, Some(1), 1),
-    // 3 get_next_cmd: pull side 0  (park site, SWCLK low).
-    pull(SS1, Some(0), 0),
-    // 4 out x,8  (X := bit_count - 1).
-    out(SS1, Dest::X, 8, None, 0),
-    // 5 out pindirs,1  (SWDIO direction).
-    out(SS1, Dest::PinDirs, 1, None, 0),
-    // 6 out pc,5  (dispatch to the entry PC).
-    out(SS1, Dest::Pc, 5, None, 0),
-    // 7 read_bitloop: low-phase delay slot on the taken loop branch.
-    nop(SS1, None, READ_NOP_DELAY),
-    // 8 read_cmd: in pins,1 [1] side 1  (SWCLK rises + sample).
-    in_pins(SS1, 1, Some(1), 1),
-    // 9 jmp x-- read_bitloop side 0  (SWCLK falls).
-    jmp(SS1, Cond::XPostDec, 7, Some(0), 0),
-    // 10 push  (result word after the last bit).
-    push(SS1, None, 0),
-    // 11 release_cmd: push completion after the dispatcher applies released direction.
-    push(SS1, None, 0),
-    // 12 return to the dispatcher without entering the normal wrap range.
-    jmp(SS1, Cond::Always, 3, None, 0),
-];
+static DIRECT_WORDS: [u16; 13] = direct_words(1, 0);
+static DIRECT_STRETCHED_WORDS: [u16; 13] = direct_words(2, 1);
+
+const fn direct_words(low_delay: u8, read_nop_delay: u8) -> [u16; 13] {
+    [
+        // 0 write_cmd / turnaround_cmd: pull the data (or dummy 0 for high-Z).
+        pull(SS1, None, 0),
+        // 1 write_bitloop: drive the bit with SWCLK low.
+        out(SS1, Dest::Pins, 1, Some(0), low_delay),
+        // 2 jmp x-- write_bitloop [1] side 1  (SWCLK rises, target samples).
+        jmp(SS1, Cond::XPostDec, 1, Some(1), 1),
+        // 3 get_next_cmd: pull side 0  (park site, SWCLK low).
+        pull(SS1, Some(0), 0),
+        // 4 out x,8  (X := bit_count - 1).
+        out(SS1, Dest::X, 8, None, 0),
+        // 5 out pindirs,1  (SWDIO direction).
+        out(SS1, Dest::PinDirs, 1, None, 0),
+        // 6 out pc,5  (dispatch to the entry PC).
+        out(SS1, Dest::Pc, 5, None, 0),
+        // 7 read_bitloop: low-phase delay slot on the taken loop branch.
+        nop(SS1, None, read_nop_delay),
+        // 8 read_cmd: in pins,1 [1] side 1  (SWCLK rises + sample).
+        in_pins(SS1, 1, Some(1), 1),
+        // 9 jmp x-- read_bitloop side 0  (SWCLK falls).
+        jmp(SS1, Cond::XPostDec, 7, Some(0), 0),
+        // 10 push  (result word after the last bit).
+        push(SS1, None, 0),
+        // 11 release_cmd: push completion after the dispatcher applies released direction.
+        push(SS1, None, 0),
+        // 12 return to the dispatcher without entering the normal wrap range.
+        jmp(SS1, Cond::Always, 3, None, 0),
+    ]
+}
+
+static DIRECT_STRETCHED: PioProgram = PioProgram {
+    instructions: &DIRECT_STRETCHED_WORDS,
+    wrap_target: DIRECT.wrap_target,
+    wrap: DIRECT.wrap,
+    side_set_bits: DIRECT.side_set_bits,
+    side_set_opt: DIRECT.side_set_opt,
+    labels: DIRECT.labels,
+    variant: Variant::Direct,
+};
 
 const SS2: SideSet = SideSet { data_bits: 2 };
 
@@ -237,67 +187,189 @@ pub static OEN: PioProgram = PioProgram {
     variant: Variant::Oen,
 };
 
-static OEN_WORDS: [u16; 17] = [
-    // 0 turnaround_cmd: pull  (dummy data word, pairing kept uniform).
-    pull(SS2, None, 0),
-    // 1 turnaround_bitloop: OEn released, SWCLK low.
-    nop(SS2, Some(0x1), LOW_DELAY),
-    // 2 jmp x-- turnaround_bitloop [1] side 0x3  (OEn released, SWCLK high).
-    jmp(SS2, Cond::XPostDec, 1, Some(0x3), 1),
-    // 3 jmp get_next_cmd.
-    jmp(SS2, Cond::Always, 7, None, 0),
-    // 4 write_cmd: pull.
-    pull(SS2, None, 0),
-    // 5 write_bitloop: driving, SWCLK low.
-    out(SS2, Dest::Pins, 1, Some(0x0), LOW_DELAY),
-    // 6 jmp x-- write_bitloop [1] side 0x2  (driving, SWCLK high).
-    jmp(SS2, Cond::XPostDec, 5, Some(0x2), 1),
-    // 7 get_next_cmd: pull side 0x1  (park site, SWCLK low, OEn released).
-    pull(SS2, Some(0x1), 0),
-    // 8 out x,8.
-    out(SS2, Dest::X, 8, None, 0),
-    // 9 out pindirs,1.
-    out(SS2, Dest::PinDirs, 1, None, 0),
-    // 10 out pc,5.
-    out(SS2, Dest::Pc, 5, None, 0),
-    // 11 read_bitloop: low-phase delay slot.
-    nop(SS2, None, READ_NOP_DELAY),
-    // 12 read_cmd: in pins,1 [1] side 0x3  (OEn released, SWCLK rises + sample).
-    in_pins(SS2, 1, Some(0x3), 1),
-    // 13 jmp x-- read_bitloop side 0x1  (OEn released, SWCLK falls).
-    jmp(SS2, Cond::XPostDec, 11, Some(0x1), 0),
-    // 14 push.
-    push(SS2, None, 0),
-    // 15 release_cmd: push completion after the dispatcher applies released direction.
-    push(SS2, None, 0),
-    // 16 return to the released dispatcher without entering the normal wrap range.
-    jmp(SS2, Cond::Always, 7, None, 0),
-];
+static OEN_WORDS: [u16; 17] = oen_words(1, 0);
+static OEN_STRETCHED_WORDS: [u16; 17] = oen_words(2, 1);
 
-/// Pick the variant for a wiring: [`OEN`] with an output-enable pin, [`DIRECT`] otherwise.
-pub const fn select_program(has_oen: bool) -> &'static PioProgram {
-    if has_oen {
-        &OEN
-    } else {
-        &DIRECT
+const fn oen_words(low_delay: u8, read_nop_delay: u8) -> [u16; 17] {
+    [
+        // 0 turnaround_cmd: pull  (dummy data word, pairing kept uniform).
+        pull(SS2, None, 0),
+        // 1 turnaround_bitloop: OEn released, SWCLK low.
+        nop(SS2, Some(0x1), low_delay),
+        // 2 jmp x-- turnaround_bitloop [1] side 0x3  (OEn released, SWCLK high).
+        jmp(SS2, Cond::XPostDec, 1, Some(0x3), 1),
+        // 3 jmp get_next_cmd.
+        jmp(SS2, Cond::Always, 7, None, 0),
+        // 4 write_cmd: pull.
+        pull(SS2, None, 0),
+        // 5 write_bitloop: driving, SWCLK low.
+        out(SS2, Dest::Pins, 1, Some(0x0), low_delay),
+        // 6 jmp x-- write_bitloop [1] side 0x2  (driving, SWCLK high).
+        jmp(SS2, Cond::XPostDec, 5, Some(0x2), 1),
+        // 7 get_next_cmd: pull side 0x1  (park site, SWCLK low, OEn released).
+        pull(SS2, Some(0x1), 0),
+        // 8 out x,8.
+        out(SS2, Dest::X, 8, None, 0),
+        // 9 out pindirs,1.
+        out(SS2, Dest::PinDirs, 1, None, 0),
+        // 10 out pc,5.
+        out(SS2, Dest::Pc, 5, None, 0),
+        // 11 read_bitloop: low-phase delay slot.
+        nop(SS2, None, read_nop_delay),
+        // 12 read_cmd: in pins,1 [1] side 0x3  (OEn released, SWCLK rises + sample).
+        in_pins(SS2, 1, Some(0x3), 1),
+        // 13 jmp x-- read_bitloop side 0x1  (OEn released, SWCLK falls).
+        jmp(SS2, Cond::XPostDec, 11, Some(0x1), 0),
+        // 14 push.
+        push(SS2, None, 0),
+        // 15 release_cmd: push completion after the dispatcher applies released direction.
+        push(SS2, None, 0),
+        // 16 return to the released dispatcher without entering the normal wrap range.
+        jmp(SS2, Cond::Always, 7, None, 0),
+    ]
+}
+
+static OEN_STRETCHED: PioProgram = PioProgram {
+    instructions: &OEN_STRETCHED_WORDS,
+    wrap_target: OEN.wrap_target,
+    wrap: OEN.wrap,
+    side_set_bits: OEN.side_set_bits,
+    side_set_opt: OEN.side_set_opt,
+    labels: OEN.labels,
+    variant: Variant::Oen,
+};
+
+const JTAG_OFFSET: u8 = DIRECT_WORDS.len() as u8;
+const JTAG_GET_NEXT: u8 = JTAG_OFFSET;
+const JTAG_TMS_LOW_DATA: u8 = JTAG_OFFSET + 4;
+const JTAG_TMS_LOW_INLINE: u8 = JTAG_OFFSET + 5;
+const JTAG_TMS_HIGH_DATA: u8 = JTAG_OFFSET + 10;
+const JTAG_TMS_HIGH_INLINE: u8 = JTAG_OFFSET + 11;
+const JTAG_FINISH: u8 = JTAG_OFFSET + 15;
+const JTAG_DISCARD: u8 = JTAG_OFFSET + 18;
+const JTAG_NOP_TMS_LOW: u8 = 0b01;
+const JTAG_NOP_TMS_HIGH: u8 = 0b11;
+
+static JTAG_125MHZ: JtagProgram = JtagProgram {
+    instructions: &JTAG_125MHZ_WORDS,
+    load_offset: JTAG_OFFSET,
+    wrap_target: JTAG_GET_NEXT,
+    wrap: JTAG_OFFSET + JTAG_125MHZ_WORDS.len() as u8 - 1,
+    side_set_bits: 2,
+    entries: JtagProgramEntries {
+        get_next_cmd: JTAG_GET_NEXT,
+        tms_low_data_cmd: JTAG_TMS_LOW_DATA,
+        tms_low_inline_cmd: JTAG_TMS_LOW_INLINE,
+        tms_high_data_cmd: JTAG_TMS_HIGH_DATA,
+        tms_high_inline_cmd: JTAG_TMS_HIGH_INLINE,
+    },
+};
+
+static JTAG_150MHZ: JtagProgram = JtagProgram {
+    instructions: &JTAG_150MHZ_WORDS,
+    load_offset: JTAG_125MHZ.load_offset,
+    wrap_target: JTAG_125MHZ.wrap_target,
+    wrap: JTAG_125MHZ.wrap,
+    side_set_bits: JTAG_125MHZ.side_set_bits,
+    entries: JTAG_125MHZ.entries,
+};
+
+static JTAG_200MHZ: JtagProgram = JtagProgram {
+    instructions: &JTAG_200MHZ_WORDS,
+    load_offset: JTAG_125MHZ.load_offset,
+    wrap_target: JTAG_125MHZ.wrap_target,
+    wrap: JTAG_125MHZ.wrap,
+    side_set_bits: JTAG_125MHZ.side_set_bits,
+    entries: JTAG_125MHZ.entries,
+};
+
+static JTAG_125MHZ_WORDS: [u16; 19] = jtag_words(crate::clock::JTAG_TIMING_125MHZ);
+static JTAG_150MHZ_WORDS: [u16; 19] = jtag_words(crate::clock::JTAG_TIMING_150MHZ);
+static JTAG_200MHZ_WORDS: [u16; 19] = jtag_words(crate::clock::JTAG_TIMING_200MHZ);
+
+const fn jtag_words(timing: JtagTiming) -> [u16; 19] {
+    [
+        // 13: count - 1, capture, entry PC and up to 21 TDI bits share one command word.
+        pull(SS2, None, 0),
+        out(SS2, Dest::X, 5, None, 0),
+        out(SS2, Dest::Y, 1, None, 0),
+        out(SS2, Dest::Pc, 5, None, 0),
+        // 17: TMS-low external-data entry and bit loop.
+        pull(SS2, None, 0),
+        out(SS2, Dest::Pins, 1, Some(0b00), timing.output_delay()),
+        nop(SS2, Some(JTAG_NOP_TMS_LOW), timing.loop_high_delay()),
+        in_pins(SS2, 1, Some(0b01), timing.sample_delay()),
+        jmp(
+            SS2,
+            Cond::XPostDec,
+            JTAG_TMS_LOW_INLINE,
+            Some(0b00),
+            timing.loop_low_delay(),
+        ),
+        jmp(SS2, Cond::Always, JTAG_FINISH, None, 0),
+        // 23: TMS-high external-data entry and bit loop.
+        pull(SS2, None, 0),
+        out(SS2, Dest::Pins, 1, Some(0b10), timing.output_delay()),
+        nop(SS2, Some(JTAG_NOP_TMS_HIGH), timing.loop_high_delay()),
+        in_pins(SS2, 1, Some(0b11), timing.sample_delay()),
+        jmp(
+            SS2,
+            Cond::XPostDec,
+            JTAG_TMS_HIGH_INLINE,
+            Some(0b10),
+            timing.loop_low_delay(),
+        ),
+        // 28: Push captured data, or clear the ISR without filling the RX FIFO.
+        jmp(SS2, Cond::YZero, JTAG_DISCARD, None, 0),
+        push(SS2, None, 0),
+        jmp(SS2, Cond::Always, JTAG_GET_NEXT, None, 0),
+        // 31: wrap returns to the dispatcher.
+        clear_isr(SS2),
+    ]
+}
+
+const _: () = assert!(DIRECT_WORDS.len() + JTAG_125MHZ_WORDS.len() <= 32);
+
+/// Pick the qualified standard SWD program for a wiring and system clock.
+pub const fn select_program(has_oen: bool, sys_hz: u32) -> Option<&'static PioProgram> {
+    match swd_cycles_per_bit(sys_hz) {
+        Some(4) => Some(if has_oen { &OEN } else { &DIRECT }),
+        Some(5) => Some(if has_oen {
+            &OEN_STRETCHED
+        } else {
+            &DIRECT_STRETCHED
+        }),
+        _ => None,
+    }
+}
+
+/// Pick the qualified late-sampled JTAG program for a system clock.
+pub const fn select_jtag_program(sys_hz: u32) -> Option<&'static JtagProgram> {
+    match jtag_timing(sys_hz) {
+        Some(crate::clock::JTAG_TIMING_125MHZ) => Some(&JTAG_125MHZ),
+        Some(crate::clock::JTAG_TIMING_150MHZ) => Some(&JTAG_150MHZ),
+        Some(crate::clock::JTAG_TIMING_200MHZ) => Some(&JTAG_200MHZ),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asm::OP_OUT;
+    use crate::clock::{JTAG_TIMING_125MHZ, JTAG_TIMING_150MHZ, JTAG_TIMING_200MHZ};
 
     // Golden words hand-computed from the datasheet encoding, so an encoder bug cannot hide.
     #[rustfmt::skip]
     const DIRECT_GOLDEN: [u16; 13] = [
         0x80A0, // 0  pull
-        if cfg!(any(feature = "clock-180mhz", feature = "clock-200mhz")) { 0x7201 } else { 0x7101 },
+        0x7101, // 1  out pins,1 [1] side 0
         0x1941, // 2  jmp x-- 1 [1] side 1
         0x90A0, // 3  pull side 0
         0x6028, // 4  out x,8
         0x6081, // 5  out pindirs,1
         0x60A5, // 6  out pc,5
-        if cfg!(any(feature = "clock-180mhz", feature = "clock-200mhz")) { 0xA142 } else { 0xA042 },
+        0xA042, // 7  nop
         0x5901, // 8  in pins,1 [1] side 1
         0x1047, // 9  jmp x-- 7 side 0
         0x8020, // 10 push
@@ -308,17 +380,17 @@ mod tests {
     #[rustfmt::skip]
     const OEN_GOLDEN: [u16; 17] = [
         0x80A0, // 0  pull
-        if cfg!(any(feature = "clock-180mhz", feature = "clock-200mhz")) { 0xB642 } else { 0xB542 },
+        0xB542, // 1  nop [1] side 0x1
         0x1D41, // 2  jmp x-- 1 [1] side 0x3
         0x0007, // 3  jmp get_next_cmd (7)
         0x80A0, // 4  pull
-        if cfg!(any(feature = "clock-180mhz", feature = "clock-200mhz")) { 0x7201 } else { 0x7101 },
+        0x7101, // 5  out pins,1 [1] side 0
         0x1945, // 6  jmp x-- 5 [1] side 0x2
         0x94A0, // 7  pull side 0x1
         0x6028, // 8  out x,8
         0x6081, // 9  out pindirs,1
         0x60A5, // 10 out pc,5
-        if cfg!(any(feature = "clock-180mhz", feature = "clock-200mhz")) { 0xA142 } else { 0xA042 },
+        0xA042, // 11 nop
         0x5D01, // 12 in pins,1 [1] side 0x3
         0x144B, // 13 jmp x-- 11 side 0x1
         0x8020, // 14 push
@@ -374,6 +446,68 @@ mod tests {
     }
 
     #[test]
+    fn jtag_program_fills_shared_instruction_memory() {
+        let program = select_jtag_program(125_000_000).unwrap();
+        assert_eq!(program.load_offset, 13);
+        assert_eq!(program.instructions.len(), 19);
+        assert_eq!(program.wrap_target, 13);
+        assert_eq!(program.wrap, 31);
+        assert_eq!(program.side_set_bits, 2);
+        assert_eq!(
+            program.entries,
+            JtagProgramEntries {
+                get_next_cmd: 13,
+                tms_low_data_cmd: 17,
+                tms_low_inline_cmd: 18,
+                tms_high_data_cmd: 23,
+                tms_high_inline_cmd: 24,
+            }
+        );
+    }
+
+    #[test]
+    fn jtag_words_match_profile_goldens() {
+        #[rustfmt::skip]
+        let profiles = [
+            (JTAG_TIMING_125MHZ, [
+                0x80A0, 0x6025, 0x6041, 0x60A5, 0x80A0,
+                0x7101, 0xB442, 0x5401, 0x1052, 0x001C, 0x80A0,
+                0x7901, 0xBC42, 0x5C01, 0x1858, 0x007F, 0x8020, 0x000D, 0xA0C3,
+            ]),
+            (JTAG_TIMING_150MHZ, [
+                0x80A0, 0x6025, 0x6041, 0x60A5, 0x80A0,
+                0x7101, 0xB542, 0x5401, 0x1052, 0x001C, 0x80A0,
+                0x7901, 0xBD42, 0x5C01, 0x1858, 0x007F, 0x8020, 0x000D, 0xA0C3,
+            ]),
+            (JTAG_TIMING_200MHZ, [
+                0x80A0, 0x6025, 0x6041, 0x60A5, 0x80A0,
+                0x7101, 0xB642, 0x5401, 0x1152, 0x001C, 0x80A0,
+                0x7901, 0xBE42, 0x5C01, 0x1958, 0x007F, 0x8020, 0x000D, 0xA0C3,
+            ]),
+        ];
+        for (timing, golden) in profiles {
+            assert_eq!(jtag_words(timing), golden);
+        }
+        assert_eq!(JTAG_125MHZ_WORDS, jtag_words(JTAG_TIMING_125MHZ));
+        assert_eq!(JTAG_150MHZ_WORDS, jtag_words(JTAG_TIMING_150MHZ));
+        assert_eq!(JTAG_200MHZ_WORDS, jtag_words(JTAG_TIMING_200MHZ));
+    }
+
+    #[test]
+    fn jtag_shift_loops_match_every_profile_geometry() {
+        let duration = |word: u16| u32::from((word >> 8) & 0x03) + 1;
+        for timing in [JTAG_TIMING_125MHZ, JTAG_TIMING_150MHZ, JTAG_TIMING_200MHZ] {
+            let words = jtag_words(timing);
+            for start in [5, 11] {
+                let low = duration(words[start + 3]) + duration(words[start]);
+                let high = duration(words[start + 1]) + duration(words[start + 2]);
+                assert_eq!((low, high), (timing.low_cycles(), timing.high_cycles()));
+                assert_eq!(low + high, timing.cycles_per_bit());
+            }
+        }
+    }
+
+    #[test]
     fn entries_match_absolute_program_addresses() {
         let direct = DIRECT.entries(0);
         assert_eq!(direct.turnaround_cmd, 0);
@@ -398,8 +532,16 @@ mod tests {
 
     #[test]
     fn select_program_picks_variant() {
-        assert_eq!(select_program(false).variant, Variant::Direct);
-        assert_eq!(select_program(true).variant, Variant::Oen);
+        assert_eq!(
+            select_program(false, 125_000_000).unwrap().variant,
+            Variant::Direct
+        );
+        assert_eq!(
+            select_program(true, 200_000_000).unwrap().variant,
+            Variant::Oen
+        );
+        assert!(select_program(false, 160_000_000).is_none());
+        assert!(select_jtag_program(160_000_000).is_none());
     }
 
     #[test]
@@ -420,7 +562,7 @@ mod tests {
         let field = (DIRECT_WORDS[1] >> 8) & 0x1f;
         assert_eq!(field >> 4, 1, "opt enable set");
         assert_eq!((field >> 3) & 1, 0, "SWCLK low");
-        assert_eq!(field & 0x7, u16::from(LOW_DELAY), "low-phase delay");
+        assert_eq!(field & 0x7, 1, "low-phase delay");
 
         let field = (DIRECT_WORDS[2] >> 8) & 0x1f;
         assert_eq!(field >> 4, 1);

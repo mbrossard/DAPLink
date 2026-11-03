@@ -8,8 +8,7 @@ pub const SLOT: f64 = 64.0;
 /// Bulk transactions a full-speed 1 ms frame can theoretically carry.
 const FS_SLOTS_PER_MS: f64 = 19.0;
 
-/// Bulk transactions a high-speed millisecond can theoretically carry: 13 per microframe, eight
-/// microframes.
+/// Bulk transactions a high-speed millisecond can carry: 13 per microframe, eight microframes.
 const HS_SLOTS_PER_MS: f64 = 104.0;
 
 /// Bulk max packet size that marks a high-speed endpoint.

@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Own workspace: pins its own embedded target.
 [workspace]
+
+[lib]
+test = false
+bench = false
+doctest = false
+
+[features]
+conntest = []
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }

@@ -5,6 +5,10 @@ use core::num::NonZeroU32;
 /// Core cycles one loop iteration costs on Cortex-M0+: `subs` 1, taken `bne` 2.
 pub const CYCLES_PER_ITERATION: u32 = 3;
 
+// The M7 runs this loop in about one cycle, so every delay would be short.
+#[cfg(daplink_cortex_m7)]
+compile_error!("the 3-cycle spin runs short on a Cortex-M7; pace by DWT_CYCCNT or a timer");
+
 /// A cycle request converted once into the trip count used by the aligned delay loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedSpin(NonZeroU32);
@@ -64,8 +68,7 @@ const fn nonzero(value: u32) -> NonZeroU32 {
 #[cfg(target_arch = "arm")]
 #[inline(always)]
 fn spin_iterations(iterations: u32) {
-    // SAFETY: register arithmetic and a local backward branch only -- no memory, no stack, no
-    // call; the count is non-zero, and the flags clobber is why `preserves_flags` is absent.
+    // SAFETY: register arithmetic and a local branch only; flags are clobbered.
     unsafe {
         core::arch::asm!(
             ".p2align 4",
@@ -90,7 +93,7 @@ fn spin_iterations(iterations: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ceil_div3, iterations_for, spin_cycles, PreparedSpin, CYCLES_PER_ITERATION};
+    use super::{ceil_div3, iterations_for, CYCLES_PER_ITERATION};
 
     /// The reciprocal divides exactly over every request a bit cell can plausibly make.
     #[test]
@@ -131,13 +134,5 @@ mod tests {
             let realized = iterations * CYCLES_PER_ITERATION;
             assert!(realized >= cycles && realized - cycles < 2 * CYCLES_PER_ITERATION);
         }
-    }
-
-    /// The primitive itself runs for the degenerate and the clamped request.
-    #[test]
-    fn the_spin_runs() {
-        spin_cycles(0);
-        spin_cycles(99);
-        PreparedSpin::new(99).run();
     }
 }

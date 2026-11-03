@@ -46,8 +46,7 @@ pub enum Error {
     ResetFailed,
     /// A [`ResetOps`](crate::reset_sequence::ResetOps) primitive the port in use does not implement.
     Unsupported,
-    /// The debug access port is locked and the active
-    /// [`UnlockPolicy`](crate::reset_sequence::UnlockPolicy) refuses to unlock it.
+    /// The debug port is locked and the active unlock policy refuses to unlock it.
     TargetLocked,
     /// Debug power-up handshake did not complete in time.
     PowerUpTimeout,
@@ -61,6 +60,13 @@ pub enum Error {
     AlgoDownloadFailed,
     /// A flash-algorithm syscall did not return in time.
     AlgoTimeout,
+    /// A flash-algorithm syscall halted somewhere other than its return trap.
+    AlgoHalted {
+        /// Where the core halted.
+        pc: u32,
+    },
+    /// The core locked up while a flash-algorithm syscall ran.
+    AlgoLockup,
     /// A flash-algorithm syscall returned a non-zero status code.
     AlgoFailed {
         /// The status code returned in r0.

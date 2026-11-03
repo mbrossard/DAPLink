@@ -6,53 +6,98 @@
 // Panic policy: halt, so the probe stays inspectable over its own SWD port.
 use panic_halt as _;
 
+#[cfg(feature = "accel")]
+mod spi_swd;
+
+#[cfg(all(feature = "accel", feature = "conntest"))]
+compile_error!("accel and conntest reserve incompatible probe-pad compositions");
+
+#[cfg(feature = "conntest")]
+mod conntest;
+
 #[rtic::app(device = stm32f1xx_hal::pac)]
 mod app {
+    use cortex_m::peripheral::NVIC;
     use daplink_rs::daplink_core::{
-        product_string, DapConfig, DapQueue, DAP_FW_VERSION, DAP_PACKET_SIZE,
+        product_string, DapConfig, DapQueue, EndpointSize, PacketSize, DAP_FW_VERSION,
+        DAP_PACKET_SIZE,
     };
-    use daplink_rs::{BitbangDap, NoBootloader, RebootVendor, StatusLed};
-    use daplink_stm32f1_hal::{probe_parts_stlinkv2, DynCycleDelay, IoPin, LedPin, Usart1Swo};
-    use daplink_usb_device::DapUsbNoVcom;
+    #[cfg(all(not(feature = "conntest"), not(feature = "accel")))]
+    use daplink_rs::BitbangDap as SelectedDap;
+    use daplink_rs::{NoBootloader, RebootVendor, StatusLed};
+    #[cfg(feature = "conntest")]
+    use daplink_rs::{NoSwo as SelectedSwo, SwdOnlyDap as SelectedDap};
+    #[cfg(feature = "conntest")]
+    use daplink_stm32f1_hal::probe_parts_stlinkv2_swd as probe_parts_stlinkv2;
+    #[cfg(not(feature = "conntest"))]
+    use daplink_stm32f1_hal::{probe_parts_stlinkv2, Usart1Swo as SelectedSwo};
+    use daplink_stm32f1_hal::{DynCycleDelay, IoPin, LedPin};
+    #[cfg(feature = "accel")]
+    use daplink_stm32f1_spi_swd::SpiSwdJtagDap as SelectedDap;
+    use daplink_usb_device::{dap_pass, DapPassHooks, DapUsbNoVcom};
     use static_cell::ConstStaticCell;
+    use stm32f1xx_hal::pac::Interrupt;
     use stm32f1xx_hal::usb::{Peripheral, UsbBus};
 
-    /// The USB-FS bus this firmware's device is built on.
     type Bus = UsbBus<Peripheral>;
 
-    /// The PA9 activity LED's concrete `DapLeds` type: active-low (the pin sinks to light it).
+    /// The PA9 activity LED, active-low.
     type StatusLedType = StatusLed<LedPin>;
 
-    /// The reboot-to-bootloader vendor command, honestly declined: the F103's ROM bootloader is
-    /// USART-only, so there is no software-reachable USB update path to reboot into.
+    /// The USART-only ROM bootloader offers no USB update path.
     type Vendor = RebootVendor<NoBootloader>;
 
-    /// The bit-bang SWD+JTAG engine, with USART1-RX SWO capture in its SWO slot.
-    type Engine = BitbangDap<'static, IoPin, DynCycleDelay, Usart1Swo, Vendor, StatusLedType>;
+    #[cfg(not(feature = "accel"))]
+    type Engine = SelectedDap<'static, IoPin, DynCycleDelay, SelectedSwo, Vendor, StatusLedType>;
 
-    /// Core cycles of fixed bit-cell work subtracted from every requested half-period delay;
-    /// swept for this pin path at 72 MHz, so re-sweep after an `opt-level` change.
-    const SWD_FIXED_WORK_CYCLES: u32 = 8;
+    #[cfg(feature = "accel")]
+    type Engine = SelectedDap<
+        'static,
+        crate::spi_swd::Board,
+        IoPin,
+        DynCycleDelay,
+        crate::spi_swd::F1JtagPacing,
+        SelectedSwo,
+        Vendor,
+        StatusLedType,
+    >;
 
-    /// Floor on the residual spin, in core cycles; zero lets a saturated request run flat out.
+    #[cfg(feature = "conntest")]
+    type Scanner = crate::conntest::Control;
+    #[cfg(not(feature = "conntest"))]
+    type Scanner = ();
+
+    /// No fixed work: a write's ACK-to-turnaround cell is two halves of bare store and spin.
+    const SWD_FIXED_WORK_CYCLES: u32 = 0;
+
+    /// Floor on the residual spin, in core cycles; zero runs flat out.
     const MIN_HALF_PERIOD_CYCLES: u32 = 0;
 
-    /// Pipelined CMSIS-DAP command-queue depth, also the advertised `DAP_PACKET_COUNT`.
-    const DAP_QUEUE_DEPTH: usize = 4;
+    /// Command-queue depth, also the advertised `DAP_PACKET_COUNT`.
+    const DAP_QUEUE_DEPTH: usize = 8;
 
-    /// Per-slot byte capacity of the command queue: one full-speed DAP v2 bulk packet.
+    /// Maximum commands executed in one USB interrupt activation.
+    const DAP_COMMAND_BUDGET: usize = 1;
+
     const DAP_QUEUE_SLOT: usize = DAP_PACKET_SIZE as usize;
 
-    /// This image's command queue: the depth the host is told about and the storage behind it.
     type Queue = DapQueue<DAP_QUEUE_DEPTH, DAP_QUEUE_SLOT>;
 
-    /// The `DAP_Info(MaxPacketCount)` this image advertises; fed to the engine below.
-    const DAP_PACKET_COUNT: u8 = 4;
+    const DAP_PACKET: PacketSize = daplink_usb_device::single_transfer_packet(
+        Queue::packet_size::<DAP_PACKET_SIZE>(),
+        DAP_ENDPOINT,
+    );
 
-    // Advertised count, ring depth and slot size are one fact; widening one alone fails the build.
+    const DAP_ENDPOINT: EndpointSize = Queue::endpoint_size::<DAP_PACKET_SIZE>();
+
+    const DAP_PACKET_COUNT: u8 = DAP_QUEUE_DEPTH as u8;
+
+    // Advertised count, ring depth and slot size are one fact.
     const _: () = {
+        assert!(DAP_QUEUE_DEPTH <= u8::MAX as usize);
         assert!(Queue::new().depth() == DAP_PACKET_COUNT as usize);
         assert!(Queue::new().packet_capacity() == DAP_PACKET_SIZE as usize);
+        assert!(DAP_COMMAND_BUDGET > 0 && DAP_COMMAND_BUDGET <= DAP_QUEUE_DEPTH);
     };
 
     #[shared]
@@ -62,8 +107,8 @@ mod app {
     struct Local {
         usb: DapUsbNoVcom<'static, Bus>,
         dap: Engine,
-        /// Caller-owned command queue, filled and drained by the USB task in the same pass.
         dap_queue: &'static mut Queue,
+        scanner: Scanner,
     }
 
     #[init]
@@ -74,25 +119,45 @@ mod app {
             MIN_HALF_PERIOD_CYCLES,
         );
         let parts = probe_parts_stlinkv2(cx.device, delay);
-        let cfg = DapConfig::daplink(parts.serial).with_product(product_string!("stlinkv2"));
+        #[cfg(not(feature = "accel"))]
+        let deps = parts.deps;
+        #[cfg(feature = "accel")]
+        let deps = crate::spi_swd::accel_deps(delay);
+        #[cfg(not(feature = "conntest"))]
+        let product = product_string!("stlinkv2");
+        #[cfg(feature = "conntest")]
+        let product = product_string!("stlinkv2-conntest");
+        let cfg = DapConfig::daplink(parts.serial, DAP_ENDPOINT).with_product(product);
+        let identity = daplink_rs::daplink_core::Identity {
+            vendor: cfg.manufacturer,
+            product: cfg.product,
+            serial: cfg.serial,
+            board_vendor: "daplink-rs",
+            board_name: "stlinkv2",
+        };
 
         let led = StatusLed::new_active_low(parts.led);
-        let dap: Engine = BitbangDap::with_vendor(
-            parts.deps,
+        let dap: Engine = SelectedDap::with_vendor(
+            deps,
             led,
             delay,
             parts.swo,
             DAP_FW_VERSION,
-            cfg.max_packet_size,
+            DAP_PACKET,
             RebootVendor::new(NoBootloader),
         )
-        .with_packet_count(DAP_PACKET_COUNT);
+        .with_packet_count(DAP_PACKET_COUNT)
+        .with_identity(identity);
 
-        let usb = DapUsbNoVcom::new(parts.usb_alloc, &cfg);
+        let usb = DapUsbNoVcom::new(parts.usb_alloc, &cfg)
+            .with_endpoint_repair(&daplink_stm32f1_hal::ENDPOINT_REPAIR);
 
-        // Caller-owned queue storage; `DAP_PACKET_COUNT` above names the same depth.
         static DAP_QUEUE: ConstStaticCell<Queue> = ConstStaticCell::new(Queue::new());
         let dap_queue = DAP_QUEUE.take();
+        #[cfg(feature = "conntest")]
+        let scanner = crate::conntest::Control::new(cx.core.DCB, cx.core.DWT);
+        #[cfg(not(feature = "conntest"))]
+        let scanner = ();
 
         (
             Shared {},
@@ -100,65 +165,47 @@ mod app {
                 usb,
                 dap,
                 dap_queue,
+                scanner,
             },
         )
     }
 
-    /// Idle: everything is serviced from the USB interrupt, SWO capture included.
-    #[idle]
-    fn idle(_: idle::Context) -> ! {
+    #[idle(local = [scanner])]
+    fn idle(cx: idle::Context) -> ! {
+        let _ = &cx.local.scanner;
         loop {
+            #[cfg(feature = "conntest")]
+            cx.local.scanner.poll();
+            #[cfg(not(feature = "conntest"))]
             cortex_m::asm::wfi();
         }
     }
 
-    /// USB interrupt: pump the pipelined CMSIS-DAP queue.
+    struct Pass<'a> {
+        dap: &'a mut Engine,
+    }
+
+    impl DapPassHooks for Pass<'_> {
+        // Keep the engine outside the USB pass to fit the 64 KiB flash.
+        #[inline(never)]
+        fn execute(&mut self, request: &[u8], response: &mut [u8]) -> usize {
+            self.dap.process_command(request, response)
+        }
+
+        fn session_reset(&mut self) {
+            self.dap.suspend();
+        }
+    }
+
     #[task(binds = USB_LP_CAN_RX0, local = [usb, dap, dap_queue])]
     fn on_usb(cx: on_usb::Context) {
         let usb = cx.local.usb;
-        let dap = cx.local.dap;
         let dap_queue = &mut **cx.local.dap_queue;
-        if usb.poll() {
-            if usb.session_ended() {
-                // Host gone: drop the dead session's queue and release the wire.
-                dap_queue.reset();
-                dap.suspend();
-            }
-
-            // Skip the OUT endpoint while the ring is full, so it NAKs the host into pacing itself.
-            let mut buf = [0u8; DAP_QUEUE_SLOT];
-            if !dap_queue.requests_full() {
-                if let Some(n) = usb.read_command(&mut buf) {
-                    if dap_queue.submit(&buf[..n]).is_err() {
-                        debug_assert!(false, "request refused by a checked-non-full ring");
-                    }
-                }
-            }
-
-            // Run queued commands oldest first, never dequeuing with nowhere to put the response.
-            let mut resp = [0u8; DAP_QUEUE_SLOT];
-            let mut executed = 0;
-            while executed < DAP_QUEUE_DEPTH {
-                if dap_queue.responses_full() {
-                    break;
-                }
-                let Some(n) = dap_queue.take_request(&mut buf) else {
-                    break;
-                };
-                let len = dap.process_command(&buf[..n], &mut resp);
-                if len > 0 && dap_queue.post_response(&resp[..len]).is_err() {
-                    debug_assert!(false, "response ring full after a reserved slot");
-                }
-                executed += 1;
-            }
-
-            // Send whatever is ready, stopping at the first busy-endpoint refusal.
-            while let Some(n) = dap_queue.peek_response(&mut resp) {
-                if !usb.write_response(&resp[..n]) {
-                    break;
-                }
-                dap_queue.discard_response();
-            }
+        let polled = usb.poll();
+        let mut hooks = Pass { dap: cx.local.dap };
+        let dap_work_remains = dap_pass(dap_queue, usb, &mut hooks, polled, DAP_COMMAND_BUDGET);
+        if dap_work_remains {
+            NVIC::pend(Interrupt::USB_LP_CAN_RX0);
         }
     }
 }

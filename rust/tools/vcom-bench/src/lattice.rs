@@ -57,8 +57,7 @@ pub const DEFAULT_SUSTAIN_RUNGS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// Whether a short message still round-trips: the console question, asked of every rung and
-    /// independent of what a saturating stream can hold.
+    /// Whether a short message still round-trips at every rung, independent of the stream ceiling.
     Message,
     /// Which rungs hold a short saturating stream, across the whole pruned lattice.
     Sweep,
@@ -117,8 +116,7 @@ pub struct StagedOutcome {
     pub screen_exhausted: bool,
 }
 
-/// Escalate a pairing through sweep, screen, and sustain, stopping at the first ceiling each stage
-/// confirms.
+/// Escalate through sweep, screen and sustain, stopping at the first ceiling each confirms.
 pub fn staged(
     len: usize,
     limits: StagedLimits,
@@ -131,8 +129,7 @@ pub fn staged(
         };
     }
 
-    // The console question first, and over the whole lattice: a short message can survive a rate
-    // at which a saturating duplex stream misses its bar, so this ceiling is its own.
+    // A short message can survive a rate a saturating stream fails, so its ceiling is separate.
     let mut message = None;
     for index in 0..len {
         if run!(Stage::Message, index, &mut out) {
@@ -151,11 +148,7 @@ pub fn staged(
     }
     out.swept = correct.last().copied();
 
-    // The sweep's window is short enough that startup transients dominate it, so a rung it failed
-    // above the swept ceiling is a candidate, not a verdict. Re-ask those at the screen window
-    // before the search files the rung below as the top: a sweep failure must never become a
-    // ceiling unconfirmed. A rung that holds is screened, so the walk costs a window only where it
-    // buys one, plus the single failing window that stops it.
+    // A sweep failure above the swept ceiling is a candidate; the screen re-asks it before it counts.
     let mut screened = None;
     if let Some(&top) = correct.last() {
         for index in top + 1..len {
@@ -185,8 +178,7 @@ pub fn staged(
     let Some(screened) = screened else {
         return out;
     };
-    // Descend until both ceilings are known: a rung can carry its budget with counted loss well
-    // above the highest rung that is byte-exact, and the pairing's numbers are both of them.
+    // Descend until both the qualified and the byte-exact ceilings are known.
     let below = correct.iter().rev().skip_while(|&&i| i > screened);
     for &index in below.take(limits.sustain_rungs) {
         let grade = run_graded(Stage::Sustain, index, &mut out, &mut test);
@@ -288,9 +280,7 @@ mod tests {
             .all(|(s, i)| matches!(s, Stage::Message | Stage::Sweep) || correct[*i] || *i == 9));
     }
 
-    /// The sweep window is short enough to fail a rung a longer one holds. Where that rung is the
-    /// top of the lattice the old search filed the rung below as the ceiling with nothing to catch
-    /// it, so the screen re-asks every rung above the swept ceiling before accepting it.
+    /// A rung the short sweep fails but a screen holds is still found at the top of the lattice.
     #[test]
     fn a_rung_the_sweep_failed_at_the_top_is_re_asked_before_a_ceiling_is_filed() {
         let mut runs = Vec::new();
@@ -336,7 +326,7 @@ mod tests {
 
     #[test]
     fn a_short_message_carries_past_the_rung_where_the_stream_gives_up() {
-        // The shape the F411 pairings show: a console works two rungs above the stream ceiling.
+        // A console that works two rungs above the stream ceiling.
         let message: Vec<bool> = (0..12).map(|i| i <= 8).collect();
         let correct: Vec<bool> = (0..12).map(|i| i <= 6).collect();
         let (out, runs) = messaging(&message, &correct, 6, 6);

@@ -6,16 +6,12 @@ extern "C" {
     /// First device-interrupt vector, emitted by `cortex-m-rt`.
     static __INTERRUPTS: u8;
 
-    /// The weak fallback every unoverridden vector points at.
     fn DefaultHandler();
 }
 
-/// Disable every enabled NVIC line whose vector is still `DefaultHandler`, returning the count.
-///
-/// Call once, immediately after `embassy_stm32::init` and before enabling interrupts of your own.
+/// Disable every enabled NVIC line still vectored to `DefaultHandler`; call right after `init`.
 ///
 /// # Safety
-///
 /// No interrupt this disables may be serviced other than through its vector-table entry.
 pub unsafe fn mask_unhandled_interrupts() -> u32 {
     // Both sides carry the Thumb bit; compare the instruction addresses.

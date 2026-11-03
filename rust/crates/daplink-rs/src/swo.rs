@@ -4,8 +4,7 @@ use dap_rs::swo::{Swo, SwoControl, SwoMode, SwoStatus, SwoSupport, SwoTransport}
 
 use crate::ring::ByteConsumer;
 
-/// Where [`RingSwo`] takes captured bytes from: a [`ByteConsumer`] for an interrupt-fed capture,
-/// or a platform's DMA ring for a controller-fed one.
+/// Where [`RingSwo`] takes captured bytes from: a [`ByteConsumer`] or a platform DMA ring.
 pub trait SwoSource {
     /// Bytes buffered right now.
     fn len(&self) -> usize;
@@ -46,24 +45,19 @@ impl<const N: usize> SwoSource for ByteConsumer<'_, N> {
     }
 }
 
-/// Per-platform SWO capture mechanism: baud programming and capture arm/stop. The session
-/// choreography and dap-rs surface live in [`RingSwo`]; a backend supplies only the raw peripheral.
+/// Per-platform SWO capture: baud programming and capture arm/stop.
 pub trait SwoBackend {
-    /// Reprogram the capture baud; returns the realized baud (0 = failed). Called only with
-    /// `baud > 0` -- [`RingSwo`] handles the zero guard.
+    /// Reprogram the capture baud, returning the realized baud (0 = failed); `baud` is never 0.
     fn set_baudrate(&mut self, baud: u32) -> u32;
-    /// Halt capture and drop every byte in flight (hardware FIFO included), so nothing that
-    /// predates the session survives it. Leaves capture stopped until [`arm`](SwoBackend::arm).
+    /// Halt capture and drop every byte in flight, leaving it stopped until [`arm`](SwoBackend::arm).
     fn prepare(&mut self);
-    /// Start capture. Called after [`prepare`](SwoBackend::prepare) and a source clear, so a
-    /// backend may re-base its transfer here.
+    /// Start capture, after [`prepare`](SwoBackend::prepare) and a source clear.
     fn arm(&mut self);
     /// Halt capture, leaving whatever the source already holds readable.
     fn stop(&mut self);
 }
 
-/// dap-rs [`Swo`] slot over a ring-fed capture backend: UART-only, non-streaming, polled through
-/// `DAP_SWO_Data`. Wraps an [`SwoBackend`] mechanism plus the [`SwoSource`] it fills.
+/// dap-rs [`Swo`] slot over a ring-fed backend: UART-only, polled through `DAP_SWO_Data`.
 pub struct RingSwo<HW: SwoBackend, SRC: SwoSource> {
     hw: HW,
     src: SRC,
@@ -109,11 +103,17 @@ impl<HW: SwoBackend, SRC: SwoSource> Swo for RingSwo<HW, SRC> {
     }
 
     fn set_baudrate(&mut self, baudrate: u32) -> u32 {
-        if baudrate == 0 {
-            return 0;
-        }
-        let realized = self.hw.set_baudrate(baudrate);
+        let realized = if baudrate == 0 {
+            0
+        } else {
+            self.hw.set_baudrate(baudrate)
+        };
         self.baud_set = realized != 0;
+        // A rejected rate leaves capture stopped, so the host never sees it running unconfigured.
+        if !self.baud_set && self.active {
+            self.hw.stop();
+            self.active = false;
+        }
         realized
     }
 
@@ -227,6 +227,47 @@ mod tests {
         assert!(swo.set_control(SwoControl::Stop));
         assert!(!swo.is_active());
         assert_eq!(swo.hw.log.last(), Some(&"stop"));
+    }
+
+    #[test]
+    fn polling_drains_in_order_and_status_reports_overrun_once() {
+        let mut ring: ByteRing<8> = ByteRing::new();
+        let (mut p, cons) = ring.split();
+        for b in 0..9 {
+            p.push(b); // the last two overrun the 7-byte ring
+        }
+        let mut swo = RingSwo::new(MockHw { log: Vec::new() }, cons);
+        assert_eq!(swo.buffer_size(), 7);
+        assert_eq!(swo.bytes_available(), 7);
+        let mut buf = [0u8; 4];
+        assert_eq!(swo.polling_data(&mut buf), 4);
+        assert_eq!(buf, [0, 1, 2, 3]);
+        assert_eq!(swo.bytes_available(), 3);
+        let status = swo.status();
+        assert!(status.trace_overrun);
+        assert!(!status.active && !status.trace_error);
+        assert_eq!(status.bytes_available, 3);
+        assert!(!swo.status().trace_overrun, "cleared by the read");
+        let mut rest = [0u8; 8];
+        assert_eq!(swo.polling_data(&mut rest), 3);
+        assert_eq!(rest[..3], [4, 5, 6]);
+        assert_eq!(swo.polling_data(&mut rest), 0);
+        assert_eq!(swo.bytes_available(), 0);
+    }
+
+    #[test]
+    fn rejected_baud_stops_capture() {
+        for rejected in [1, 0] {
+            let mut ring: ByteRing<8> = ByteRing::new();
+            let (_p, cons) = ring.split();
+            let mut swo = RingSwo::new(MockHw { log: Vec::new() }, cons);
+            assert_eq!(swo.set_baudrate(1_000_000), 500_000);
+            assert!(swo.set_control(SwoControl::Start));
+            assert_eq!(swo.set_baudrate(rejected), 0);
+            assert!(!swo.is_active() && !swo.status().active, "baud {rejected}");
+            assert_eq!(swo.hw.log.last(), Some(&"stop"), "baud {rejected}");
+            assert!(!swo.set_control(SwoControl::Start), "no rate configured");
+        }
     }
 
     #[test]

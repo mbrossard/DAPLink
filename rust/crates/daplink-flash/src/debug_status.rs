@@ -1,20 +1,19 @@
 //! Decoded `defmt` reports of the debug registers, each naming when the value was observed.
 
 use crate::swd_host_core::{
-    CDBGPWRUPACK, CSYSPWRUPACK, C_DEBUGEN, C_HALT, S_HALT, S_REGRDY, TRCENA, VC_CORERESET,
+    CDBGPWRUPACK, CSYSPWRUPACK, C_DEBUGEN, C_HALT, S_HALT, S_LOCKUP, S_REGRDY, VC_CORERESET,
+    VC_HARDERR,
 };
 
-/// The core is locked up (an unrecoverable fault).
-const S_LOCKUP: u32 = 1 << 19;
+/// Trace enable; decoded here only, since a session never sets it.
+const TRCENA: u32 = 1 << 24;
+
 /// The core is sleeping (WFI/WFE).
 const S_SLEEP: u32 = 1 << 18;
 /// An instruction retired since this bit was last read. Clear-on-read.
 const S_RETIRE_ST: u32 = 1 << 24;
 /// The core has been reset, or is being reset, since this bit was last read. Clear-on-read.
 const S_RESET_ST: u32 = 1 << 25;
-
-/// Catch a HardFault as a debug event.
-const VC_HARDERR: u32 = 1 << 10;
 
 /// A transaction returned FAULT and latched an error.
 const STICKYERR: u32 = 1 << 5;

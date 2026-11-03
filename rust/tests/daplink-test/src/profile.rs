@@ -36,8 +36,7 @@ impl std::str::FromStr for Req {
     }
 }
 
-/// Which side withheld a requirement: the probe's rig profile, the target's own wiring, or an
-/// operator override.
+/// Which side withheld a requirement: rig profile, target wiring, or operator override.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Side {
     Profile,
@@ -53,6 +52,14 @@ pub(crate) struct Profile {
 
 /// Known rig profiles; names the rig shape, not a bench serial.
 pub(crate) const PROFILES: &[Profile] = &[
+    Profile {
+        name: "stlinkv2",
+        supports: &[Req::Jtag, Req::Swo, Req::Nreset],
+    },
+    Profile {
+        name: "stlinkv2-conntest",
+        supports: &[Req::Nreset],
+    },
     Profile {
         name: "rp2040-pico",
         supports: &[Req::Jtag, Req::Swo, Req::Vcom, Req::Nreset],
@@ -84,13 +91,11 @@ pub(crate) const PROFILES: &[Profile] = &[
     },
 ];
 
-/// Look up a profile by name.
 pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
     PROFILES.iter().find(|p| p.name == name)
 }
 
-/// The first requirement unmet by (profile and target caps) minus disabled, and which side
-/// withheld it; an absent profile gates nothing.
+/// The first requirement unmet by profile and target caps minus disabled, and which side withheld it.
 pub(crate) fn missing_requirement(
     profile: Option<&Profile>,
     target_caps: Option<&[Req]>,

@@ -20,11 +20,6 @@ Dependencies point toward portable mechanisms: firmware depends on platform and 
 while reusable crates do not select a board. Accelerated wire backends expose narrow register or
 pin seams that platform and firmware code complete.
 
-CMSIS-DAP, target flashing, VCOM, SWO, and mass storage share hardware only through explicit
-composition and ownership boundaries. Firmware type aliases and constructors make those choices
-visible at the composition root; a build feature selects a supported product variant rather than
-hiding runtime policy inside a reusable crate.
-
 The [crate reference](reference/crates.md) identifies each workspace. The
 [composition design](design/composition.md) explains how a firmware fills these layers with
 concrete types and values.

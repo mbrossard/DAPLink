@@ -1,5 +1,4 @@
-//! The CMSIS-DAP vendor flash commands: a sequential image stream decoded straight into a
-//! [`TransferSink`], with the command ids and framing of the C firmware's vendor surface.
+//! CMSIS-DAP vendor flash commands: a sequential image stream decoded into a [`TransferSink`].
 
 use daplink_core::vendor::VendorHandler;
 use daplink_core::FlashPhase;
@@ -76,7 +75,7 @@ fn stream_format(stream_type: u8) -> Option<Format> {
     }
 }
 
-/// Scratchpad bytes reserved for a record/block straddling two chunks; matches the transfer engine.
+/// Scratchpad for a block straddling two chunks; matches the transfer engine.
 const SCRATCH: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,8 +85,7 @@ enum State {
     Failed,
 }
 
-/// The vendor flash-stream protocol state, over the accepted-format set `D`. A vendor stream is
-/// sequential, so chunks reach the decoder as they arrive and never need a write-order queue.
+/// The vendor flash-stream state over format set `D`; sequential, so no write-order queue.
 pub struct VendorFlashStream<D: DecoderSet> {
     state: State,
     fmt: Format,
@@ -118,11 +116,6 @@ impl<D: DecoderSet> VendorFlashStream<D> {
             head: [0u8; 4],
             head_len: 0,
         }
-    }
-
-    /// Whether an image stream is currently open (including one that has already failed).
-    pub fn is_open(&self) -> bool {
-        self.state != State::Closed
     }
 
     /// Handle one vendor command against `sink`; commands outside the flash set are declined.
@@ -197,6 +190,7 @@ impl<D: DecoderSet> VendorFlashStream<D> {
                 // The bytes must actually be the format the host opened.
                 if D::detect(&self.head) != Some(self.fmt) {
                     self.state = State::Failed;
+                    sink.end(TransferOutcome::DecodeError);
                     return status::DURING_TRANSFER;
                 }
             }
@@ -214,6 +208,8 @@ impl<D: DecoderSet> VendorFlashStream<D> {
         };
         if decoded.is_err() {
             self.state = State::Failed;
+            // Release the session now: a host that stops at this reply never sends the close.
+            sink.end(TransferOutcome::DecodeError);
             return status::DURING_TRANSFER;
         }
         // The sink latches a flash failure without failing the fragment; surface it on this reply.
@@ -249,6 +245,10 @@ impl<D: DecoderSet> VendorFlashStream<D> {
             TransferOutcome::DecodeError
         };
         sink.end(outcome);
+        // The sink may refuse a clean stream, as it does one that flashed nothing.
+        if status == status::SUCCESS && sink.last_failed() {
+            status = status::DURING_TRANSFER;
+        }
         // A phase latched by the sink names the failure more precisely than the decode verdict.
         if let Some(phase) = sink.latched_phase() {
             status = phase_status(phase);
@@ -258,12 +258,25 @@ impl<D: DecoderSet> VendorFlashStream<D> {
         self.check_head = true;
         self.head_len = 0;
         self.state = State::Closed;
+        // Chip erase is chosen per stream, so a later client cannot inherit it.
+        sink.set_sector_erase(true);
         status
+    }
+
+    /// End a stream whose host is gone: the session closes as failed and the next open succeeds.
+    pub fn abort<S: TransferSink>(&mut self, sink: &mut S) {
+        if self.state != State::Closed {
+            sink.end(TransferOutcome::DecodeError);
+            self.decoder = None;
+            self.fmt = Format::Unknown;
+            self.check_head = true;
+            self.head_len = 0;
+            self.state = State::Closed;
+        }
     }
 }
 
-/// A [`VendorHandler`] owning the sink it streams into, for a firmware whose vendor surface is
-/// that sink's only writer.
+/// A [`VendorHandler`] owning the sink it streams into.
 pub struct VendorFlash<D: DecoderSet, S: TransferSink> {
     stream: VendorFlashStream<D>,
     sink: S,
@@ -288,6 +301,11 @@ impl<D: DecoderSet, S: TransferSink> VendorFlash<D, S> {
         &mut self.sink
     }
 
+    /// End a stream whose host is gone.
+    pub fn abort(&mut self) {
+        self.stream.abort(&mut self.sink);
+    }
+
     /// Borrow the protocol state.
     pub fn stream(&self) -> &VendorFlashStream<D> {
         &self.stream
@@ -297,6 +315,10 @@ impl<D: DecoderSet, S: TransferSink> VendorFlash<D, S> {
 impl<D: DecoderSet, S: TransferSink> VendorHandler for VendorFlash<D, S> {
     fn handle(&mut self, report: &[u8], response: &mut [u8]) -> Option<usize> {
         self.stream.handle(report, response, &mut self.sink)
+    }
+
+    fn session_reset(&mut self) {
+        self.abort();
     }
 }
 
@@ -320,6 +342,7 @@ mod tests {
         fail_program: bool,
         sector_erase: Option<bool>,
         programmed: Vec<(u32, Vec<u8>)>,
+        require_family: bool,
     }
 
     impl MockBackend {
@@ -330,6 +353,7 @@ mod tests {
                 fail_program: false,
                 sector_erase: None,
                 programmed: Vec::new(),
+                require_family: false,
             }
         }
     }
@@ -361,6 +385,12 @@ mod tests {
         fn flash_ranges(&self) -> &[(u32, u32)] {
             self.ranges
         }
+        fn requires_uf2_family(&self) -> bool {
+            self.require_family
+        }
+        fn expected_uf2_family(&self) -> Option<u32> {
+            self.require_family.then_some(FAMILY)
+        }
     }
 
     type Handler = VendorFlash<AllDecoders, FlashSink<MockBackend>>;
@@ -369,7 +399,6 @@ mod tests {
         VendorFlash::new(FlashSink::new(MockBackend::new()))
     }
 
-    /// Run one command and return `(response length, status byte)`.
     fn cmd(h: &mut Handler, report: &[u8]) -> (usize, u8) {
         let mut resp = [0u8; 64];
         let len = h
@@ -426,8 +455,43 @@ mod tests {
         assert_eq!(&be.programmed[0].1[..], &bin[..256]);
     }
 
-    /// frozen: these command ids and status bytes are the wire contract host tools hard-code, so
-    /// a renumber must fail here rather than at a host integration test.
+    #[test]
+    fn chip_erase_selection_ends_with_its_stream() {
+        let mut h = handler();
+        cmd(&mut h, &[ID_DAP_SELECT_ERASE_MODE, 0x00]);
+        assert_eq!(h.sink().backend().sector_erase, Some(false));
+        open(&mut h);
+        close(&mut h);
+        assert_eq!(h.sink().backend().sector_erase, Some(true));
+    }
+
+    #[test]
+    fn multi_target_vendor_stream_rejects_missing_families() {
+        for block_index in [0, 1] {
+            let mut uf2 = bin_to_uf2(&[0xAA; 512], BASE, FAMILY);
+            uf2[block_index * 512..][8..12].fill(0);
+            let mut h = VendorFlash::new(FlashSink::new(MockBackend {
+                require_family: true,
+                ..MockBackend::new()
+            }));
+            assert_eq!(open(&mut h), status::SUCCESS);
+            assert_eq!(
+                stream_in(&mut h, &uf2, 60),
+                phase_status(FlashPhase::Family)
+            );
+            assert_ne!(close(&mut h), status::SUCCESS);
+            assert_eq!(
+                h.sink().outcome(),
+                Some(TransferOutcome::FlashError(FlashPhase::Family))
+            );
+            assert_eq!(h.sink().backend().programmed.len(), block_index);
+            if block_index == 0 {
+                assert!(h.sink().backend().calls.is_empty());
+            }
+        }
+    }
+
+    /// Frozen: host tools hard-code these command ids and status bytes.
     #[test]
     fn vendor_flash_ids_and_status_bytes_are_pinned() {
         assert_eq!(ID_DAP_MSD_OPEN, 0x8A);
@@ -448,7 +512,6 @@ mod tests {
         assert_eq!(status::DAP_OK, 0x00);
         assert_eq!(status::DAP_ERROR, 0xFF);
 
-        // (request bytes, expected reply status byte), run against the real handler.
         let cases: &[(&[u8], u8)] = &[
             (&[ID_DAP_MSD_OPEN, STREAM_TYPE_UF2], status::SUCCESS),
             (&[ID_DAP_MSD_OPEN, STREAM_TYPE_BIN], status::INTERNAL),
@@ -575,7 +638,7 @@ mod tests {
         assert_eq!(close(&mut h), status::INTERNAL);
         assert_eq!(open(&mut h), status::SUCCESS);
         assert_eq!(open(&mut h), status::INTERNAL);
-        assert_eq!(close(&mut h), status::SUCCESS);
+        assert_eq!(close(&mut h), status::DURING_TRANSFER); // nothing was flashed
         assert_eq!(write(&mut h, &[0u8; 4]), status::INTERNAL);
     }
 

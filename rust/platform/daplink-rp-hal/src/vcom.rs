@@ -13,12 +13,9 @@ use daplink_rs::{
 use rp2040_hal::pac::{Interrupt, UART1};
 use static_cell::StaticCell;
 
-use crate::CPU_HZ;
-
 const RX_RING: usize = 2048;
 const TX_RING: usize = 128;
 const IRQ_FIFO_BUDGET: usize = 32;
-const CLK_PERI_HZ: u32 = CPU_HZ;
 
 pub type VcomRxProducer = ByteProducer<'static, RX_RING>;
 pub type VcomRxConsumer = ByteConsumer<'static, RX_RING>;
@@ -38,7 +35,7 @@ pub struct VcomUsb {
 static UART_RX: AtomicU32 = AtomicU32::new(0);
 /// Bytes staged toward the CDC IN endpoint, before the discards deducted at the query.
 static CDC_IN: AtomicU32 = AtomicU32::new(0);
-/// Staged bytes a port close or a bus reset threw away; the only source `host_dropped` has.
+/// Bytes a close or bus reset threw away, staged or still in the ring: all of `host_dropped`.
 static DISCARDED: AtomicU32 = AtomicU32::new(0);
 static CDC_OUT: AtomicU32 = AtomicU32::new(0);
 static RING_FULL: AtomicU32 = AtomicU32::new(0);
@@ -50,6 +47,10 @@ static APPLIED_BAUD: AtomicU32 = AtomicU32::new(115_200);
 static PENDING_BAUD: AtomicU32 = AtomicU32::new(0);
 
 fn add(counter: &AtomicU32, value: u32) {
+    // Host tests have no PRIMASK to mask.
+    #[cfg(test)]
+    counter.fetch_add(value, Ordering::Relaxed);
+    #[cfg(not(test))]
     cortex_m::interrupt::free(|_| {
         counter.store(
             counter.load(Ordering::Relaxed).wrapping_add(value),
@@ -75,7 +76,7 @@ pub fn vcom_split() -> (VcomIrq, VcomUsb) {
     )
 }
 
-pub fn vcom_irq_service(vcom: &mut VcomIrq) {
+pub fn vcom_irq_service<const CLK_PERI_HZ: u32>(vcom: &mut VcomIrq) {
     // SAFETY: UART1 FIFO access belongs exclusively to this interrupt.
     let uart = unsafe { &*UART1::ptr() };
     if uart.uartris().read().oeris().bit_is_set() {
@@ -103,14 +104,16 @@ pub fn vcom_irq_service(vcom: &mut VcomIrq) {
         uart.uartdr().write(|w| unsafe { w.data().bits(byte) });
         transmitted += 1;
     }
-    // Credited at `UARTDR`, so it runs ahead of the wire by at most 33 bytes -- the 32-entry
-    // PL011 transmit FIFO plus the shifter -- and is exact whenever the line is quiet.
+    // Credited at `UARTDR`, so it leads the wire by at most the 32-entry FIFO plus the shifter.
     add(&UART_TX, transmitted as u32);
     let mut pending = PENDING_BAUD.load(Ordering::Relaxed);
     if vcom.tx.is_empty() && pending != 0 && uart.uartfr().read().busy().bit_is_clear() {
-        program_baud(uart, pending);
-        // A plain store, since ARMv6-M has no CAS: a request arriving during the programming is
-        // cleared with it, and the host's next line coding re-requests it.
+        #[cfg(feature = "defmt")]
+        let previous = log_baud_move(uart, vcom, pending);
+        program_baud::<CLK_PERI_HZ>(uart, pending);
+        #[cfg(feature = "defmt")]
+        log_baud_moved(uart, vcom, previous, pending);
+        // A plain store (no CAS on ARMv6-M): a request landing mid-programming waits for the next line coding.
         PENDING_BAUD.store(0, Ordering::Release);
         pending = 0;
     }
@@ -118,8 +121,76 @@ pub fn vcom_irq_service(vcom: &mut VcomIrq) {
         .modify(|_, w| w.txim().bit(!vcom.tx.is_empty() || pending != 0));
 }
 
-/// Unmask TXIM and pend UART1: the PL011 raises that interrupt on a transmit-FIFO level
-/// transition, so an already-idle transmitter would otherwise never enter the handler.
+/// Ring bytes buffered, read from the producer half this interrupt owns.
+#[cfg(feature = "defmt")]
+fn rx_ring_used(vcom: &VcomIrq) -> usize {
+    RX_RING - 1 - vcom.rx.remaining_capacity()
+}
+
+/// Report the receive state the divisor move leaves behind, returning the rate it leaves.
+#[cfg(feature = "defmt")]
+fn log_baud_move(
+    uart: &rp2040_hal::pac::uart1::RegisterBlock,
+    vcom: &mut VcomIrq,
+    pending: u32,
+) -> u32 {
+    let flags = uart.uartfr().read();
+    let (rxfe, busy) = (flags.rxfe().bit_is_set(), flags.busy().bit_is_set());
+    let previous = APPLIED_BAUD.load(Ordering::Relaxed);
+    let mut scratch = [0u8; IRQ_FIFO_BUDGET];
+    let mut residue = 0;
+    let mut errors = 0;
+    while residue < scratch.len() && uart.uartfr().read().rxfe().bit_is_clear() {
+        let word = uart.uartdr().read();
+        if word.fe().bit_is_set() || word.pe().bit_is_set() || word.be().bit_is_set() {
+            errors += 1;
+        } else {
+            scratch[residue] = word.data().bits();
+            residue += 1;
+        }
+    }
+    let first = if residue > 0 { scratch[0] } else { 0 };
+    defmt::info!(
+        "vcom baud move: {=u32}->{=u32} fifo={=usize} err={=usize} first={=u8:#04x} ring={=usize} rxfe={=bool} busy={=bool}",
+        previous,
+        pending,
+        residue,
+        errors,
+        first,
+        rx_ring_used(vcom),
+        rxfe,
+        busy
+    );
+    add(&FRAME_ERR, errors as u32);
+    for &byte in &scratch[..residue] {
+        if !vcom.rx.push(byte) {
+            add(&RING_FULL, 1);
+        }
+    }
+    previous
+}
+
+/// Report the receive state the new divisor starts from.
+#[cfg(feature = "defmt")]
+fn log_baud_moved(
+    uart: &rp2040_hal::pac::uart1::RegisterBlock,
+    vcom: &VcomIrq,
+    previous: u32,
+    pending: u32,
+) {
+    let flags = uart.uartfr().read();
+    defmt::info!(
+        "vcom baud moved: {=u32}->{=u32} realized={=u32} ring={=usize} rxfe={=bool} busy={=bool}",
+        previous,
+        pending,
+        REALIZED_BAUD.load(Ordering::Relaxed),
+        rx_ring_used(vcom),
+        flags.rxfe().bit_is_set(),
+        flags.busy().bit_is_set()
+    );
+}
+
+/// Unmask TXIM and pend UART1: an already-idle transmitter raises no level-transition interrupt.
 pub fn vcom_enable_tx_interrupt() {
     // SAFETY: USB only changes the TX mask after publishing bytes to the IRQ-owned consumer.
     let uart = unsafe { &*UART1::ptr() };
@@ -127,14 +198,13 @@ pub fn vcom_enable_tx_interrupt() {
     NVIC::pend(Interrupt::UART1_IRQ);
 }
 
-/// Divisor for a requested rate. A CDC line coding cannot be refused, so a rate the lattice
-/// cannot serve takes the fastest divisor and `REALIZED_BAUD` reports what that yields.
-fn vcom_div_x64(baud: u32) -> u32 {
+/// Divisor for a requested rate; an unservable rate takes the fastest divisor, reported via `REALIZED_BAUD`.
+fn vcom_div_x64<const CLK_PERI_HZ: u32>(baud: u32) -> u32 {
     pl011_baud::div_x64(CLK_PERI_HZ, baud).unwrap_or(pl011_baud::DIV_X64_MIN)
 }
 
-fn program_baud(uart: &rp2040_hal::pac::uart1::RegisterBlock, baud: u32) {
-    let (ibrd, fbrd) = pl011_baud::split(vcom_div_x64(baud));
+fn program_baud<const CLK_PERI_HZ: u32>(uart: &rp2040_hal::pac::uart1::RegisterBlock, baud: u32) {
+    let (ibrd, fbrd) = pl011_baud::split(vcom_div_x64::<CLK_PERI_HZ>(baud));
     uart.uartcr().modify(|_, w| w.uarten().clear_bit());
     uart.uartibrd()
         .write(|w| unsafe { w.baud_divint().bits(ibrd) });
@@ -155,9 +225,8 @@ pub fn vcom_request_baud(baud: u32) {
     }
 }
 
-/// Credit a drain: `taken` off the receive ring, `forwarded` into the CDC stage. The caller
-/// bounds the drain by the stage's room, so a short write breaks `uart_rx == cdc_in` instead of
-/// being absorbed.
+/// Credit a drain: `taken` off the receive ring, `forwarded` into the CDC stage.
+/// The caller bounds the drain by the stage's room, so a short write fails `uart_rx == cdc_in`.
 pub fn vcom_account_delivery(taken: usize, forwarded: usize) {
     add(&UART_RX, taken as u32);
     add(&CDC_IN, forwarded as u32);
@@ -165,6 +234,13 @@ pub fn vcom_account_delivery(taken: usize, forwarded: usize) {
 
 /// Charge staged bytes the CDC stream discarded; the credit moves at the query, not here.
 pub fn vcom_account_discard(n: usize) {
+    add(&DISCARDED, n as u32);
+}
+
+/// Charge ring bytes dropped at a close: taken, staged and discarded at once, so `cdc_in` holds.
+pub fn vcom_account_drop(n: usize) {
+    add(&UART_RX, n as u32);
+    add(&CDC_IN, n as u32);
     add(&DISCARDED, n as u32);
 }
 
@@ -177,9 +253,7 @@ pub fn vcom_realized_baud() -> u32 {
     REALIZED_BAUD.load(Ordering::Relaxed)
 }
 
-/// The seam's answer to the `0x9E` query. UART1 defers a requested rate until the transmit ring
-/// and the PL011 are both idle, so pending is loaded first: a change starting between the two
-/// loads then reads unsettled, never settled at the rate it is leaving.
+/// The `0x9E` answer; pending loads first so a change between the two loads reads unsettled.
 pub fn vcom_baud_state() -> daplink_rs::VcomBaudState {
     let pending = PENDING_BAUD.load(Ordering::Acquire);
     daplink_rs::VcomBaudState::deferred(
@@ -190,8 +264,7 @@ pub fn vcom_baud_state() -> daplink_rs::VcomBaudState {
 }
 
 pub fn vcom_counters() -> VcomCounters {
-    // Deducting one free-running discard total as the reply is built moves the credit across in
-    // one step, so a query never reads the pair half updated.
+    // One discard total deducted per reply, so a query never reads the pair half updated.
     let discarded = DISCARDED.load(Ordering::Relaxed);
     VcomCounters {
         uart_rx: UART_RX.load(Ordering::Relaxed),
@@ -209,8 +282,7 @@ pub fn vcom_counters() -> VcomCounters {
             | VCOM_VALID_FRAME_ERR
             | VCOM_VALID_OVERRUN
             | VCOM_VALID_UART_TX,
-        // Per-byte at the FIFO and the endpoints; `OVERRUN` folds a pass's overruns into one
-        // episode and `UART_TX` is credited before the wire, so those two stay lower bounds.
+        // `OVERRUN` folds a pass into one episode and `UART_TX` leads the wire, so both are lower bounds.
         grade: vcom_grade(VCOM_SLOT_UART_RX, VCOM_GRADE_EXACT)
             | vcom_grade(VCOM_SLOT_CDC_IN, VCOM_GRADE_EXACT)
             | vcom_grade(VCOM_SLOT_HOST_DROPPED, VCOM_GRADE_EXACT)
@@ -225,10 +297,77 @@ pub fn vcom_counters() -> VcomCounters {
 
 #[cfg(test)]
 mod tests {
-    use super::vcom_div_x64;
+    use super::*;
+
+    #[test]
+    fn a_discard_moves_its_credit_from_cdc_in_to_host_dropped() {
+        vcom_account_delivery(10, 8);
+        vcom_account_discard(3);
+        vcom_account_host_traffic(5);
+        let c = vcom_counters();
+        assert_eq!(
+            (c.uart_rx, c.cdc_in, c.host_dropped, c.cdc_out),
+            (10, 5, 3, 5)
+        );
+        assert_eq!(
+            (c.ring_full, c.frame_err, c.overrun, c.uart_tx, c.rx_dma_err),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            c.valid,
+            VCOM_VALID_IDENTITY
+                | VCOM_VALID_CDC_OUT
+                | VCOM_VALID_RING_FULL
+                | VCOM_VALID_FRAME_ERR
+                | VCOM_VALID_OVERRUN
+                | VCOM_VALID_UART_TX
+        );
+        let exact = [
+            VCOM_SLOT_UART_RX,
+            VCOM_SLOT_CDC_IN,
+            VCOM_SLOT_HOST_DROPPED,
+            VCOM_SLOT_CDC_OUT,
+            VCOM_SLOT_RING_FULL,
+            VCOM_SLOT_FRAME_ERR,
+        ]
+        .map(|slot| vcom_grade(slot, VCOM_GRADE_EXACT));
+        let lower = [VCOM_SLOT_OVERRUN, VCOM_SLOT_UART_TX]
+            .map(|slot| vcom_grade(slot, VCOM_GRADE_LOWER_BOUND));
+        assert_eq!(
+            c.grade,
+            exact.into_iter().chain(lower).fold(0, |a, g| a | g)
+        );
+        assert_eq!(c.units, vcom_episodes(VCOM_SLOT_OVERRUN));
+    }
+
+    #[test]
+    fn baud_state_reads_unsettled_while_a_rate_is_pending() {
+        let settled = vcom_baud_state();
+        assert_eq!((settled.realized, settled.applied), (115_207, 115_200));
+        assert_eq!(
+            settled.flags,
+            daplink_rs::VCOM_BAUD_APPLIED_VALID | daplink_rs::VCOM_BAUD_SETTLED
+        );
+        PENDING_BAUD.store(9_600, Ordering::Release);
+        assert_eq!(vcom_baud_state().flags, daplink_rs::VCOM_BAUD_APPLIED_VALID);
+        PENDING_BAUD.store(0, Ordering::Release);
+    }
 
     #[test]
     fn a_rate_the_lattice_cannot_serve_takes_the_fastest_divisor() {
-        assert_eq!(vcom_div_x64(u32::MAX), pl011_baud::DIV_X64_MIN);
+        assert_eq!(
+            vcom_div_x64::<125_000_000>(u32::MAX),
+            pl011_baud::DIV_X64_MIN
+        );
+        assert_eq!(
+            vcom_div_x64::<200_000_000>(u32::MAX),
+            pl011_baud::DIV_X64_MIN
+        );
+    }
+
+    #[test]
+    fn line_coding_uses_the_injected_peripheral_clock() {
+        assert_eq!(vcom_div_x64::<125_000_000>(1_000_000), 500);
+        assert_eq!(vcom_div_x64::<200_000_000>(1_000_000), 800);
     }
 }

@@ -7,27 +7,27 @@ use embassy_stm32::Peri;
 
 use crate::{DynCycleDelay, IoPin};
 
-/// The wired bit-bang dependencies the DAP engine is assembled from.
 pub type ProbeDeps = LateJtagDeps<IoPin, DynCycleDelay>;
 
-/// Wire the SWD+JTAG bit-bang dependencies from any five GPIOs; call once per image. nRESET
-/// drives open-drain: it shares a wired-AND net with the target's own reset supervisor.
-pub fn swd_jtag_deps(
+/// Wire the bit-bang dependencies over `scan`, SWDIO and SWCLK at `OSPEEDR` class `line_speed`.
+#[allow(clippy::too_many_arguments)]
+pub fn swd_jtag_deps_at(
     nreset: Peri<'static, impl Pin>,
     tdi: Peri<'static, impl Pin>,
     swdio: Peri<'static, impl Pin>,
     swclk: Peri<'static, impl Pin>,
     tdo: Peri<'static, impl Pin>,
     delay: DynCycleDelay,
+    line_speed: u32,
+    scan: &'static ScanChainStorage<SCAN_CHAIN_SLOTS>,
 ) -> ProbeDeps {
-    static SCAN: ScanChainStorage<SCAN_CHAIN_SLOTS> = ScanChainStorage::new();
     LateJtagDeps::wired(
         IoPin::new_open_drain(nreset),
         IoPin::new(tdi),
-        IoPin::new(swdio),
-        IoPin::new(swclk),
+        IoPin::with_speed(swdio, line_speed),
+        IoPin::with_speed(swclk, line_speed),
         IoPin::new(tdo),
         delay,
-        &SCAN,
+        scan,
     )
 }

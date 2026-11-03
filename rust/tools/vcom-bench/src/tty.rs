@@ -86,12 +86,15 @@ impl ClaimedCdc {
             comm: comm_number,
             data: data_number,
         };
+        // Restore the composite driver only after both interface claims have been released.
+        let _ = device.detach_kernel_driver(comm_number);
+        let _ = device.detach_kernel_driver(data_number);
         let comm = device
-            .detach_and_claim_interface(comm_number)
+            .claim_interface(comm_number)
             .wait()
             .context("detach and claim CDC communication interface")?;
         let data = device
-            .detach_and_claim_interface(data_number)
+            .claim_interface(data_number)
             .wait()
             .context("detach and claim CDC data interface")?;
         let descriptor = data.descriptor().context("CDC data interface descriptor")?;
@@ -168,12 +171,16 @@ impl ClaimedCdc {
             }
             self.in_.submit(Buffer::new(read_len));
         }
-        Ok(Ledger::new(
+        let mut ledger = Ledger::new(
             payload.len() as u64,
             got.len() as u64,
             divergence(payload, &got),
             started.elapsed(),
-        ))
+        );
+        if !ledger.byte_exact {
+            ledger.head = got.iter().take(8).copied().collect();
+        }
+        Ok(ledger)
     }
 }
 
@@ -228,6 +235,8 @@ pub struct Ledger {
     /// First write to last byte read (or last write when nothing came back).
     pub elapsed: Duration,
     pub throughput_bps: f64,
+    /// The first bytes read back, kept only when the echo was not byte-exact.
+    pub head: Vec<u8>,
 }
 
 impl Ledger {
@@ -245,6 +254,7 @@ impl Ledger {
             first_divergence,
             elapsed,
             throughput_bps,
+            head: Vec::new(),
         }
     }
 }
@@ -311,7 +321,43 @@ pub struct Tty {
     port: Box<dyn SerialPort>,
 }
 
+fn open_current<T>(
+    mut locate: impl FnMut() -> Result<Option<String>>,
+    open: impl FnOnce(&str) -> Result<T>,
+) -> Result<T> {
+    let path = locate()?.context("selected CDC tty is not present")?;
+    let port = open(&path)?;
+    if locate()?.as_deref() != Some(path.as_str()) {
+        bail!("selected CDC tty changed while opening it");
+    }
+    Ok(port)
+}
+
 impl Tty {
+    pub fn open_selected(selector: &str, baud: u32) -> Result<Self> {
+        let selector: ProbeSelector = selector.parse()?;
+        let serial = selector
+            .serial
+            .as_deref()
+            .context("CDC requires a serial-qualified selector")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut locate = || find_port_once(selector.vendor_id, selector.product_id, serial);
+            let attempt = (|| {
+                // Last close retires pending cooked-mode echoes before opening the raw session.
+                drop(open_current(&mut locate, |path| Self::open(path, baud))?);
+                open_current(&mut locate, |path| Self::open(path, baud))
+            })();
+            match attempt {
+                Ok(tty) => return Ok(tty),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                Err(error) => return Err(error).context("open selected CDC tty"),
+            }
+        }
+    }
+
     pub fn scrub_baud(target: u32) -> u32 {
         if target == SCRUB_BAUD {
             SCRUB_BAUD_ALT
@@ -435,8 +481,7 @@ impl Tty {
         ))
     }
 
-    /// A reader thread collects the echo concurrently, so a full kernel buffer can't deadlock the
-    /// writer.
+    /// A reader thread collects the echo concurrently, so a full kernel buffer can't deadlock.
     pub fn echo_batched(&mut self, payload: &[u8], chunk: usize, baud: u32) -> Result<Ledger> {
         let mut reader = self
             .port
@@ -463,8 +508,7 @@ impl Tty {
             Ok((got, last_read))
         });
 
-        // A write can legitimately block for the transfer time; a short timeout would misreport
-        // that as dead.
+        // A write can block for the whole transfer time.
         self.port.set_timeout(deadline)?;
         let start = Instant::now();
         let mut write_err = None;
@@ -491,8 +535,7 @@ impl Tty {
         ))
     }
 
-    /// Must return before the DUT is told to start, since every byte of the stream must fall inside
-    /// the measured window.
+    /// Call before the DUT is told to start, so every byte falls inside the window.
     pub fn v1_reader(&mut self, verifier: Verifier, clock: Clock) -> Result<Reader> {
         let mut port = self
             .port
@@ -548,8 +591,7 @@ impl Tty {
             .port
             .try_clone()
             .context("clone port for the v1 writer")?;
-        // A bridge draining slower than offered backpressures the write; a short timeout would call
-        // it dead.
+        // A slow bridge backpressures the write; a short timeout would call it dead.
         port.set_timeout(WRITE_TIMEOUT)?;
         let stop = Arc::new(AtomicBool::new(false));
         let close = Arc::new(AtomicBool::new(false));
@@ -587,8 +629,7 @@ impl Tty {
                     // Published for the window's checkpoints, which only read it.
                     *ledger.lock().unwrap_or_else(|e| e.into_inner()) = encoder.counters();
                     written += n as u64;
-                    // Token bucket against the run's own start, so a write that fell behind catches
-                    // up.
+                    // Token bucket against the run's start, so a write that fell behind catches up.
                     let due = started + Duration::from_secs_f64(written as f64 / pace_bps.max(1.0));
                     if let Some(wait) = due.checked_duration_since(Instant::now()) {
                         std::thread::sleep(wait);
@@ -729,6 +770,26 @@ pub fn pattern(len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopening_rediscovers_the_path_and_rejects_identity_changes() {
+        let mut paths = [Some("old"), Some("new"), Some("new"), Some("new")].into_iter();
+        let mut locate = || Ok(paths.next().flatten().map(str::to_owned));
+        let mut opened = Vec::new();
+        let mut open = |path: &str| {
+            opened.push(path.to_owned());
+            Ok(path.to_owned())
+        };
+        assert!(open_current(&mut locate, &mut open).is_err());
+        assert_eq!(open_current(&mut locate, &mut open).unwrap(), "new");
+        assert_eq!(opened, ["old", "new"]);
+    }
+
+    #[test]
+    fn absent_selected_tty_never_opens_an_unrelated_path() {
+        let result: Result<()> = open_current(|| Ok(None), |_| panic!("no selected tty"));
+        assert!(result.is_err());
+    }
 
     #[test]
     fn divergence_finds_the_first_bad_or_missing_byte() {

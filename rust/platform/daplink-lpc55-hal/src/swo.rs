@@ -31,15 +31,13 @@ fn regs() -> &'static raw::usart0::RegisterBlock {
     unsafe { &*raw::USART3::ptr() }
 }
 
-/// Route PIO0_3 to Flexcomm3 (`FC3_RXD`, SWO capture) or back to GPIO (JTAG TDO): only `FUNC`
-/// differs, so the pad is an input either way. No JTAG path reclaims it while capture runs.
+/// Route PIO0_3 to FC3_RXD (SWO) or GPIO (JTAG TDO); the pad is an input either way.
 #[inline]
 fn route_pio0_3(to_fc3: bool) {
     // A write to a clock-gated IOCON is silently ignored, and bring-up gates it off; idempotent.
     // SAFETY: SYSCON is a fixed peripheral; `ahbclkctrlset` touches only the set bit.
     unsafe { &*raw::SYSCON::ptr() }.ahbclkctrlset[0].write(|w| unsafe { w.bits(1 << 13) });
-    // SAFETY: PIO0_3 is owned by the SWO/TDO pair and accessed non-concurrently; this
-    // reprograms only that pad's IOCON word.
+    // SAFETY: PIO0_3 belongs to the SWO/TDO pair; only its IOCON word is written.
     let iocon = unsafe { &*raw::IOCON::ptr() };
     iocon.pio0_3.modify(|_, w| {
         let w = if to_fc3 {
@@ -93,8 +91,7 @@ impl SwoBackend for Fc3SwoHw {
     }
 }
 
-/// Bring Flexcomm3 up as an RX-only USART SWO capture; call once per image. PIO0_3 is left in GPIO
-/// (TDO) mode, and capture muxes it to FC3_RXD only while running.
+/// Bring up Flexcomm3 as RX-only SWO capture, once; PIO0_3 is FC3_RXD only while capturing.
 pub(crate) fn fc3_swo(
     flexcomm3: hal::peripherals::flexcomm::Flexcomm3,
     rx_pin: Pin<Pio0_3, state::Unused>,

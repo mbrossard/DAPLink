@@ -4,9 +4,8 @@ use crate::delay::CycleDelay;
 use crate::io_pin::{sio_pin, IoPin, SplitIoPin};
 use crate::swo::{uart0_swo, Uart0Swo};
 use daplink_rs::daplink_core::serial::{format_serial, SERIAL_LEN};
-use daplink_rs::{wired_swd_deps, JtagLines, LateJtagDeps, ScanChainStorage, SwdOnlyDeps};
+use daplink_rs::{wired_swd_deps, LateJtagDeps, ScanChainStorage, SwdOnlyDeps};
 use embassy_rp::gpio::Pull;
-use embassy_rp::pac;
 use embassy_rp::peripherals::{DMA_CH1, DMA_CH2, DMA_CH3, FLASH, PIN_25, PIN_4, PIN_5, UART1, USB};
 use embassy_rp::{Peri, Peripherals};
 use static_cell::StaticCell;
@@ -30,6 +29,33 @@ pub struct HostIo {
     pub vcom_tx_dma: Peri<'static, DMA_CH3>,
 }
 
+/// UART and DMA resources consumed by the VCOM service.
+pub struct VcomIo {
+    pub(crate) uart: Peri<'static, UART1>,
+    pub(crate) uart_tx: Peri<'static, PIN_4>,
+    pub(crate) uart_rx: Peri<'static, PIN_5>,
+    pub(crate) rx_dma: Peri<'static, DMA_CH1>,
+    pub(crate) chain_dma: Peri<'static, DMA_CH2>,
+    pub(crate) tx_dma: Peri<'static, DMA_CH3>,
+}
+
+impl HostIo {
+    /// Separate USB from the resources owned by the VCOM service.
+    pub fn split(self) -> (Peri<'static, USB>, VcomIo) {
+        (
+            self.usb,
+            VcomIo {
+                uart: self.uart,
+                uart_tx: self.uart_tx,
+                uart_rx: self.uart_rx,
+                rx_dma: self.vcom_rx_dma,
+                chain_dma: self.vcom_chain_dma,
+                tx_dma: self.vcom_tx_dma,
+            },
+        )
+    }
+}
+
 /// The built probe pieces for the Pico layout.
 pub struct PicoParts {
     pub deps: ProbeDeps,
@@ -39,12 +65,10 @@ pub struct PicoParts {
     pub swo: Uart0Swo,
     /// Onboard status LED pin (GP25).
     pub status_pin: Peri<'static, PIN_25>,
-    #[cfg(feature = "carrier-leds")]
     pub carrier_pins: crate::CarrierPins,
 }
 
-/// Bring the probe up in the Pico wiring (SWCLK=GP2, SWDIO=GP3, nRESET=GP1, TDI=GP6, TDO=GP7);
-/// call once per image.
+/// Bring the probe up in the Pico wiring (SWCLK=GP2, SWDIO=GP3, nRESET=GP1, TDI=GP6, TDO=GP7).
 pub fn probe_parts_pico(p: Peripherals, delay: CycleDelay) -> PicoParts {
     // Pulled up so the target lines idle high until driven.
     let nreset = {
@@ -62,9 +86,7 @@ pub fn probe_parts_pico(p: Peripherals, delay: CycleDelay) -> PicoParts {
 
     let serial = serial_string(p.FLASH);
 
-    // The raw SWO backend takes the register block, so the typed `p.UART0` is dropped here.
-    let _ = p.UART0;
-    let swo = uart0_swo(pac::UART0, p.PIN_13, p.DMA_CH0);
+    let swo = uart0_swo(p.UART0, p.PIN_13, p.DMA_CH0);
 
     PicoParts {
         deps,
@@ -80,13 +102,12 @@ pub fn probe_parts_pico(p: Peripherals, delay: CycleDelay) -> PicoParts {
         },
         swo,
         status_pin: p.PIN_25,
-        #[cfg(feature = "carrier-leds")]
         carrier_pins: crate::CarrierPins {
-            heartbeat: p.PIN_10,
-            dap: p.PIN_11,
-            flash: p.PIN_12,
-            vcom: p.PIN_14,
-            swo: p.PIN_15,
+            gpio10: p.PIN_10,
+            gpio11: p.PIN_11,
+            gpio12: p.PIN_12,
+            gpio14: p.PIN_14,
+            gpio15: p.PIN_15,
         },
     }
 }
@@ -97,34 +118,30 @@ pub struct PicoAccelParts {
     pub io: HostIo,
     /// SWO capture slot (UART0 RX on GP13).
     pub swo: Uart0Swo,
-    /// Second handles to the four JTAG pads; TCK/TMS ride SWCLK/SWDIO over the pad loan.
-    pub jtag_lines: JtagLines<IoPin>,
-    /// GPIO numbers the PIO bring-up claims.
+    /// GPIO numbers the PIO state machines claim.
     pub swclk: u8,
     pub swdio: u8,
+    pub tdi: u8,
+    pub tdo: u8,
     pub nreset: u8,
     /// Onboard status LED pin (GP25).
     pub status_pin: Peri<'static, PIN_25>,
-    #[cfg(feature = "carrier-leds")]
     pub carrier_pins: crate::CarrierPins,
 }
 
-/// Bring the probe up in the Pico wiring with SWCLK/SWDIO left for a PIO state machine; the
-/// firmware owns PIO0 and those pads from here, so call once per image.
+/// Bring up the Pico wiring with the SWJ pads and both whole PIO blocks reserved for the firmware.
 pub fn probe_parts_pico_accel(p: Peripherals) -> PicoAccelParts {
     // Pulled up so the lines idle high; the pull survives the later move to the PIO function.
     let _ = sio_pin(p.PIN_1, Pull::Up);
     let _ = sio_pin(p.PIN_3, Pull::Up);
     let _ = sio_pin(p.PIN_2, Pull::Up);
-    let tdi = sio_pin(p.PIN_6, Pull::Up);
-    let tdo = sio_pin(p.PIN_7, Pull::Up);
+    let _ = sio_pin(p.PIN_6, Pull::Up);
+    let _ = sio_pin(p.PIN_7, Pull::Up);
 
-    // PIO0 is handed to the firmware's raw-register bring-up, which addresses it by block.
-    let _ = p.PIO0;
+    // Both whole blocks are handed to raw-register bring-up; the engine uses PIO0 and PIO1.
+    let _ = (p.PIO0, p.PIO1);
 
-    // The raw SWO backend takes the register block, so the typed `p.UART0` is dropped here.
-    let _ = p.UART0;
-    let swo = uart0_swo(pac::UART0, p.PIN_13, p.DMA_CH0);
+    let swo = uart0_swo(p.UART0, p.PIN_13, p.DMA_CH0);
 
     PicoAccelParts {
         serial: serial_string(p.FLASH),
@@ -138,18 +155,18 @@ pub fn probe_parts_pico_accel(p: Peripherals) -> PicoAccelParts {
             vcom_tx_dma: p.DMA_CH3,
         },
         swo,
-        jtag_lines: JtagLines::new(IoPin::new(2), IoPin::new(3), tdi, tdo),
         swclk: 2,
         swdio: 3,
+        tdi: 6,
+        tdo: 7,
         nreset: 1,
         status_pin: p.PIN_25,
-        #[cfg(feature = "carrier-leds")]
         carrier_pins: crate::CarrierPins {
-            heartbeat: p.PIN_10,
-            dap: p.PIN_11,
-            flash: p.PIN_12,
-            vcom: p.PIN_14,
-            swo: p.PIN_15,
+            gpio10: p.PIN_10,
+            gpio11: p.PIN_11,
+            gpio12: p.PIN_12,
+            gpio14: p.PIN_14,
+            gpio15: p.PIN_15,
         },
     }
 }
@@ -192,9 +209,7 @@ pub struct DebugProbeParts {
     pub io: HostIo,
 }
 
-/// Bring the probe up in the Debug Probe wiring (SWCLK=GP12, SWDI=GP13, SWDIO=GP14, VCOM
-/// UART1 TX=GP4/RX=GP5); no reset line and no JTAG pins are wired out, so those are no-connects.
-/// Call once per image.
+/// Bring the probe up in the Debug Probe wiring (SWCLK=GP12, SWDI=GP13, SWDIO=GP14); no reset or JTAG pins.
 pub fn probe_parts_debugprobe(p: Peripherals, delay: CycleDelay) -> DebugProbeParts {
     // Pulled up so the driven lines idle high; the shifted input is left to the shifter.
     let _ = sio_pin(p.PIN_12, Pull::Up);
@@ -234,16 +249,15 @@ pub struct DebugProbeAccelParts {
     pub swdio_in: u8,
 }
 
-/// Bring the probe up in the Debug Probe wiring with the SWD pads left for a PIO state machine;
-/// the firmware owns PIO0 and those pads from here, so call once per image.
+/// Bring up Debug Probe wiring with its SWD pads and both whole PIO blocks reserved for firmware.
 pub fn probe_parts_debugprobe_accel(p: Peripherals) -> DebugProbeAccelParts {
     // Pulled up so the driven lines idle high; the pull survives the move to the PIO function.
     let _ = sio_pin(p.PIN_12, Pull::Up);
     let _ = sio_pin(p.PIN_13, Pull::None);
     let _ = sio_pin(p.PIN_14, Pull::Up);
 
-    // PIO0 is handed to the firmware's raw-register bring-up, which addresses it by block.
-    let _ = p.PIO0;
+    // Both whole blocks are handed to raw-register bring-up; the engine uses PIO0 and PIO1.
+    let _ = (p.PIO0, p.PIO1);
 
     DebugProbeAccelParts {
         serial: serial_string(p.FLASH),
@@ -281,8 +295,7 @@ fn serial_string(flash: Peri<'static, FLASH>) -> &'static str {
     }
 }
 
-/// Derive the USB serial string from the OTP chip id, as hex: `embassy-rp` exposes no QSPI
-/// unique-id command on RP235x, so `flash` goes unused here.
+/// Derive the USB serial string from the OTP chip id, as hex; `embassy-rp` has no RP235x unique-id read.
 #[cfg(feature = "rp2350")]
 fn serial_string(_flash: Peri<'static, FLASH>) -> &'static str {
     static SERIAL: StaticCell<[u8; SERIAL_LEN]> = StaticCell::new();

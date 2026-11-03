@@ -1,18 +1,19 @@
-//! JSONL recording for a HIL run: one appended record per case, under git-ignored `artifacts/`.
+//! JSONL recording for a HIL run: a start line, then one appended record per case, in a fixed ledger.
 
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use probe_rs::probe::{DebugProbeSelector, WireProtocol};
+use probe_rs::probe::WireProtocol;
 
-use crate::speed::{self, CHUNK_BYTES};
+use crate::speed;
 
-/// Record format version: bumped on a field's meaning changing, so a reader can refuse a record.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// Record format version, bumped when a field's meaning changes.
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
-/// Default record file name under the resolved `artifacts/` directory.
+/// The record file name, in the ledger and under a fallback `artifacts/`.
 const DEFAULT_FILE_NAME: &str = "hil-runs.jsonl";
 
 /// The marker identifying the checkout root while walking up from a starting path.
@@ -22,17 +23,21 @@ const CHECKOUT_MARKER: &str = "rust/tests/daplink-test/Cargo.toml";
 pub(crate) struct RunMeta {
     /// Groups the records of one invocation exactly, rather than by timestamp proximity.
     pub(crate) run_id: String,
-    /// Probe USB vendor id.
+    /// `full` for the default set, `list` for named cases.
+    pub(crate) mode: &'static str,
+    /// The runner's token for one event across its attempts.
+    pub(crate) series: Option<String>,
     pub(crate) vid: u16,
-    /// Probe USB product id.
     pub(crate) pid: u16,
-    /// Probe USB serial, when it reports one.
     pub(crate) serial: Option<String>,
+    /// The firmware registry row the record measured, when anything names it.
+    pub(crate) firmware_row: Option<String>,
+    /// What named it: `image`, `operator` or `none`.
+    pub(crate) firmware_row_source: &'static str,
     /// The probe's own reported firmware-version string, when the read succeeded.
     pub(crate) firmware_version: Option<String>,
     /// This harness binary's own linked version string (`daplink_core::DAP_FW_VERSION`).
     pub(crate) harness_version: &'static str,
-    /// Target registry name.
     pub(crate) target: &'static str,
     /// probe-rs chip name the run attaches with.
     pub(crate) chip: String,
@@ -40,85 +45,131 @@ pub(crate) struct RunMeta {
     pub(crate) dut_elf: Option<String>,
     /// DUT uf2 path, when the run was given one.
     pub(crate) dut_uf2: Option<String>,
+    /// What the DUT reported about itself over the test protocol, `None` when it did not answer.
+    pub(crate) dut: Option<DutIdRecord>,
+}
+
+/// The DUT image's own identity, as its `ID` reply gave it.
+pub(crate) struct DutIdRecord {
+    pub(crate) name: Option<String>,
+    pub(crate) proto: Option<u32>,
+    /// Build revision of the DUT image; `None` for an image predating the field.
+    pub(crate) revision: Option<String>,
 }
 
 impl RunMeta {
     /// Build the shared run header from what `main` already read; nothing is re-queried here.
     pub(crate) fn new(
         run_id: String,
-        selector: &DebugProbeSelector,
+        (mode, series): (&'static str, Option<String>),
+        cx: &crate::Ctx,
+        firmware_row: &firmware_row::Resolved,
         firmware_version: Option<&str>,
         target: &'static str,
-        chip: &str,
-        dut_elf: Option<&str>,
-        dut_uf2: Option<&str>,
+        dut: Option<&crate::dutid::DutId>,
     ) -> Self {
         RunMeta {
             run_id,
-            vid: selector.vendor_id,
-            pid: selector.product_id,
-            serial: selector.serial_number.clone(),
+            mode,
+            series,
+            vid: cx.selector.vendor_id,
+            pid: cx.selector.product_id,
+            serial: cx.selector.serial_number.clone(),
+            firmware_row: firmware_row.row.clone(),
+            firmware_row_source: firmware_row.source.key(),
             firmware_version: firmware_version.map(str::to_string),
             harness_version: daplink_core::DAP_FW_VERSION,
             target,
-            chip: chip.to_string(),
-            dut_elf: dut_elf.map(str::to_string),
-            dut_uf2: dut_uf2.map(str::to_string),
+            chip: cx.chip.clone(),
+            dut_elf: cx.dut_elf.clone(),
+            dut_uf2: cx.dut_uf2.clone(),
+            dut: dut.map(|d| DutIdRecord {
+                name: d.name.clone(),
+                proto: d.proto,
+                revision: d.revision.clone(),
+            }),
         }
     }
 }
 
 /// One case's outcome and cost.
 pub(crate) struct CaseRecord<'a> {
-    /// Registry case name.
     pub(crate) case: &'a str,
     /// `ok`, `failed`, `fatal` or `skip` -- the harness's `Failure` taxonomy.
     pub(crate) outcome: &'static str,
-    /// Why it failed, was fatal, or was skipped; `None` for `ok`.
+    /// Why it failed, was fatal, or was skipped; on an `ok`, a note on how it was reached.
     pub(crate) detail: Option<&'a str>,
     /// Wall clock the case took, including a skip's near-zero.
     pub(crate) duration_ms: u64,
+    /// The first `/proc/loadavg` field at case start, where the host has one.
+    pub(crate) load1: Option<f64>,
+    /// The deadline-bound waits the case noted.
+    pub(crate) waits: Vec<WaitRecord>,
     /// The speed sweep's rungs, on the record of a case that swept (`speed-swd`, `speed-jtag`).
     pub(crate) speed: Option<SpeedPayload>,
 }
 
+/// One deadline-bound wait, the worst of `n`.
+pub(crate) struct WaitRecord {
+    pub(crate) name: &'static str,
+    pub(crate) budget_ms: u64,
+    pub(crate) max_ms: u64,
+    pub(crate) n: u32,
+}
+
 /// A speed case's own measurements.
 pub(crate) struct SpeedPayload {
-    /// Transport the sweep ran over.
     pub(crate) transport: &'static str,
-    /// Bytes read per timed chunk, constant across rungs.
-    pub(crate) chunk_bytes: usize,
-    /// The rungs, in sweep order.
+    /// `basic` or `extended`.
+    pub(crate) mode: &'static str,
+    pub(crate) repeats: u32,
     pub(crate) rows: Vec<RowRecord>,
 }
 
 impl SpeedPayload {
     /// Build a payload from the raw sweep this run stashed on `Ctx::last_speed`.
-    pub(crate) fn from_steps(protocol: WireProtocol, steps: &[speed::Step]) -> Self {
+    pub(crate) fn from_sweep(protocol: WireProtocol, sweep: &speed::Sweep) -> Self {
         SpeedPayload {
             transport: transport_name(protocol),
-            chunk_bytes: CHUNK_BYTES,
-            rows: steps
+            mode: if sweep.extended { "extended" } else { "basic" },
+            repeats: sweep.repeats,
+            rows: sweep
+                .rows
                 .iter()
-                .map(|s| RowRecord {
-                    requested_hz: s.requested_hz,
-                    chunk_ns: s.chunk_ns.clone(),
+                .map(|r| RowRecord {
+                    requested_hz: r.requested_hz,
+                    direction: r.direction.label(),
+                    access_bytes: r.access_bytes,
+                    samples: r.samples.iter().map(|s| (s.calls, s.ns)).collect(),
+                    stats: r.stats(),
+                    error: r.error.clone(),
+                    chunk_ns: (!sweep.extended).then(|| r.chunk_ns.clone()),
                 })
                 .collect(),
         }
     }
 }
 
-/// One rung's raw measurement, as recorded.
+/// One row's measurement, as recorded.
 pub(crate) struct RowRecord {
     /// Requested wire clock, Hz.
     pub(crate) requested_hz: u32,
-    /// Elapsed nanoseconds of each timed read, in the order they ran.
-    pub(crate) chunk_ns: Vec<u128>,
+    /// `read` or `write`.
+    pub(crate) direction: &'static str,
+    /// Bytes per call.
+    pub(crate) access_bytes: usize,
+    /// Calls and summed elapsed nanoseconds of each repeat.
+    pub(crate) samples: Vec<(u32, u128)>,
+    /// Median, min and max KiB/s over the repeats.
+    pub(crate) stats: Option<(f64, f64, f64)>,
+    /// Why the row failed; its samples, if any, still stand.
+    pub(crate) error: Option<String>,
+    /// Elapsed nanoseconds of each timed call; basic mode only, as the extended one is too long.
+    pub(crate) chunk_ns: Option<Vec<u128>>,
 }
 
 /// The record's spelling of a wire transport.
-fn transport_name(protocol: WireProtocol) -> &'static str {
+pub(crate) fn transport_name(protocol: WireProtocol) -> &'static str {
     match protocol {
         WireProtocol::Swd => "swd",
         WireProtocol::Jtag => "jtag",
@@ -134,7 +185,27 @@ pub(crate) fn run_id() -> String {
     format!("{:x}-{nanos:x}", std::process::id())
 }
 
-/// The default record path: `artifacts/` under the checkout root above `start`, or under `start`
+/// The fixed ledger, wherever the binary was built: under `$XDG_STATE_HOME`, else `~/.local/state`.
+pub(crate) fn ledger_path(state: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let state = state.filter(|s| !s.is_empty()).map(PathBuf::from);
+    let base = state.or_else(|| home.map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("daplink").join(DEFAULT_FILE_NAME))
+}
+
+/// Where a recording run appends: the ledger, and `--record` as well.
+pub(crate) fn record_paths(record: Option<PathBuf>) -> Vec<PathBuf> {
+    let ledger = ledger_path(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+        .unwrap_or_else(default_path_for_process);
+    std::iter::once(ledger).chain(record).collect()
+}
+
+/// The first `/proc/loadavg` field, `None` where the host has no such file.
+pub(crate) fn load1() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    text.split_whitespace().next()?.parse().ok()
+}
+
+/// The ledger's fallback path: `artifacts/` under the checkout root above `start`, or under `start`
 /// itself when no ancestor matches.
 pub(crate) fn default_path(start: &Path) -> PathBuf {
     for ancestor in start.ancestors() {
@@ -157,22 +228,96 @@ pub(crate) fn default_path_for_process() -> PathBuf {
 
 /// Append one case record to `path`, creating the file and its directory; never truncates.
 pub(crate) fn append(path: &Path, meta: &RunMeta, case: &CaseRecord) -> std::io::Result<()> {
+    append_line(path, &render(meta, case, now_s()))
+}
+
+/// Append the run's start line, which names what it selected: a name with no row and no `fatal` died.
+pub(crate) fn append_start(path: &Path, meta: &RunMeta, selected: &[&str]) -> std::io::Result<()> {
+    append_line(path, &render_start(meta, selected, load1(), now_s()))
+}
+
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let line = render(meta, case, secs);
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(line.as_bytes())
+}
+
+fn now_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Render the start line as a single JSON line, terminated by a newline.
+pub(crate) fn render_start(
+    meta: &RunMeta,
+    selected: &[&str],
+    load1: Option<f64>,
+    unix_s: u64,
+) -> String {
+    let names: Vec<String> = selected.iter().map(|name| quote(name)).collect();
+    format!(
+        "{}\"event\":\"start\",\"selected\":[{}],\"load1\":{}}}\n",
+        render_head(meta, unix_s),
+        names.join(","),
+        opt_f64(load1)
+    )
 }
 
 /// Render one case record as a single JSON line, terminated by a newline.
 pub(crate) fn render(meta: &RunMeta, case: &CaseRecord, unix_s: u64) -> String {
     let rows = case.speed.as_ref().map(|s| s.rows.len()).unwrap_or(0);
     let mut s = String::with_capacity(384 + rows * 96);
+    s.push_str(&render_head(meta, unix_s));
+    s.push_str(&format!(
+        "\"case\":{},\"outcome\":{},\"detail\":{},\"duration_ms\":{},\"load1\":{}",
+        quote(case.case),
+        quote(case.outcome),
+        opt_str(case.detail),
+        case.duration_ms,
+        opt_f64(case.load1)
+    ));
+    if !case.waits.is_empty() {
+        let waits: Vec<String> = case
+            .waits
+            .iter()
+            .map(|w| {
+                format!(
+                    "{{\"name\":{},\"budget_ms\":{},\"max_ms\":{},\"n\":{}}}",
+                    quote(w.name),
+                    w.budget_ms,
+                    w.max_ms,
+                    w.n
+                )
+            })
+            .collect();
+        s.push_str(&format!(",\"waits\":[{}]", waits.join(",")));
+    }
+    if let Some(p) = &case.speed {
+        s.push_str(&format!(
+            ",\"speed\":{{\"transport\":{},\"mode\":{},\"repeats\":{},\"rows\":[",
+            quote(p.transport),
+            quote(p.mode),
+            p.repeats
+        ));
+        for (i, r) in p.rows.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&render_row(r));
+        }
+        s.push_str("]}");
+    }
+    s.push_str("}\n");
+    s
+}
+
+/// What every line of a run opens with.
+fn render_head(meta: &RunMeta, unix_s: u64) -> String {
+    let mut s = String::with_capacity(384);
     s.push_str(&format!(
         "{{\"schema_version\":{SCHEMA_VERSION},\"run_id\":{},\"unix_s\":{unix_s},",
         quote(&meta.run_id)
@@ -189,6 +334,11 @@ pub(crate) fn render(meta: &RunMeta, case: &CaseRecord, unix_s: u64) -> String {
         opt_str(meta.serial.as_deref())
     ));
     s.push_str(&format!(
+        "\"firmware_row\":{},\"firmware_row_source\":{},",
+        opt_str(meta.firmware_row.as_deref()),
+        quote(meta.firmware_row_source)
+    ));
+    s.push_str(&format!(
         "\"firmware_version\":{},",
         opt_str(meta.firmware_version.as_deref())
     ));
@@ -202,41 +352,57 @@ pub(crate) fn render(meta: &RunMeta, case: &CaseRecord, unix_s: u64) -> String {
         opt_str(meta.dut_elf.as_deref()),
         opt_str(meta.dut_uf2.as_deref())
     ));
-    s.push_str(&format!(
-        "\"case\":{},\"outcome\":{},\"detail\":{},\"duration_ms\":{}",
-        quote(case.case),
-        quote(case.outcome),
-        opt_str(case.detail),
-        case.duration_ms
-    ));
-    if let Some(p) = &case.speed {
-        s.push_str(&format!(
-            ",\"speed\":{{\"transport\":{},\"chunk_bytes\":{},\"rows\":[",
-            quote(p.transport),
-            p.chunk_bytes
-        ));
-        for (i, r) in p.rows.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&render_row(r));
-        }
-        s.push_str("]}");
+    match &meta.dut {
+        Some(d) => s.push_str(&format!(
+            "\"dut\":{{\"name\":{},\"proto\":{},\"revision\":{}}},",
+            opt_str(d.name.as_deref()),
+            d.proto
+                .map_or_else(|| "null".to_string(), |p| p.to_string()),
+            opt_str(d.revision.as_deref())
+        )),
+        None => s.push_str("\"dut\":null,"),
     }
-    s.push_str("}\n");
+    s.push_str(&format!(
+        "\"mode\":{},\"series\":{},",
+        quote(meta.mode),
+        opt_str(meta.series.as_deref())
+    ));
     s
 }
 
-/// Render one rung object.
-fn render_row(r: &RowRecord) -> String {
-    format!(
-        "{{\"requested_hz\":{},\"chunk_ns\":{}}}",
-        r.requested_hz,
-        ns_array(&r.chunk_ns)
-    )
+fn opt_f64(v: Option<f64>) -> String {
+    v.map_or_else(|| "null".to_string(), |v| v.to_string())
 }
 
-/// Render a list of elapsed times as a JSON array.
+fn render_row(r: &RowRecord) -> String {
+    let samples: Vec<String> = r
+        .samples
+        .iter()
+        .map(|(calls, ns)| format!("{{\"calls\":{calls},\"ns\":{ns}}}"))
+        .collect();
+    let stat = |pick: fn((f64, f64, f64)) -> f64| {
+        r.stats
+            .map_or_else(|| "null".to_string(), |s| format!("{:.3}", pick(s)))
+    };
+    let mut s = format!(
+        "{{\"requested_hz\":{},\"direction\":{},\"access_bytes\":{},\"samples\":[{}],\
+         \"median_kib_s\":{},\"min_kib_s\":{},\"max_kib_s\":{},\"error\":{}",
+        r.requested_hz,
+        quote(r.direction),
+        r.access_bytes,
+        samples.join(","),
+        stat(|s| s.0),
+        stat(|s| s.1),
+        stat(|s| s.2),
+        opt_str(r.error.as_deref())
+    );
+    if let Some(ns) = &r.chunk_ns {
+        s.push_str(&format!(",\"chunk_ns\":{}", ns_array(ns)));
+    }
+    s.push('}');
+    s
+}
+
 fn ns_array(ns: &[u128]) -> String {
     let mut s = String::from("[");
     for (i, v) in ns.iter().enumerate() {
@@ -257,7 +423,6 @@ fn opt_str(v: Option<&str>) -> String {
     }
 }
 
-/// Quote and escape a JSON string.
 fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -308,13 +473,18 @@ mod tests {
     use super::*;
 
     /// The exact line the renderer emits for a swept case, as a reader parses it back.
-    const PINNED_SWEEP: &str = r#"{"schema_version":1,"run_id":"1f4-17a2b","unix_s":1754378400,"utc":"2025-08-05T07:20:00Z","harness_version":"2.1.1.gfeedc0ffee12","probe":{"vid":"0d28","pid":"0204","serial":"0000ABCDEF012345"},"firmware_version":"2.1.1.gfeedc0ffee12","target":"rp2040","chip":"RP2040","dut_elf":"target/rp2040.elf","dut_uf2":null,"case":"speed-swd","outcome":"ok","detail":null,"duration_ms":8421,"speed":{"transport":"swd","chunk_bytes":4096,"rows":[{"requested_hz":25000000,"chunk_ns":[71500,71600,71400]}]}}"#;
+    const PINNED_SWEEP: &str = r#"{"schema_version":5,"run_id":"1f4-17a2b","unix_s":1754378400,"utc":"2025-08-05T07:20:00Z","harness_version":"2.1.1.gfeedc0ffee12","probe":{"vid":"0d28","pid":"0204","serial":"0000ABCDEF012345"},"firmware_row":"firmware/mculink","firmware_row_source":"image","firmware_version":"2.1.1.gfeedc0ffee12","target":"rp2040","chip":"RP2040","dut_elf":"target/rp2040.elf","dut_uf2":null,"dut":{"name":"rp2040","proto":8,"revision":"gfeedc0ffee12"},"mode":"list","series":null,"case":"speed-swd","outcome":"ok","detail":null,"duration_ms":8421,"load1":null,"speed":{"transport":"swd","mode":"basic","repeats":1,"rows":[{"requested_hz":25000000,"direction":"read","access_bytes":4096,"samples":[{"calls":3,"ns":214500}],"median_kib_s":55944.056,"min_kib_s":55944.056,"max_kib_s":55944.056,"error":null,"chunk_ns":[71500,71600,71400]}]}}"#;
+
+    /// A swept case as schema 4 wrote it, before `mode`, `series` and `load1`.
+    const PINNED_V4_SWEEP: &str = r#"{"schema_version":4,"run_id":"1f4-17a2b","unix_s":1754378400,"utc":"2025-08-05T07:20:00Z","harness_version":"2.1.1.gfeedc0ffee12","probe":{"vid":"0d28","pid":"0204","serial":"0000ABCDEF012345"},"firmware_row":"firmware/mculink","firmware_row_source":"image","firmware_version":"2.1.1.gfeedc0ffee12","target":"rp2040","chip":"RP2040","dut_elf":"target/rp2040.elf","dut_uf2":null,"dut":{"name":"rp2040","proto":8,"revision":"gfeedc0ffee12"},"case":"speed-swd","outcome":"ok","detail":null,"duration_ms":8421,"speed":{"transport":"swd","mode":"basic","repeats":1,"rows":[{"requested_hz":25000000,"direction":"read","access_bytes":4096,"samples":[{"calls":3,"ns":214500}],"median_kib_s":55944.056,"min_kib_s":55944.056,"max_kib_s":55944.056,"error":null,"chunk_ns":[71500,71600,71400]}]}}"#;
+
+    /// A swept case as schema 2 wrote it, before rows carried direction and access size.
+    const PINNED_V2_SWEEP: &str = r#"{"schema_version":2,"run_id":"1f4-17a2b","unix_s":1754378400,"utc":"2025-08-05T07:20:00Z","harness_version":"2.1.1.gfeedc0ffee12","probe":{"vid":"0d28","pid":"0204","serial":"0000ABCDEF012345"},"firmware_version":"2.1.1.gfeedc0ffee12","target":"rp2040","chip":"RP2040","dut_elf":"target/rp2040.elf","dut_uf2":null,"dut":{"name":"rp2040","proto":8,"revision":"gfeedc0ffee12"},"case":"speed-swd","outcome":"ok","detail":null,"duration_ms":8421,"speed":{"transport":"swd","chunk_bytes":4096,"rows":[{"requested_hz":25000000,"chunk_ns":[71500,71600,71400]}]}}"#;
 
     /// The exact line for a case that swept nothing: the `speed` key is absent, not null.
-    const PINNED_PLAIN: &str = r#"{"schema_version":1,"run_id":"1f4-17a2b","unix_s":1754378400,"utc":"2025-08-05T07:20:00Z","harness_version":"2.1.1.gfeedc0ffee12","probe":{"vid":"0d28","pid":"0204","serial":"0000ABCDEF012345"},"firmware_version":"2.1.1.gfeedc0ffee12","target":"rp2040","chip":"RP2040","dut_elf":"target/rp2040.elf","dut_uf2":null,"case":"msc","outcome":"failed","detail":"drop 2 of 3 never re-enumerated","duration_ms":61230}"#;
+    const PINNED_PLAIN: &str = r#"{"schema_version":5,"run_id":"1f4-17a2b","unix_s":1754378400,"utc":"2025-08-05T07:20:00Z","harness_version":"2.1.1.gfeedc0ffee12","probe":{"vid":"0d28","pid":"0204","serial":"0000ABCDEF012345"},"firmware_row":"firmware/mculink","firmware_row_source":"image","firmware_version":"2.1.1.gfeedc0ffee12","target":"rp2040","chip":"RP2040","dut_elf":"target/rp2040.elf","dut_uf2":null,"dut":{"name":"rp2040","proto":8,"revision":"gfeedc0ffee12"},"mode":"list","series":null,"case":"msc","outcome":"failed","detail":"drop 2 of 3 never re-enumerated","duration_ms":61230,"load1":null}"#;
 
-    /// The rendered line is pinned in full, raw per-read nanoseconds included: a derived rate
-    /// would round away the equal-time signature a clamped clock leaves.
+    /// The rendered line is pinned in full, raw per-read nanoseconds included.
     #[test]
     fn a_swept_case_renders_one_line_with_raw_times() {
         let case = CaseRecord {
@@ -322,12 +492,20 @@ mod tests {
             outcome: "ok",
             detail: None,
             duration_ms: 8421,
+            load1: None,
+            waits: Vec::new(),
             speed: Some(SpeedPayload {
                 transport: "swd",
-                chunk_bytes: 4096,
+                mode: "basic",
+                repeats: 1,
                 rows: vec![RowRecord {
                     requested_hz: 25_000_000,
-                    chunk_ns: vec![71_500, 71_600, 71_400],
+                    direction: "read",
+                    access_bytes: 4096,
+                    samples: vec![(3, 214_500)],
+                    stats: Some((55_944.056, 55_944.056, 55_944.056)),
+                    error: None,
+                    chunk_ns: Some(vec![71_500, 71_600, 71_400]),
                 }],
             }),
         };
@@ -343,6 +521,8 @@ mod tests {
             outcome: "failed",
             detail: Some("drop 2 of 3 never re-enumerated"),
             duration_ms: 61_230,
+            load1: None,
+            waits: Vec::new(),
             speed: None,
         };
         let line = render(&meta_for_test(), &case, 1_754_378_400);
@@ -353,17 +533,281 @@ mod tests {
     /// A sweep runs over its own transport, whatever the rest of the run attached with.
     #[test]
     fn a_sweeps_own_transport_is_recorded() {
-        let payload = SpeedPayload::from_steps(
-            WireProtocol::Jtag,
-            &[speed::Step {
-                requested_hz: 1_000_000,
-                kib_per_s: 123.0,
-                chunks: 4,
-                chunk_ns: vec![1, 2, 3, 4],
-            }],
-        );
+        let payload = SpeedPayload::from_sweep(WireProtocol::Jtag, &basic_sweep());
         assert_eq!(payload.transport, "jtag");
-        assert_eq!(payload.rows[0].chunk_ns, vec![1, 2, 3, 4]);
+        assert_eq!(payload.mode, "basic");
+        assert_eq!(payload.rows[0].chunk_ns, Some(vec![1, 2, 3, 4]));
+        assert_eq!(payload.rows[0].samples, vec![(4, 10)]);
+    }
+
+    /// An extended row carries its direction, size, repeats and failure, but no per-call times.
+    #[test]
+    fn an_extended_sweep_round_trips_through_a_reader() {
+        let sweep = speed::Sweep {
+            extended: true,
+            repeats: 2,
+            rows: vec![
+                speed::Row {
+                    requested_hz: 50_000_000,
+                    direction: speed::Direction::Write,
+                    access_bytes: 64,
+                    samples: vec![
+                        speed::Sample {
+                            calls: 400,
+                            ns: 100_000_000,
+                        },
+                        speed::Sample {
+                            calls: 500,
+                            ns: 100_000_000,
+                        },
+                    ],
+                    chunk_ns: vec![9, 9],
+                    error: Some("mismatch at 0x20041000".into()),
+                },
+                speed::Row {
+                    requested_hz: 50_000_000,
+                    direction: speed::Direction::Read,
+                    access_bytes: 64,
+                    samples: Vec::new(),
+                    chunk_ns: Vec::new(),
+                    error: Some("attach at 50000000 Hz: no ack".into()),
+                },
+            ],
+        };
+        let case = CaseRecord {
+            speed: Some(SpeedPayload::from_sweep(WireProtocol::Swd, &sweep)),
+            ..plain_case()
+        };
+        let read = read_speed(&render(&meta_for_test(), &case, 0));
+        assert_eq!(read.schema, 5);
+        assert_eq!((read.mode.as_str(), read.repeats), ("extended", 2));
+        assert_eq!(
+            read.rows,
+            vec![
+                ReadRow {
+                    requested_hz: 50_000_000,
+                    direction: "write".into(),
+                    access_bytes: 64,
+                    samples: vec![(400, 100_000_000), (500, 100_000_000)],
+                    median_kib_s: Some(281.25),
+                    error: Some("mismatch at 0x20041000".into()),
+                    chunk_ns: None,
+                },
+                ReadRow {
+                    requested_hz: 50_000_000,
+                    direction: "read".into(),
+                    access_bytes: 64,
+                    samples: Vec::new(),
+                    median_kib_s: None,
+                    error: Some("attach at 50000000 Hz: no ack".into()),
+                    chunk_ns: None,
+                },
+            ]
+        );
+    }
+
+    /// A basic sweep reads back with its per-call times.
+    #[test]
+    fn a_basic_sweep_round_trips_through_a_reader() {
+        let case = CaseRecord {
+            speed: Some(SpeedPayload::from_sweep(WireProtocol::Swd, &basic_sweep())),
+            ..plain_case()
+        };
+        let read = read_speed(&render(&meta_for_test(), &case, 0));
+        assert_eq!((read.mode.as_str(), read.repeats), ("basic", 1));
+        assert_eq!(read.rows[0].samples, vec![(4, 10)]);
+        assert_eq!(read.rows[0].chunk_ns, Some(vec![1, 2, 3, 4]));
+        assert_eq!(read.rows[0].direction, "read");
+    }
+
+    /// A schema-4 record, which carries no mode, series or load, still reads.
+    #[test]
+    fn a_schema_4_sweep_still_reads() {
+        assert_eq!(read_speed(PINNED_V4_SWEEP).schema, 4);
+    }
+
+    /// A schema-3 record, which names no firmware row, still reads.
+    #[test]
+    fn a_schema_3_sweep_still_reads() {
+        let v3 = PINNED_V4_SWEEP
+            .replace("\"schema_version\":4", "\"schema_version\":3")
+            .replace(
+                "\"firmware_row\":\"firmware/mculink\",\"firmware_row_source\":\"image\",",
+                "",
+            );
+        assert_eq!(read_speed(&v3).schema, 3);
+    }
+
+    /// A schema-2 record still reads: its rows are basic reads at the payload's `chunk_bytes`.
+    #[test]
+    fn a_schema_2_sweep_still_reads() {
+        let read = read_speed(PINNED_V2_SWEEP);
+        assert_eq!(read.schema, 2);
+        assert_eq!((read.mode.as_str(), read.repeats), ("basic", 1));
+        assert_eq!(
+            read.rows,
+            vec![ReadRow {
+                requested_hz: 25_000_000,
+                direction: "read".into(),
+                access_bytes: 4096,
+                samples: vec![(3, 214_500)],
+                median_kib_s: None,
+                error: None,
+                chunk_ns: Some(vec![71_500, 71_600, 71_400]),
+            }]
+        );
+    }
+
+    /// One basic row of four calls.
+    fn basic_sweep() -> speed::Sweep {
+        speed::Sweep {
+            extended: false,
+            repeats: 1,
+            rows: vec![speed::Row {
+                requested_hz: 1_000_000,
+                direction: speed::Direction::Read,
+                access_bytes: 4096,
+                samples: vec![speed::Sample { calls: 4, ns: 10 }],
+                chunk_ns: vec![1, 2, 3, 4],
+                error: None,
+            }],
+        }
+    }
+
+    /// A reader's view of a speed payload, whichever schema wrote it.
+    struct ReadSpeed {
+        schema: u64,
+        mode: String,
+        repeats: u64,
+        rows: Vec<ReadRow>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ReadRow {
+        requested_hz: u64,
+        direction: String,
+        access_bytes: u64,
+        samples: Vec<(u64, u64)>,
+        median_kib_s: Option<f64>,
+        error: Option<String>,
+        chunk_ns: Option<Vec<u64>>,
+    }
+
+    /// Parse a record line's speed payload, normalizing a schema-2 one.
+    fn read_speed(line: &str) -> ReadSpeed {
+        let v: serde_json::Value = serde_json::from_str(line).expect("a record is JSON");
+        let schema = v["schema_version"].as_u64().unwrap();
+        let p = &v["speed"];
+        let ns = |a: &serde_json::Value| -> Option<Vec<u64>> {
+            a.as_array()
+                .map(|a| a.iter().map(|n| n.as_u64().unwrap()).collect())
+        };
+        let rows = p["rows"].as_array().unwrap().iter();
+        if schema < 3 {
+            let access = p["chunk_bytes"].as_u64().unwrap();
+            return ReadSpeed {
+                schema,
+                mode: "basic".into(),
+                repeats: 1,
+                rows: rows
+                    .map(|r| {
+                        let chunk_ns = ns(&r["chunk_ns"]).unwrap();
+                        ReadRow {
+                            requested_hz: r["requested_hz"].as_u64().unwrap(),
+                            direction: "read".into(),
+                            access_bytes: access,
+                            samples: vec![(chunk_ns.len() as u64, chunk_ns.iter().sum())],
+                            median_kib_s: None,
+                            error: None,
+                            chunk_ns: Some(chunk_ns),
+                        }
+                    })
+                    .collect(),
+            };
+        }
+        ReadSpeed {
+            schema,
+            mode: p["mode"].as_str().unwrap().into(),
+            repeats: p["repeats"].as_u64().unwrap(),
+            rows: rows
+                .map(|r| ReadRow {
+                    requested_hz: r["requested_hz"].as_u64().unwrap(),
+                    direction: r["direction"].as_str().unwrap().into(),
+                    access_bytes: r["access_bytes"].as_u64().unwrap(),
+                    samples: r["samples"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|s| (s["calls"].as_u64().unwrap(), s["ns"].as_u64().unwrap()))
+                        .collect(),
+                    median_kib_s: r["median_kib_s"].as_f64(),
+                    error: r["error"].as_str().map(str::to_string),
+                    chunk_ns: ns(&r["chunk_ns"]),
+                })
+                .collect(),
+        }
+    }
+
+    /// A killed run shows as a selected name with no row and no fatal, so a start line is not a case.
+    #[test]
+    fn the_start_line_names_the_selection_and_is_not_a_case() {
+        let line = render_start(&meta_for_test(), &["identity", "info"], Some(1.5), 0);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        assert_eq!(v["event"], "start");
+        assert_eq!(v["selected"][1], "info");
+        assert_eq!(v["load1"], 1.5);
+        assert_eq!(v["mode"], "list");
+        assert!(v.get("case").is_none(), "{line}");
+    }
+
+    #[test]
+    fn waits_render_only_when_present() {
+        let mut case = plain_case();
+        assert!(!render(&meta_for_test(), &case, 0).contains("waits"));
+        case.waits = vec![WaitRecord {
+            name: "rtt.expect",
+            budget_ms: 3000,
+            max_ms: 412,
+            n: 2,
+        }];
+        assert!(render(&meta_for_test(), &case, 0)
+            .contains(r#""waits":[{"name":"rtt.expect","budget_ms":3000,"max_ms":412,"n":2}]"#));
+    }
+
+    #[test]
+    fn a_case_carries_its_load_and_a_run_its_series() {
+        let mut meta = meta_for_test();
+        meta.mode = "full";
+        meta.series = Some("attempt-a".into());
+        let case = CaseRecord {
+            load1: Some(0.25),
+            ..plain_case()
+        };
+        let v: serde_json::Value = serde_json::from_str(&render(&meta, &case, 0)).unwrap();
+        assert_eq!(v["mode"], "full");
+        assert_eq!(v["series"], "attempt-a");
+        assert_eq!(v["load1"], 0.25);
+    }
+
+    #[test]
+    fn the_ledger_path_ignores_the_binary_and_prefers_xdg_state() {
+        let path = |state: Option<&str>, home: Option<&str>| {
+            ledger_path(state.map(Into::into), home.map(Into::into))
+        };
+        assert_eq!(
+            path(Some("/s"), Some("/h")),
+            Some(PathBuf::from("/s/daplink/hil-runs.jsonl"))
+        );
+        assert_eq!(
+            path(None, Some("/h")),
+            Some(PathBuf::from("/h/.local/state/daplink/hil-runs.jsonl"))
+        );
+        assert_eq!(
+            path(Some(""), Some("/h")),
+            Some(PathBuf::from("/h/.local/state/daplink/hil-runs.jsonl"))
+        );
+        assert_eq!(path(None, None), None);
     }
 
     /// The taxonomy's four outcomes render as themselves; nothing infers one.
@@ -375,6 +819,8 @@ mod tests {
                 outcome,
                 detail: None,
                 duration_ms: 1,
+                load1: None,
+                waits: Vec::new(),
                 speed: None,
             };
             let line = render(&meta_for_test(), &case, 0);
@@ -390,6 +836,8 @@ mod tests {
     fn absent_keys_render_as_null() {
         let mut meta = meta_for_test();
         meta.serial = None;
+        meta.firmware_row = None;
+        meta.firmware_row_source = "none";
         meta.firmware_version = None;
         meta.dut_elf = None;
         let case = CaseRecord {
@@ -397,13 +845,57 @@ mod tests {
             outcome: "ok",
             detail: None,
             duration_ms: 1,
+            load1: None,
+            waits: Vec::new(),
             speed: None,
         };
         let line = render(&meta, &case, 0);
         assert!(line.contains("\"serial\":null"), "{line}");
+        assert!(
+            line.contains("\"firmware_row\":null,\"firmware_row_source\":\"none\""),
+            "{line}"
+        );
         assert!(line.contains("\"firmware_version\":null"), "{line}");
         assert!(line.contains("\"dut_elf\":null"), "{line}");
         assert!(line.contains("\"detail\":null"), "{line}");
+    }
+
+    /// A DUT that never answered records as absent, not as a blank identity.
+    #[test]
+    fn an_unread_dut_identity_renders_as_null() {
+        let mut meta = meta_for_test();
+        meta.dut = None;
+        let line = render(&meta, &plain_case(), 0);
+        assert!(line.contains(r#""dut":null,"mode""#), "{line}");
+    }
+
+    /// A DUT image predating the revision field records a null revision.
+    #[test]
+    fn a_dut_without_a_revision_records_the_rest() {
+        let mut meta = meta_for_test();
+        meta.dut = Some(DutIdRecord {
+            name: Some("rp2040".to_string()),
+            proto: Some(7),
+            revision: None,
+        });
+        let line = render(&meta, &plain_case(), 0);
+        assert!(
+            line.contains(r#""dut":{"name":"rp2040","proto":7,"revision":null}"#),
+            "{line}"
+        );
+    }
+
+    /// One outcome-only case record, for the tests that only vary the run identity.
+    fn plain_case() -> CaseRecord<'static> {
+        CaseRecord {
+            case: "connect",
+            outcome: "ok",
+            detail: None,
+            duration_ms: 1,
+            load1: None,
+            waits: Vec::new(),
+            speed: None,
+        }
     }
 
     /// A failure reason lands in the record verbatim, so it has to be escaped.
@@ -417,6 +909,8 @@ mod tests {
             outcome: "failed",
             detail: Some("mount \"/Volumes/DAPLINK\" went away"),
             duration_ms: 1,
+            load1: None,
+            waits: Vec::new(),
             speed: None,
         };
         let line = render(&meta_for_test(), &case, 0);
@@ -431,7 +925,7 @@ mod tests {
         assert_eq!(utc_iso(1_735_689_599), "2024-12-31T23:59:59Z");
     }
 
-    /// Records of one invocation share a run id, so two rigs recording into one tree do not mix.
+    /// Records of one invocation share a run id.
     #[test]
     fn a_run_id_is_stable_within_a_run_and_differs_between_runs() {
         let a = run_id();
@@ -482,6 +976,8 @@ mod tests {
             outcome: "ok",
             detail: None,
             duration_ms: 1,
+            load1: None,
+            waits: Vec::new(),
             speed: None,
         };
         append(&path, &meta_for_test(), &case).unwrap();
@@ -505,6 +1001,8 @@ mod tests {
             outcome: "ok",
             detail: None,
             duration_ms: 1,
+            load1: None,
+            waits: Vec::new(),
             speed: None,
         };
         append(&path, &meta_for_test(), &case).unwrap();
@@ -517,15 +1015,24 @@ mod tests {
     fn meta_for_test() -> RunMeta {
         RunMeta {
             run_id: "1f4-17a2b".to_string(),
+            mode: "list",
+            series: None,
             vid: 0x0d28,
             pid: 0x0204,
             serial: Some("0000ABCDEF012345".to_string()),
+            firmware_row: Some("firmware/mculink".to_string()),
+            firmware_row_source: "image",
             firmware_version: Some("2.1.1.gfeedc0ffee12".to_string()),
             harness_version: "2.1.1.gfeedc0ffee12",
             target: "rp2040",
             chip: "RP2040".to_string(),
             dut_elf: Some("target/rp2040.elf".to_string()),
             dut_uf2: None,
+            dut: Some(DutIdRecord {
+                name: Some("rp2040".to_string()),
+                proto: Some(8),
+                revision: Some("gfeedc0ffee12".to_string()),
+            }),
         }
     }
 }

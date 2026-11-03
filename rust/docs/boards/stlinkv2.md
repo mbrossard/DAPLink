@@ -22,3 +22,10 @@ pin, so JTAG and SWO are both composed but used alternately, the target's choice
 
 Build with `cargo build --release` in the firmware directory, then flash the ELF through the
 SWD header (`probe-rs download --chip STM32F103C8 <elf>`).
+
+The `conntest` feature replaces JTAG/SWO with an RTT GPIO scanner while retaining USB SWD.
+It checks PA7 output and PA6/PA10 inputs against `test-stm32f401` built with `conntest`;
+see the [test tool](../../tests/daplink-test/README.md#connectivity-scan).
+
+The `accel` feature selects SPI2-assisted SWD reads and complete-word GPIO JTAG scans,
+keeping the default image's USB identity and services. It is incompatible with `conntest`.

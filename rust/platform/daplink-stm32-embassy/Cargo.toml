@@ -5,33 +5,43 @@ edition = "2021"
 license = "Apache-2.0"
 description = "embassy-stm32 platform support for daplink-rs"
 
-# Own workspace: pulls an embedded HAL, so it resolves independently of any root.
 [workspace]
 
 [features]
-# The shared STM32 register seam for the SPI-session SWD engine; a firmware composing the accel
-# backend enables this and supplies the per-board half through `SpiSwdBoard`.
+# The shared STM32 register seam for the SPI-session SWD engine.
 spi-swd = ["dep:daplink-spi-swd"]
 
-# Chip-agnostic: the firmware supplies the embassy-stm32 chip feature (e.g. `stm32h523ce`).
+# `DAP_Transfer` and `DAP_TransferBlock` over the SPI-session seam.
+spi-block = ["spi-swd"]
+
+# The `DAP_TransferBlock` fast path for the bit-bang H5 image.
+block-swd = ["dep:daplink-spi-swd"]
+
+# Development only: a fixed GPIO toggle sequence on the probe pads at boot.
+wire-probe = []
+
+# The firmware selects the embassy-stm32 chip feature.
 [dependencies]
-# The SPI-session SWD engine, pulled in only by the `spi-swd` seam feature.
 daplink-spi-swd = { path = "../../crates/daplink-spi-swd", optional = true }
 embassy-stm32 = { version = "0.6.0", default-features = false, features = ["unstable-pac"] }
-# A saturated VCOM receive ring, which never goes idle, falls back to this timer; the time
-# driver stays the firmware's to install.
+embassy-usb-driver = "0.2"
+# The firmware installs the time driver.
 embassy-time = "0.5"
-# Races the VCOM receive wake against its saturation-fallback timer.
 embassy-futures = "0.1"
-# The VCOM seam parks on wakers its own USART interrupt fires.
 embassy-sync = "0.8"
 cortex-m = "0.7"
 static_cell = "2"
-# The USB serial string is cached in a static behind a critical section.
+# Guards the cached USB serial.
 critical-section = "1"
+daplink-core = { path = "../../crates/daplink-core" }
 daplink-rs = { path = "../../crates/daplink-rs" }
 daplink-embassy-usb = { path = "../daplink-embassy-usb" }
 
-# A chip feature only so the crate still builds and lints on its own; dependents ignore this.
+# A chip feature only so the crate builds on its own.
 [dev-dependencies]
 embassy-stm32 = { version = "0.6.0", features = ["stm32h523ce"] }
+# dap-rs as the reference for the block paths, both against one simulated target.
+dap-differential = { package = "dap-conformance", path = "../../crates/dap-conformance", features = ["differential"] }
+
+[target.'cfg(not(target_os = "none"))'.dev-dependencies]
+critical-section = { version = "1", features = ["std"] }

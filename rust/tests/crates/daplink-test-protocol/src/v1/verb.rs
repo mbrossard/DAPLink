@@ -3,11 +3,8 @@
 use super::{BurstSpec, RxCounters, TxCounters};
 use crate::{line, parse_u32};
 
-/// Reply to `V1 START`.
 pub const OK_V1_START: &str = "OK V1 START";
-/// Reply to `V1 STOP`.
 pub const OK_V1_STOPPED: &str = "OK V1 STOPPED";
-/// Reply to `V1 RESET`.
 pub const OK_V1_RESET: &str = "OK V1 RESET";
 
 /// Buffer a `V1 REPORT` reply needs; the ledger outgrows [`crate::MAX_LINE`].
@@ -32,7 +29,6 @@ impl DirMask {
         }
     }
 
-    /// The mask as written on the wire.
     pub const fn bits(self) -> u8 {
         self.0
     }
@@ -360,8 +356,6 @@ mod tests {
         assert!(line.len() < MAX_LINE);
     }
 
-    // --- reply vectors the tool string-matches against, pinned exactly ---
-
     #[test]
     fn the_acknowledgements_are_the_literals_the_tool_waits_for() {
         assert_eq!(OK_V1_START, "OK V1 START");
@@ -507,7 +501,6 @@ mod tests {
             payload: 1 << 33,
             frames: 12,
             credit: 4096,
-            complete: true,
         };
         let rx = RxCounters {
             verified: 100,

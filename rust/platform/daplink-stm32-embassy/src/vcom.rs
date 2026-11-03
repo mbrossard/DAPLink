@@ -1,11 +1,12 @@
-//! CDC-ACM VCOM USART seam: GPDMA on both legs, with the USART interrupt reduced to wakes.
+//! CDC-ACM VCOM USART seam: GPDMA on both legs, the USART interrupt reduced to wakes.
 
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 
-use daplink_embassy_usb::{SeamStats, VcomUart};
+use daplink_core::DmaTxCursor;
+use daplink_embassy_usb::{BaudApply, SeamStats, VcomUart};
 use daplink_rs::daplink_core::DEFAULT_VCOM_BAUD;
 use daplink_rs::{
     vcom_episodes, vcom_grade, DmaRxChannel, DmaRxRing, VCOM_GRADE_LOWER_BOUND,
@@ -27,80 +28,62 @@ use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{Duration, Timer};
 use static_cell::ConstStaticCell;
 
+use crate::baud::PRESCALERS;
+
 const RX_RING: usize = 2048;
 const TX_RING: usize = 2048;
 
-// `BR1.BNDT` is 16 bits of bytes, so one block transfer cannot exceed this either side.
+// `BR1.BNDT` is 16 bits of bytes.
 const _: () = assert!(RX_RING <= 0xFFFF);
 const _: () = assert!(TX_RING <= 0xFFFF);
 
-/// Fallback poll: a saturated stream never fires IDLE, and a ring a baud change emptied has no TC.
+/// Fallback poll: a saturated stream never fires IDLE, and a baud-emptied ring has no TC.
 const DMA_POLL: Duration = Duration::from_micros(500);
 
-/// Bound on the suspend handshake spin, so a wedged channel cannot hang the caller.
-const SUSPEND_SPINS: u32 = 10_000;
-
-/// Suspends whose bound expired with the channel still busy, either direction: the reset that
-/// follows lands on running hardware, so nothing the seam counted across one is evidence.
+/// Suspends, either direction, whose bound expired with the channel still busy.
 static DMA_FAULTS: AtomicU32 = AtomicU32::new(0);
-
-/// Suspend `ch` and wait for it to let go, charging a fault when the bound expires; the caller
-/// resets the channel either way, so an expired bound is recorded rather than passed over.
-fn suspend(ch: pac::gpdma::Channel) {
-    if !ch.cr().read().en() {
-        return;
-    }
-    ch.cr().modify(|w| w.set_susp(true));
-    let mut spins = 0;
-    while spins < SUSPEND_SPINS {
-        let sr = ch.sr().read();
-        if sr.suspf() || sr.idlef() {
-            return;
-        }
-        spins += 1;
-    }
-    DMA_FAULTS.fetch_add(1, Ordering::Relaxed);
-}
 
 /// Baud rate represented by the USART divisor currently on the wire.
 static REALIZED_BAUD: AtomicU32 = AtomicU32::new(DEFAULT_VCOM_BAUD);
 
-/// Frame/parity/noise episodes; the flagged byte still reaches the ring through DMA.
+/// Frame/parity/noise episodes; with `DDRE` clear, the flagged byte never reaches the ring.
 static FRAME_ERR: AtomicU32 = AtomicU32::new(0);
-/// Overrun episodes: the first RX FIFO entry survives, the shift register and what follows do not.
+/// Overrun episodes.
 static OVERRUN: AtomicU32 = AtomicU32::new(0);
-/// Bytes whose burst the transmit-complete interrupt reaped, so every counted byte left the wire.
+/// Bytes of reaped bursts, each fully off the wire.
 static UART_TX: AtomicU32 = AtomicU32::new(0);
 
 static RX_WAKER: AtomicWaker = AtomicWaker::new();
 static TX_WAKER: AtomicWaker = AtomicWaker::new();
 
-/// Append and armed-run positions; equal means empty, so one byte of the ring stays unused.
+/// Append and armed-run positions; equal means empty, so one ring byte stays unused.
 static TX_HEAD: AtomicUsize = AtomicUsize::new(0);
 static TX_TAIL: AtomicUsize = AtomicUsize::new(0);
-/// Bytes the current burst covers, zero when the channel is idle; `TAIL` advances by this on reap.
+/// Bytes the current burst covers, zero when idle.
 static TX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Bytes queued in the transmit ring, sent and unsent both.
-fn tx_queued(head: usize, tail: usize) -> usize {
-    (head + TX_RING - tail) % TX_RING
+/// Ring arithmetic over the three cursors.
+type TxCursor = DmaTxCursor<TX_RING>;
+
+/// Snapshot the three cursors; callers hold the mask.
+fn tx_cursor() -> TxCursor {
+    TxCursor::from_parts(
+        TX_HEAD.load(Ordering::Relaxed),
+        TX_TAIL.load(Ordering::Relaxed),
+        TX_INFLIGHT.load(Ordering::Relaxed),
+    )
 }
 
-/// Return the baud rate represented by the divisor the VCOM USART currently holds.
 pub fn vcom_realized_baud() -> u32 {
     REALIZED_BAUD.load(Ordering::Relaxed)
 }
 
-/// The seam's answer to the `0x9E` query: the realized rate plus the bridge's applied-ness.
+/// The `0x9E` query's answer: the realized rate plus whether it was applied.
 pub fn vcom_baud_state() -> daplink_rs::VcomBaudState {
     daplink_embassy_usb::vcom_baud_state(vcom_realized_baud())
 }
 
-/// Divisors the USART clock prescaler field selects, indexed by the field value (RM0481 PRESC).
-const PRESCALERS: [u32; 12] = [1, 2, 4, 6, 8, 10, 12, 16, 32, 64, 128, 256];
-
-/// Linked-list item closing the receive ring: `CDAR` then `CLLR`, in fetch order. 8-byte aligned
-/// so it cannot straddle the 64 KiB window `CLBAR` addresses.
+/// Linked-list item closing the receive ring: `CDAR` then `CLLR`; aligned so it never straddles 64 KiB.
 #[repr(C, align(8))]
 struct RxLli([u32; 2]);
 
@@ -113,7 +96,7 @@ fn rx_llr_value(lli: u32) -> pac::gpdma::regs::ChLlr {
     v
 }
 
-/// The GPDMA channel filling the receive ring, looped through a one-item list (no address wrap).
+/// The GPDMA channel filling the receive ring, looped through a one-item list.
 #[derive(Clone, Copy)]
 struct VcomRxChannel {
     dma: pac::gpdma::Gpdma,
@@ -133,10 +116,9 @@ impl VcomRxChannel {
         self.regs().cr().read().en()
     }
 
-    /// Arm the transfer at the ring's base.
     fn start(&self) {
         let ch = self.regs();
-        ch.cr().write(|w| w.set_reset(true));
+        crate::gpdma::halt(ch, &DMA_FAULTS);
         ch.fcr().write(|w| {
             w.set_dtef(true);
             w.set_htf(true);
@@ -164,17 +146,21 @@ impl VcomRxChannel {
         ch.sar().write_value(self.src);
         ch.dar().write_value(self.base);
         ch.llr().write_value(rx_llr_value(self.lli));
-        // The linked-list item and the configuration must be visible before the enable.
+        // The linked-list item and configuration must be visible before the enable.
         fence(Ordering::SeqCst);
         ch.cr().write(|w| w.set_en(true));
     }
 
-    /// Stop the transfer, ring memory untouched; the divisor may only change while it is stopped.
-    fn halt(&self) {
+    /// Undo suspension without resetting the channel.
+    fn resume(&self) {
         let ch = self.regs();
-        suspend(ch);
-        ch.cr().write(|w| w.set_reset(true));
-        fence(Ordering::SeqCst);
+        ch.fcr().write(|w| w.set_suspf(true));
+        ch.cr().modify(|w| w.set_susp(false));
+    }
+
+    /// Stop the transfer, ring memory untouched; the divisor changes only while stopped.
+    fn halt(&self) {
+        crate::gpdma::halt(self.regs(), &DMA_FAULTS);
     }
 }
 
@@ -193,7 +179,7 @@ impl DmaRxChannel for VcomRxChannel {
     }
 }
 
-/// The GPDMA channel draining one transmit burst; no linked list, so [`service`] arms each run.
+/// The GPDMA channel draining one transmit burst; [`service`] arms each run.
 #[derive(Clone, Copy)]
 struct VcomTxChannel {
     dma: pac::gpdma::Gpdma,
@@ -207,10 +193,8 @@ impl VcomTxChannel {
         self.dma.ch(self.ch)
     }
 
-    /// Arm a one-shot burst of `len` bytes starting at `src`.
-    fn start(&self, src: u32, len: usize) {
+    fn start_released(&self, src: u32, len: usize) {
         let ch = self.regs();
-        ch.cr().write(|w| w.set_reset(true));
         ch.fcr().write(|w| {
             w.set_dtef(true);
             w.set_htf(true);
@@ -241,12 +225,9 @@ impl VcomTxChannel {
         ch.cr().write(|w| w.set_en(true));
     }
 
-    /// Stop a burst mid-flight, same discipline as [`VcomRxChannel::halt`].
+    /// Stop a burst mid-flight, as [`VcomRxChannel::halt`] does.
     fn halt(&self) {
-        let ch = self.regs();
-        suspend(ch);
-        ch.cr().write(|w| w.set_reset(true));
-        fence(Ordering::SeqCst);
+        crate::gpdma::halt(self.regs(), &DMA_FAULTS);
     }
 }
 
@@ -260,8 +241,7 @@ struct IrqShared {
 
 struct IrqCell(UnsafeCell<Option<IrqShared>>);
 
-// SAFETY: written once by `StmVcom::new` with the USART line masked, and read only by that line's
-// handler afterwards.
+// SAFETY: written once by `StmVcom::new` with the line masked, then read only by its handler.
 unsafe impl Sync for IrqCell {}
 
 static IRQ: IrqCell = IrqCell(UnsafeCell::new(None));
@@ -278,8 +258,7 @@ impl<I: embassy_stm32::interrupt::typelevel::Interrupt> Handler<I> for VcomInter
     }
 }
 
-/// One interrupt pass: count a receive error, wake a reader on IDLE, and on TC reap the finished
-/// transmit burst and arm the next. No byte crosses this handler as data.
+/// One interrupt pass: count receive errors, wake a reader on IDLE, reap and re-arm on TC.
 fn service(shared: IrqShared) {
     let r = shared.regs;
     let sr = r.isr().read();
@@ -300,68 +279,78 @@ fn service(shared: IrqShared) {
         RX_WAKER.wake();
     }
     if sr.tc() {
-        // TC stays set with nothing left to send, so TCIE is disarmed here and re-armed per burst.
+        let mut cursor = tx_cursor();
+        if cursor.is_armed() {
+            shared.tx_chan.halt();
+        }
+        // TC stays set once idle, so TCIE is disarmed here and re-armed per burst.
         r.icr().write(|w| w.set_tc(true));
         r.cr1().modify(|w| w.set_tcie(false));
-        let inflight = TX_INFLIGHT.load(Ordering::Relaxed);
-        if inflight != 0 {
-            let tail = TX_TAIL.load(Ordering::Relaxed);
-            TX_TAIL.store((tail + inflight) % TX_RING, Ordering::Relaxed);
+        let reaped = cursor.reap();
+        if reaped != 0 {
+            TX_TAIL.store(cursor.parts().1, Ordering::Relaxed);
             TX_INFLIGHT.store(0, Ordering::Relaxed);
-            UART_TX.fetch_add(inflight as u32, Ordering::Relaxed);
+            UART_TX.fetch_add(reaped as u32, Ordering::Relaxed);
         }
         tx_kick_regs(r, shared.tx_chan, shared.tx_base);
         TX_WAKER.wake();
     }
 }
 
-/// Arm the run from `TAIL` to `HEAD` or the ring's end, if the channel is idle; caller holds the mask.
+/// Arm the run from `TAIL` if the channel is idle; caller holds the mask.
 fn tx_kick_regs(regs: pac::usart::Usart, tx_chan: VcomTxChannel, tx_base: u32) {
-    if TX_INFLIGHT.load(Ordering::Relaxed) != 0 {
+    let mut cursor = tx_cursor();
+    let Some((tail, run)) = cursor.arm() else {
         return;
-    }
-    let head = TX_HEAD.load(Ordering::Relaxed);
-    let tail = TX_TAIL.load(Ordering::Relaxed);
-    if head == tail {
-        return;
-    }
-    let run = if head > tail {
-        head - tail
-    } else {
-        TX_RING - tail
     };
+    tx_chan.halt();
     TX_INFLIGHT.store(run, Ordering::Relaxed);
     regs.icr().write(|w| w.set_tc(true));
     regs.cr1().modify(|w| w.set_tcie(true));
-    tx_chan.start(tx_base + tail as u32, run);
+    tx_chan.start_released(tx_base + tail as u32, run);
+}
+
+fn halt_for_baud(rx: VcomRxChannel, tx: VcomTxChannel, regs: pac::usart::Usart) {
+    rx.halt();
+    crate::gpdma::masked(|| {
+        // A suspended burst can finish a latched UART byte and raise TC.
+        regs.cr1().modify(|w| w.set_tcie(false));
+        tx.halt();
+        regs.icr().write(|w| w.set_tc(true));
+        let mut cursor = tx_cursor();
+        cursor.reset();
+        let (head, tail, inflight) = cursor.parts();
+        TX_HEAD.store(head, Ordering::Relaxed);
+        TX_TAIL.store(tail, Ordering::Relaxed);
+        TX_INFLIGHT.store(inflight, Ordering::Relaxed);
+    });
 }
 
 /// The USART seam the shared bridge drives: a GPDMA ring on receive, GPDMA bursts on transmit.
 pub struct StmVcom {
-    /// Holds the pins, clock and framing; the seam uses it only to reprogram the divisor.
+    /// Used only to reprogram the divisor.
     uart: Uart<'static, Blocking>,
-    /// The USART registers, for the divisor read-back, the TC mask, and the rejection undo.
+    /// For the divisor read-back, the TC mask and the rejection undo.
     regs: pac::usart::Usart,
-    /// The USART's NVIC line, left disabled by the HAL's baud-rejection path.
+    /// Left disabled by the HAL's baud-rejection path.
     nvic: Interrupt,
-    /// Kernel clock feeding this USART, ahead of its own prescaler.
+    /// Kernel clock ahead of the USART's own prescaler.
     kernel_clock: u32,
-    /// Lap accounting over the receive ring the GPDMA channel fills.
     rx: DmaRxRing<VcomRxChannel>,
-    /// A second handle to the same channel, for the direct halt a baud change needs.
+    /// A second handle to the channel, for the halt a baud change needs.
     rx_chan: VcomRxChannel,
-    /// The ring buffer the channel fills; read volatile through `rx`, never written here.
+    /// Read volatile through `rx`, never written here.
     mem: &'static [u8],
-    /// Bytes a lap overwrote before the bridge drained them, saturating.
+    /// Bytes lost to ring laps, saturating.
     rx_lost: u32,
     tx_chan: VcomTxChannel,
-    /// Base of the transmit ring; written only under the `TX_HEAD`/`TX_TAIL` guard.
+    /// Written only under the `TX_HEAD`/`TX_TAIL` guard.
     tx_base: u32,
 }
 
 impl StmVcom {
     /// Take over `uart`'s interrupt and two GPDMA channels; `regs`, `nvic` and `kernel_clock` must
-    /// name the same USART, whose line must be bound to [`VcomInterruptHandler`]. Call once.
+    /// name that USART, its line bound to [`VcomInterruptHandler`]. Call once.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         uart: Uart<'static, Blocking>,
@@ -385,14 +374,13 @@ impl StmVcom {
         static LLI: ConstStaticCell<RxLli> = ConstStaticCell::new(RxLli([0; 2]));
         let lli = LLI.take();
         let lli_addr = lli as *const RxLli as u32;
-        // SAFETY: `lli` is exclusively owned here; the words are `CDAR` then `CLLR`, the fetch
-        // order.
+        // SAFETY: `lli` is exclusively owned here.
         unsafe {
             core::ptr::write_volatile(&mut lli.0[0], base);
             core::ptr::write_volatile(&mut lli.0[1], rx_llr_value(lli_addr).0);
         }
 
-        // The channel peripherals are claimed for ownership; the registers go through `dma`/`ch`.
+        // Claimed for ownership; registers go through `dma`/`ch`.
         let _ = (rx_channel, tx_channel);
         let rx_chan = VcomRxChannel {
             dma: rx_dma,
@@ -423,12 +411,12 @@ impl StmVcom {
             });
         }
         regs.cr3().modify(|w| {
-            // EIE is how frame/noise/overrun still reach `service`: DMA cannot see those flags.
+            // EIE is how frame/noise/overrun reach `service`: DMA cannot see those flags.
             w.set_dmar(true);
             w.set_dmat(true);
             w.set_eie(true);
         });
-        // RXNEIE stays clear: every good byte leaves through DMA. TCIE is armed per burst.
+        // RXNEIE stays clear; TCIE is armed per burst.
         regs.cr1().modify(|w| {
             w.set_peie(true);
             w.set_idleie(true);
@@ -453,14 +441,14 @@ impl StmVcom {
         vcom
     }
 
-    /// Publish the rate the divisor chain the USART holds produces, read back not recomputed.
+    /// Publish the rate the USART's divisor chain produces, read back.
     fn record_realized_baud(&self) {
         let presc = PRESCALERS
             .get(usize::from(self.regs.presc().read().prescaler().to_bits()))
             .copied()
             .unwrap_or(1);
         let brr = u32::from(self.regs.brr().read().brr());
-        // Oversampling by 8: the register holds twice the divisor, bit 3 zeroed, low bits in place.
+        // OVER8: the register holds twice the divisor, bit 3 zeroed.
         let divisor = match self.regs.cr1().read().over8() {
             Over8::OVERSAMPLING8 => ((brr & !0xf) >> 1) | (brr & 0x7),
             Over8::OVERSAMPLING16 => brr,
@@ -471,7 +459,7 @@ impl StmVcom {
         }
     }
 
-    /// One non-blocking pass over the ring, charging what a lap lost to the ledger.
+    /// One non-blocking pass over the ring, charging lap losses.
     fn drain_rx(&mut self, buf: &mut [u8]) -> usize {
         let lost = self.rx.observe();
         self.rx_lost = self.rx_lost.saturating_add(lost as u32);
@@ -484,43 +472,37 @@ impl StmVcom {
         tx_kick_regs(self.regs, self.tx_chan, self.tx_base);
     }
 
-    /// Stage as much of `data` as the ring has room for; returns how many bytes were taken.
+    /// Stage as much of `data` as fits; returns the bytes taken.
     fn tx_push(&self, data: &[u8]) -> usize {
-        let head = TX_HEAD.load(Ordering::Relaxed);
-        let tail = TX_TAIL.load(Ordering::Relaxed);
-        let free = TX_RING - 1 - tx_queued(head, tail);
-        let n = data.len().min(free);
-        if n == 0 {
+        let mut cursor = tx_cursor();
+        let head = cursor.parts().0;
+        if data.is_empty() || cursor.free() == 0 {
             return 0;
         }
-        // Copy before `TX_HEAD` moves: a completion mid-copy must arm only what is published.
-        let first = (TX_RING - head).min(n);
-        // SAFETY: the bytes lie beyond `TX_HEAD` within the free count, so the channel is idle on them.
+        // Copy before `TX_HEAD` moves, so a completion arms only published bytes.
+        let taken = cursor.accept(data.len());
+        // SAFETY: the bytes lie beyond `TX_HEAD` within the free count, so the channel is not on them.
         unsafe {
             let base = self.tx_base as *mut u8;
-            core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(head), first);
-            if n > first {
-                core::ptr::copy_nonoverlapping(data.as_ptr().add(first), base, n - first);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(head), taken.first);
+            if taken.second != 0 {
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(taken.first), base, taken.second);
             }
         }
         // Publish and kick under one mask, or a completion re-arms against a stale `TX_HEAD`.
         cortex_m::interrupt::free(|_| {
-            TX_HEAD.store((head + n) % TX_RING, Ordering::Relaxed);
+            TX_HEAD.store(cursor.parts().0, Ordering::Relaxed);
             self.tx_kick();
         });
-        n
+        taken.taken
     }
 
-    /// Wait for the ring to free a byte, racing the fallback poll a baud-emptied ring needs.
+    /// Wait for ring room, racing the fallback poll a baud-emptied ring needs.
     async fn tx_wait_room(&self) {
         loop {
             let woken = poll_fn(|cx| {
                 TX_WAKER.register(cx.waker());
-                let queued = tx_queued(
-                    TX_HEAD.load(Ordering::Relaxed),
-                    TX_TAIL.load(Ordering::Relaxed),
-                );
-                if queued < TX_RING - 1 {
+                if tx_cursor().free() != 0 {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -535,16 +517,13 @@ impl StmVcom {
 }
 
 impl VcomUart for StmVcom {
-    /// Ring-full is this seam's own lap accounting; frame and overrun come from the error interrupt.
+    /// Ring-full from lap accounting; frame and overrun from the error interrupt.
     const SEAM_VALID: u32 = VCOM_VALID_RING_FULL
         | VCOM_VALID_FRAME_ERR
         | VCOM_VALID_OVERRUN
         | VCOM_VALID_UART_TX
         | VCOM_VALID_RX_DMA_ERR;
-    /// Lower bounds throughout: the position-only cursor aliases whole laps, one interrupt pass
-    /// can fold several error episodes, a baud change drops the transmit ring uncounted, and the
-    /// DMA slot counts only expired suspends -- the GPDMA's own `DTEF`/`ULEF`/`USEF` flags are
-    /// cleared unobserved at every arm.
+    /// Lower bounds: cursors alias whole laps, one pass can fold several errors, and a baud change drops TX uncounted.
     const SEAM_GRADE: u32 = vcom_grade(VCOM_SLOT_RING_FULL, VCOM_GRADE_LOWER_BOUND)
         | vcom_grade(VCOM_SLOT_FRAME_ERR, VCOM_GRADE_LOWER_BOUND)
         | vcom_grade(VCOM_SLOT_OVERRUN, VCOM_GRADE_LOWER_BOUND)
@@ -586,12 +565,12 @@ impl VcomUart for StmVcom {
             frame_err: FRAME_ERR.load(Ordering::Relaxed),
             overrun: OVERRUN.load(Ordering::Relaxed),
             uart_tx: UART_TX.load(Ordering::Relaxed),
-            // Either VCOM channel: a baud change re-arms the receive ring across every such reset.
+            // Either channel: a baud change re-arms the receive ring across every such reset.
             rx_dma_err: DMA_FAULTS.load(Ordering::Relaxed),
         }
     }
 
-    /// Stage `data` in the transmit ring; returns once it is queued, not once it is on the wire.
+    /// Stage `data` in the transmit ring; returns once queued, not once on the wire.
     async fn write_all(&mut self, data: &[u8]) {
         let mut sent = 0;
         while sent < data.len() {
@@ -602,15 +581,13 @@ impl VcomUart for StmVcom {
         }
     }
 
-    /// Empty-and-reaped is only ever established by TC, the completion of the last frame on the
-    /// wire, so this resolves at wire-idle with nothing further to prove.
+    /// Resolves at wire-idle: empty-and-reaped is established only by TC.
     async fn drain_tx(&mut self) {
         loop {
             let idle = poll_fn(|cx| {
                 TX_WAKER.register(cx.waker());
-                let empty = TX_HEAD.load(Ordering::Relaxed) == TX_TAIL.load(Ordering::Relaxed)
-                    && TX_INFLIGHT.load(Ordering::Relaxed) == 0;
-                if empty {
+                let cursor = tx_cursor();
+                if cursor.queued() == 0 && !cursor.is_armed() {
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -623,31 +600,103 @@ impl VcomUart for StmVcom {
         }
     }
 
-    fn set_baudrate(&mut self, baud: u32) {
-        // Both channels stop first: a divisor change under a running transfer invalidates its counter.
-        self.rx_chan.halt();
-        // Mask TCIE across the halt: a suspended burst can still finish a latched byte and raise TC.
-        cortex_m::interrupt::free(|_| {
-            self.regs.cr1().modify(|w| w.set_tcie(false));
-            self.tx_chan.halt();
-            self.regs.icr().write(|w| w.set_tc(true));
-            // Queued bytes were framed at the old rate; the whole ring is dropped.
-            TX_HEAD.store(0, Ordering::Relaxed);
-            TX_TAIL.store(0, Ordering::Relaxed);
-            TX_INFLIGHT.store(0, Ordering::Relaxed);
-        });
-        // Outside the mask: wakes a writer waiting on room this just freed.
+    /// Suspended, not reset: the counter stays readable and later bytes count as overruns.
+    fn halt_rx(&mut self) {
+        crate::gpdma::suspend(self.rx_chan.regs(), &DMA_FAULTS);
+    }
+
+    fn set_baudrate(&mut self, baud: u32) -> BaudApply {
+        // Reject before stopping DMA or letting the HAL disable the USART.
+        if !crate::baud::supported(self.kernel_clock, baud) {
+            self.rx_chan.resume();
+            return BaudApply::Rejected;
+        }
+        // Stop both channels first: a divisor change invalidates a running transfer's counter.
+        halt_for_baud(self.rx_chan, self.tx_chan, self.regs);
+        // Outside the mask: wakes a writer waiting on the freed room.
         TX_WAKER.wake();
-        // A rate the USART cannot realize leaves the previous divisor in force.
-        if self.uart.set_baudrate(baud).is_err() {
+        // An unrealizable rate leaves the previous divisor in force.
+        let applied = self.uart.set_baudrate(baud).is_ok();
+        if !applied {
             // The HAL's rejection path leaves UE and the NVIC line disabled; restore both.
             self.regs.cr1().modify(|w| w.set_ue(true));
             self.nvic.unpend();
-            // SAFETY: the seam's handler state has been published since construction.
+            // SAFETY: the handler state has been published since construction.
             unsafe { self.nvic.enable() };
         }
         self.record_realized_baud();
-        // Restart discards the old framing and re-bases the cursor, closing any accumulated lap.
+        // Restart re-bases the cursor, closing any accumulated lap.
         self.rx.restart();
+        if applied {
+            BaudApply::Applied
+        } else {
+            BaudApply::Rejected
+        }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn stop_test() {
+    use crate::gpdma::tests::{registers, reset_count, script, trapped, uart};
+    let dma = registers();
+    let regs = uart();
+    let rx = VcomRxChannel {
+        dma,
+        ch: 1,
+        request: 2,
+        base: 0x2000_0100,
+        src: 0x4000_0000,
+        lli: 0x2000_1000,
+    };
+    let tx = VcomTxChannel {
+        dma,
+        ch: 2,
+        request: 3,
+        dst: 0x4000_0004,
+    };
+    for failed_rx in [true, false] {
+        TX_HEAD.store(23, Ordering::Relaxed);
+        TX_TAIL.store(4, Ordering::Relaxed);
+        TX_INFLIGHT.store(7, Ordering::Relaxed);
+        script(rx.regs(), (true, !failed_rx, !failed_rx), None, false);
+        script(tx.regs(), (true, false, false), None, false);
+        let before = tx_cursor().parts();
+        let faults = DMA_FAULTS.load(Ordering::Relaxed);
+        trapped(|| halt_for_baud(rx, tx, regs));
+        assert_eq!(tx_cursor().parts(), before);
+        assert_eq!(DMA_FAULTS.load(Ordering::Relaxed), faults + 1);
+        assert_eq!(reset_count(tx.regs()), 0);
+        assert!(!rx.regs().cr().read().en());
+        assert_eq!(regs.brr().read().brr(), 0);
+    }
+    let before = tx_cursor().parts();
+    let sent = UART_TX.load(Ordering::Relaxed);
+    unsafe { (regs.isr().as_ptr() as *mut u32).write_volatile(1 << 6) };
+    trapped(|| {
+        service(IrqShared {
+            regs,
+            tx_chan: tx,
+            tx_base: 0x2000_2000,
+        })
+    });
+    assert_eq!(tx_cursor().parts(), before);
+    assert_eq!(UART_TX.load(Ordering::Relaxed), sent);
+    TX_INFLIGHT.store(0, Ordering::Relaxed);
+    let before = tx_cursor().parts();
+    trapped(|| tx_kick_regs(regs, tx, 0x2000_2000));
+    assert_eq!(tx_cursor().parts(), before);
+    assert_eq!(tx.regs().sar().read(), 0);
+    script(rx.regs(), (false, true, false), None, false);
+    script(tx.regs(), (false, true, false), None, false);
+    halt_for_baud(rx, tx, regs);
+    assert_eq!(tx_cursor().parts(), (0, 0, 0));
+    let mut rx = rx;
+    rx.reload(RX_RING);
+    assert_eq!(rx.regs().dar().read(), rx.base);
+    assert!(rx.regs().cr().read().en());
+    TX_HEAD.store(17, Ordering::Relaxed);
+    tx_kick_regs(regs, tx, 0x2000_2000);
+    assert_eq!(tx.regs().sar().read(), 0x2000_2000);
+    assert_eq!(tx.regs().br1().read().bndt(), 17);
+    assert_eq!(TX_INFLIGHT.load(Ordering::Relaxed), 17);
 }

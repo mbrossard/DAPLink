@@ -1,29 +1,23 @@
-//! VCOM realized-baud query (`0x9E`): the echoed id, the realized and applied rates, then a
-//! `flags` word saying whether the seam sources applied-ness and whether a change is in flight.
+//! VCOM realized-baud query (`0x9E`): echoed id, realized and applied rates, then a `flags` word.
 
 use daplink_core::vendor::VendorHandler;
 
 /// Vendor command id for the VCOM realized-baud query (`ID_DAP_Vendor30`).
 pub const VCOM_BAUD_CMD_ID: u8 = 0x9E;
 
-/// The first reply form: the echoed id and the little-endian realized rate. Hosts tell the forms
-/// apart by length alone, so firmware older than the bump stays readable.
+/// The first reply form: echoed id and little-endian realized rate; hosts tell forms apart by length.
 pub const VCOM_BAUD_V1_RESPONSE_LEN: usize = 5;
 
 /// Total response length: the echoed id, `realized`, `applied`, then `flags`.
 pub const VCOM_BAUD_RESPONSE_LEN: usize = 13;
-// One full-speed DAP packet, so the query stays a single exchange on every probe in the fleet.
 const _: () = assert!(VCOM_BAUD_RESPONSE_LEN <= 64);
 
-/// `flags` bit: this seam observes whether a requested rate has reached the divisor, so
-/// [`VCOM_BAUD_SETTLED`] and `applied` mean something. Clear, and the host must not read either.
+/// `flags` bit: the seam observes whether a requested rate reached the divisor.
 pub const VCOM_BAUD_APPLIED_VALID: u32 = 1 << 0;
-/// `flags` bit: no rate change is in flight, so `realized` describes a rate nothing is queued
-/// behind. Meaningful only where [`VCOM_BAUD_APPLIED_VALID`] is set.
+/// `flags` bit: no rate change is in flight; meaningful only with [`VCOM_BAUD_APPLIED_VALID`].
 pub const VCOM_BAUD_SETTLED: u32 = 1 << 1;
 
-/// What the probe answers `0x9E` with. A seam that defers a rate change until its transmitter
-/// idles must report the deferral rather than let the host infer settling from a timeout.
+/// What the probe answers `0x9E` with.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct VcomBaudState {
     /// Rate the divisor now on the wire produces, `0` before the first programming.
@@ -35,8 +29,7 @@ pub struct VcomBaudState {
 }
 
 impl VcomBaudState {
-    /// Every seam in the fleet defers a rate change until its transmitter is idle. One that did
-    /// not would pass `settled` permanently true rather than leave the flag out.
+    /// A seam that defers a rate change until its transmitter is idle.
     pub const fn deferred(realized: u32, applied: u32, settled: bool) -> Self {
         let settled = if settled { VCOM_BAUD_SETTLED } else { 0 };
         Self {
@@ -59,15 +52,13 @@ impl VcomBaudState {
     }
 }
 
-/// Answers [`VCOM_BAUD_CMD_ID`] with the injected reader's state and declines everything else, so
-/// it chains with the other vendor commands in the one vendor slot.
+/// Answers [`VCOM_BAUD_CMD_ID`] with the injected reader's state and declines everything else.
 pub struct VcomBaudVendor {
     state: fn() -> VcomBaudState,
 }
 
 impl VcomBaudVendor {
-    /// `state` reads the rate the firmware's VCOM baud programming last published, and whether a
-    /// requested rate is still waiting to reach the divisor.
+    /// `state` reads the last published rate and whether a request is still pending.
     pub const fn new(state: fn() -> VcomBaudState) -> Self {
         Self { state }
     }
@@ -86,7 +77,6 @@ impl VendorHandler for VcomBaudVendor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daplink_core::vendor::VendorChain;
 
     fn settled() -> VcomBaudState {
         VcomBaudState::deferred(2_666_666, 2_666_666, true)
@@ -159,7 +149,7 @@ mod tests {
                 })
             }
         }
-        let mut chain = VendorChain::new(Other, VcomBaudVendor::new(settled));
+        let mut chain = (Other, VcomBaudVendor::new(settled));
         let mut resp = [0u8; 16];
         assert_eq!(chain.handle(&[0x9F], &mut resp), Some(2));
         assert_eq!(

@@ -110,6 +110,10 @@ name = "daplink-core"
 version = "0.1.0"
 
 [[package]]
+name = "daplink-decoder"
+version = "0.1.0"
+
+[[package]]
 name = "daplink-flash"
 version = "0.1.0"
 dependencies = [
@@ -133,6 +137,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "daplink-spi-swd"
+version = "0.1.0"
+dependencies = [
+ "dap-rs",
+ "daplink-core",
+]
+
+[[package]]
 name = "daplink-stm32f1-hal"
 version = "0.1.0"
 dependencies = [
@@ -146,6 +158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "daplink-stm32f1-spi-swd"
+version = "0.1.0"
+dependencies = [
+ "daplink-rs",
+ "daplink-spi-swd",
+ "stm32f1",
+]
+
+[[package]]
 name = "daplink-targets"
 version = "0.1.0"
 dependencies = [
@@ -153,11 +174,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "daplink-test-protocol"
+version = "0.1.0"
+dependencies = [
+ "daplink-core",
+]
+
+[[package]]
 name = "daplink-usb-device"
 version = "0.1.0"
 dependencies = [
+ "daplink-core",
  "daplink-rs",
+ "daplink-vfs",
  "usb-device",
+]
+
+[[package]]
+name = "daplink-vfs"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "daplink-core",
+ "daplink-decoder",
+ "heapless",
+ "portable-atomic",
+ "static_cell",
 ]
 
 [[package]]
@@ -322,6 +364,9 @@ name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+dependencies = [
+ "critical-section",
+]
 
 [[package]]
 name = "proc-macro2"
@@ -379,6 +424,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtt-target"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10b34c9e6832388e45f3c01f1bb60a016384a0a4ad80cdd7d34913bed25037f0"
+dependencies = [
+ "critical-section",
+ "ufmt-write",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -424,10 +479,14 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "daplink-rs",
+ "daplink-spi-swd",
  "daplink-stm32f1-hal",
+ "daplink-stm32f1-spi-swd",
+ "daplink-test-protocol",
  "daplink-usb-device",
  "panic-halt",
  "rtic",
+ "rtt-target",
  "static_cell",
  "stm32f1xx-hal",
 ]
@@ -501,6 +560,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "ufmt-write"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e87a2ed6b42ec5e28cc3b94c09982969e9227600b2e3dcbc1db927a84c06bd69"
 
 [[package]]
 name = "unicode-ident"

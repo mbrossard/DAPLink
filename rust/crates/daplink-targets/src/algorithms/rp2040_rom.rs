@@ -1,4 +1,9 @@
-//! Generated RAM-resident shim over the RP2040 bootrom flash API. Do not edit by hand.
+//! ROM-call flash algorithm for the RP2040 external QSPI flash controller.
+//!
+//! Generated; do not edit by hand.
+//! The image is a RAM-resident, position-independent shim over the RP2040 bootrom
+//! flash API; entry fields are offsets from `algo_start`, the rest are absolute
+//! addresses in the RAM window.
 
 use crate::{FlashAlgorithm, SyscallParams};
 

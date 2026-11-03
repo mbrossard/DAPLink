@@ -1,16 +1,27 @@
-//! The info case.
-
+use crate::dap::RawDap;
 use crate::{Ctx, Failure};
 
 /// Check the probe's `DAP_Info` surface over raw CMSIS-DAP v2 bulk.
 pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
+    // A probe that misreports its own identity leaves nothing later cases can trust.
     inner(cx, full_run).map_err(Failure::Fatal)
+}
+
+/// One `DAP_Info` value, refused when its length or terminator is not what its type allows.
+fn info(dap: &mut RawDap, id: u8) -> Result<Vec<u8>, String> {
+    let (value, findings) = dap.dap_info_checked(id)?;
+    if !findings.is_empty() {
+        return Err(format!(
+            "DAP_Info({id:#04x}) answered {value:02x?}, which CMSIS-DAP does not allow: {findings:?}"
+        ));
+    }
+    Ok(value)
 }
 
 fn inner(cx: &mut Ctx, _full_run: bool) -> Result<(), String> {
     let mut dap = crate::dap::open(&cx.selector)?;
 
-    let version = dap.dap_info(0x04)?;
+    let version = info(&mut dap, 0x04)?;
     let version = core::str::from_utf8(&version).map_err(|_| "version is not UTF-8")?;
     let version = version.trim_end_matches('\0');
     let triple_ok = version.split('.').take(3).filter(|p| !p.is_empty()).count() == 3
@@ -24,12 +35,12 @@ fn inner(cx: &mut Ctx, _full_run: bool) -> Result<(), String> {
         ));
     }
 
-    let caps = dap.dap_info(0xF0)?;
+    let caps = info(&mut dap, 0xF0)?;
     if caps.first().is_none_or(|b| b & 1 == 0) {
         return Err(format!("capabilities {caps:02x?} do not advertise SWD"));
     }
 
-    let size = dap.dap_info(0xFF)?;
+    let size = info(&mut dap, 0xFF)?;
     // Both 64 (full speed) and 512 (high speed) are valid; range check only.
     let size = match size[..] {
         [lo, hi] => u16::from_le_bytes([lo, hi]),
@@ -39,7 +50,7 @@ fn inner(cx: &mut Ctx, _full_run: bool) -> Result<(), String> {
         return Err(format!("packet size {size} out of range 64..=512"));
     }
 
-    let count = dap.dap_info(0xFE)?;
+    let count = info(&mut dap, 0xFE)?;
     if count.first().is_none_or(|&c| c < 1) {
         return Err(format!("packet count {count:02x?} is below 1"));
     }

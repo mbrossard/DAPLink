@@ -16,7 +16,7 @@ pub struct DmaRingCursor {
 }
 
 impl DmaRingCursor {
-    /// A cursor for a ring of `len` units, positioned at the start with nothing available.
+    /// A cursor for a ring of `len` units, empty at the start.
     ///
     /// # Panics
     ///
@@ -49,8 +49,7 @@ impl DmaRingCursor {
         self.avail == 0
     }
 
-    /// Units waiting at `write_pos`, without folding it in. Advisory: a plain cursor difference,
-    /// so it never exceeds `len` and cannot report a lap.
+    /// Units waiting at `write_pos`, without folding it in; never reports a lap.
     #[inline]
     pub const fn pending_at(&self, write_pos: usize) -> usize {
         let write = if write_pos >= self.len { 0 } else { write_pos };
@@ -61,14 +60,12 @@ impl DmaRingCursor {
         }
     }
 
-    /// Fold the write position into the backlog, returning the units a lap overwrote. A position
-    /// of `len` (the wrap instant) or beyond folds to `0`; an exactly full ring is not a lap.
+    /// Fold `write_pos` into the backlog, returning units a lap overwrote; `len` or beyond folds to 0.
     pub fn observe(&mut self, write_pos: usize) -> usize {
         self.observe_reloaded(write_pos, false)
     }
 
-    /// [`observe`](Self::observe) for a caller that also knows whether the transfer counter
-    /// reloaded since the last observation.
+    /// [`observe`](Self::observe) that also knows whether the transfer counter reloaded.
     pub fn observe_reloaded(&mut self, write_pos: usize, reloaded: bool) -> usize {
         let len = self.len;
         let w = if write_pos >= len { 0 } else { write_pos };
@@ -80,8 +77,7 @@ impl DmaRingCursor {
         self.observe_produced(produced)
     }
 
-    /// [`observe`](Self::observe) for a caller whose channel reports an absolute production count
-    /// rather than a position: no aliasing limit, so a stall of several rings is charged in full.
+    /// [`observe`](Self::observe) from an absolute production count, which has no aliasing limit.
     pub fn observe_produced(&mut self, produced: usize) -> usize {
         let len = self.len;
         // Wrap by subtraction: this runs per unit drained and ARMv6-M has no divide instruction.
@@ -103,8 +99,7 @@ impl DmaRingCursor {
         }
     }
 
-    /// Take the index of the next unit to read, or `None` when the backlog is empty. Consuming:
-    /// the caller must read that index before calling again.
+    /// Take the index of the next unit to read, or `None` when empty.
     #[inline]
     pub fn next_index(&mut self) -> Option<usize> {
         if self.avail == 0 {
@@ -116,8 +111,7 @@ impl DmaRingCursor {
         Some(index)
     }
 
-    /// Discard the backlog and re-base both cursors at the ring's start. Correct only when the
-    /// caller reloads the transfer counter in the same breath.
+    /// Discard the backlog and re-base at the start; the caller must reload the counter with it.
     #[inline]
     pub fn reset(&mut self) {
         self.read = 0;
@@ -131,8 +125,7 @@ pub trait DmaRxChannel {
     /// Units still to be written before the counter reloads, within the current lap.
     fn remaining(&self) -> usize;
 
-    /// [`remaining`](Self::remaining), plus whether the counter reloaded since the previous call.
-    /// Consuming: an implementation latching a hardware flag clears it here.
+    /// [`remaining`](Self::remaining) plus whether the counter reloaded since; one flag cannot count laps.
     fn sample(&mut self) -> (usize, bool) {
         (self.remaining(), false)
     }
@@ -140,26 +133,24 @@ pub trait DmaRxChannel {
     /// Stop the transfer, reload the counter to `len` units, and start it again.
     fn reload(&mut self, len: usize);
 
-    /// Whether the transfer is running. A stopped channel is not observed, so a backlog captured
-    /// before the stop stays readable.
+    /// Whether the transfer is running; a stopped channel is not observed.
     fn running(&self) -> bool {
         true
     }
 }
 
-/// A circular DMA receive ring: a [`DmaRingCursor`] plus the counter read, the volatile data read
-/// and the restart. Owns no memory; the caller passes the buffer the controller fills.
+/// A circular DMA receive ring over a caller-owned buffer.
 pub struct DmaRxRing<C> {
     cursor: DmaRingCursor,
     chan: C,
 }
 
 impl<C: DmaRxChannel> DmaRxRing<C> {
-    /// A ring of `len` units on `chan`, positioned at the start.
+    /// A ring of `len` units on `chan`.
     ///
     /// # Panics
     ///
-    /// If `len` is zero (see [`DmaRingCursor::new`]).
+    /// If `len` is zero.
     pub fn new(chan: C, len: usize) -> Self {
         Self {
             cursor: DmaRingCursor::new(len),
@@ -185,15 +176,13 @@ impl<C: DmaRxChannel> DmaRxRing<C> {
         self.cursor.is_empty()
     }
 
-    /// Units waiting right now, read from the counter without folding it in. Advisory: see
-    /// [`DmaRingCursor::pending_at`].
+    /// Units waiting now, without folding the counter in.
     #[inline]
     pub fn pending(&self) -> usize {
         self.cursor.pending_at(self.write_pos())
     }
 
-    /// The index the controller will write next. A counter reading of zero maps to `len`, and a
-    /// larger reading is clamped; [`DmaRingCursor::observe`] folds both back to position 0.
+    /// The index the controller writes next; a zero counter maps to `len`, a larger one clamps.
     #[inline]
     pub fn write_pos(&self) -> usize {
         let len = self.cursor.len();
@@ -201,8 +190,7 @@ impl<C: DmaRxChannel> DmaRxRing<C> {
         len - self.chan.remaining().min(len)
     }
 
-    /// Fold the transfer counter into the backlog, returning the units a lap overwrote. Folding
-    /// on every call, the empty ones included, is what turns a wrapping position into a count.
+    /// Fold the counter into the backlog, returning the units a lap overwrote.
     #[inline]
     pub fn observe(&mut self) -> usize {
         if !self.chan.running() {
@@ -214,17 +202,21 @@ impl<C: DmaRxChannel> DmaRxRing<C> {
             .observe_reloaded(len - remaining.min(len), reloaded)
     }
 
-    /// Take the next unit out of `mem`, or `None` once the reader has caught up. A slice shorter
-    /// than [`capacity`](DmaRxRing::capacity) yields `None` rather than a read past its end.
+    /// Take the next unit out of `mem`, or `None` once caught up or past `mem`'s end.
     #[inline]
     pub fn next_byte(&mut self, mem: &[u8]) -> Option<u8> {
+        self.next_with(|index| {
+            // SAFETY: the lookup bounds the volatile read.
+            mem.get(index)
+                .map(|slot| unsafe { core::ptr::read_volatile(slot) })
+        })
+    }
+
+    fn next_with(&mut self, mut read: impl FnMut(usize) -> Option<u8>) -> Option<u8> {
         let index = self.cursor.next_index()?;
         // The counter read must be ordered before the data read, or the compiler may reuse it.
         compiler_fence(Ordering::Acquire);
-        let slot = mem.get(index)?;
-        // SAFETY: in bounds by the lookup above; volatile because the controller's write to it
-        // is invisible to the compiler.
-        Some(unsafe { core::ptr::read_volatile(slot) })
+        read(index)
     }
 
     /// Fold the counter in and take one unit, with the units a lap overwrote since the last call.
@@ -234,13 +226,25 @@ impl<C: DmaRxChannel> DmaRxRing<C> {
         (self.next_byte(mem), lost)
     }
 
-    /// Fold the counter in and copy up to `out.len()` units out of `mem`: the batched receive
-    /// path. Returns the units copied and the units a lap overwrote.
+    /// Fold the counter in and copy up to `out.len()` units; returns (copied, lost to a lap).
     pub fn read(&mut self, mem: &[u8], out: &mut [u8]) -> (usize, usize) {
+        self.read_with(out, |index| {
+            // SAFETY: the lookup bounds the volatile read.
+            mem.get(index)
+                .map(|slot| unsafe { core::ptr::read_volatile(slot) })
+        })
+    }
+
+    /// Read through a storage accessor, called after the counter fence for each consumed index.
+    pub fn read_with(
+        &mut self,
+        out: &mut [u8],
+        mut read: impl FnMut(usize) -> Option<u8>,
+    ) -> (usize, usize) {
         let lost = self.observe();
         let mut n = 0;
         while n < out.len() {
-            match self.next_byte(mem) {
+            match self.next_with(&mut read) {
                 Some(b) => {
                     out[n] = b;
                     n += 1;
@@ -251,8 +255,7 @@ impl<C: DmaRxChannel> DmaRxRing<C> {
         (n, lost)
     }
 
-    /// Re-base the cursor at the ring's base. Correct only when the caller reloads the transfer
-    /// counter in the same breath; [`restart`](DmaRxRing::restart) does both.
+    /// Re-base the cursor; the caller reloads the counter, as [`restart`](DmaRxRing::restart) does.
     pub fn reset_cursor(&mut self) {
         // A latched reload belongs to the discarded session; consume it so it isn't charged later.
         let _ = self.chan.sample();
@@ -260,8 +263,7 @@ impl<C: DmaRxChannel> DmaRxRing<C> {
         compiler_fence(Ordering::Release);
     }
 
-    /// Restart the transfer, discarding everything in flight. The counter reload and the cursor
-    /// re-base happen together, which is the only reason re-basing at the ring's base is correct.
+    /// Restart the transfer, discarding everything in flight.
     pub fn restart(&mut self) {
         self.chan.reload(self.cursor.len());
         self.reset_cursor();
@@ -276,7 +278,6 @@ mod pending_tests {
     fn pending_reports_the_gap_without_moving_the_cursor() {
         let mut c = DmaRingCursor::new(8);
         assert_eq!(c.pending_at(3), 3);
-        // Advisory only: asking does not advance anything.
         assert_eq!(c.available(), 0);
         c.observe(3);
         assert_eq!(c.available(), 3);
@@ -300,6 +301,42 @@ mod pending_tests {
 mod tests {
     use super::{DmaRingCursor, DmaRxChannel, DmaRxRing};
     use core::cell::Cell;
+
+    #[test]
+    fn storage_accessor_preserves_order_and_partial_reads() {
+        let remaining = Cell::new(4);
+        let running = Cell::new(true);
+        let mut ring = model_ring(4, &remaining, &running);
+        remaining.set(1);
+        let mut out = [0; 2];
+        assert_eq!(ring.read_with(&mut out, |i| Some(10 + i as u8)), (2, 0));
+        assert_eq!(out, [10, 11]);
+        assert_eq!(ring.available(), 1);
+        assert_eq!(ring.read_with(&mut out, |i| Some(10 + i as u8)), (1, 0));
+        assert_eq!(out[0], 12);
+        assert_eq!(ring.read_with(&mut out, |_| panic!("empty ring")), (0, 0));
+    }
+
+    #[test]
+    fn storage_accessor_matches_slice_lap_and_short_storage_behavior() {
+        let remaining = Cell::new(4);
+        let running = Cell::new(true);
+        let mut a = model_ring(4, &remaining, &running);
+        let mut b = model_ring(4, &remaining, &running);
+        remaining.set(1);
+        a.observe();
+        b.observe();
+        remaining.set(2);
+        let mem = [20, 21, 22];
+        let mut first = [0; 4];
+        let mut second = [0; 4];
+        assert_eq!(
+            a.read(&mem, &mut first),
+            b.read_with(&mut second, |i| mem.get(i).copied())
+        );
+        assert_eq!(first, second);
+        assert_eq!(a.available(), b.available());
+    }
 
     /// Drain the whole backlog into `out`, returning the filled prefix.
     fn drain<'a>(c: &mut DmaRingCursor, out: &'a mut [usize; 16]) -> &'a [usize] {
@@ -344,7 +381,6 @@ mod tests {
 
     #[test]
     fn an_exactly_full_ring_is_not_a_lap() {
-        // A loss here would be a false positive on a boundary healthy traffic actually visits.
         let mut c = DmaRingCursor::new(8);
         assert_eq!(c.observe(4), 0);
         assert_eq!(c.observe(0), 0);
@@ -385,8 +421,7 @@ mod tests {
 
     #[test]
     fn a_stall_longer_than_a_whole_ring_aliases_and_understates() {
-        // The documented residual limit: 11 units into an 8-ring land the writer at position 3,
-        // and a position-only fold cannot tell that stall from 3 units of healthy traffic.
+        // Position-only folding cannot tell 11 units into an 8-ring from 3.
         let mut aliased = DmaRingCursor::new(8);
         assert_eq!(aliased.observe(11 % 8), 0, "the lap goes unreported");
         assert_eq!(aliased.available(), 3, "five surviving units go unseen");
@@ -428,7 +463,6 @@ mod tests {
         let mut c = DmaRingCursor::new(8);
         assert_eq!(c.observe_produced(24), 16);
         assert_eq!(c.available(), 8);
-        // Resynchronized onto the oldest survivor, which is where the writer left off.
         assert_eq!(drain(&mut c, &mut [0; 16]), [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
@@ -510,8 +544,7 @@ mod tests {
         (k % 251) as u8
     }
 
-    /// Counter, memory and cursor modelled together: the `len - remaining` derivation callers
-    /// perform is where the boundaries live.
+    /// Counter, memory and cursor modelled together.
     struct DmaModel {
         len: usize,
         /// The controller's next write index, always below `len`.
@@ -765,7 +798,6 @@ mod tests {
                     assert_eq!(m.reported, over, "the loss is the overshoot, exactly");
                     assert_eq!(m.cursor.available(), len);
                     assert_eq!(m.drain(), len);
-                    // Resynchronized to the oldest survivor: the newest whole ring, contiguous.
                     assert_eq!(m.expect, total);
                     assert_eq!(
                         m.skipped, m.reported,
@@ -791,7 +823,6 @@ mod tests {
                     assert!(m.cursor.is_empty());
                     assert_eq!(m.delivered, 0);
                 } else {
-                    // The understatement costs the count, not the content.
                     assert_eq!(m.expect, delta);
                 }
                 assert_eq!(m.reported, 0);
@@ -803,7 +834,6 @@ mod tests {
 
     #[test]
     fn the_units_handed_out_are_the_newest_under_any_stall_pattern() {
-        // Stalls past a whole ring, and drains leaving a backlog for the next lap to eat into.
         for len in 2..=MAX_LEN {
             for seed in 1..=8u32 {
                 let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9) | 1);
@@ -825,7 +855,6 @@ mod tests {
 
     #[test]
     fn observing_before_every_unit_holds_the_same_invariants() {
-        // A controller that keeps writing through the drain loop.
         for len in 2..=MAX_LEN {
             for seed in 1..=4u32 {
                 let mut rng = Rng(seed.wrapping_mul(0x85eb_ca6b) | 1);
@@ -853,7 +882,6 @@ mod tests {
             for first in 1..len {
                 for taken in 0..first {
                     let mut m = DmaModel::new(len);
-                    // Leave the cursor awkward: mid-ring, partly drained, sometimes a lap behind.
                     m.produce(first);
                     m.observe();
                     for _ in 0..taken {
@@ -867,10 +895,9 @@ mod tests {
                     assert!(m.cursor.is_empty());
                     assert_eq!(m.cursor.len(), len);
                     assert_eq!(m.write_pos(), 0, "the reloaded counter reads the base");
-                    // Nothing from before the restart comes back out, though the memory holds it,
+                    // Nothing from before the restart comes back out.
                     assert_eq!(m.observe(), 0);
                     assert!(m.take().is_none());
-                    // and what arrives after is measured from the base, in order.
                     m.produce(len - 1);
                     assert_eq!(m.observe(), 0);
                     assert_eq!(m.drain(), len - 1);
@@ -918,8 +945,7 @@ mod tests {
         }
     }
 
-    /// A sticky reload latch like the F1 transfer-complete flag: cleared by the read, and
-    /// saturating -- two reloads between samples read as one.
+    /// A sticky, saturating reload latch like the F1 transfer-complete flag.
     struct LapChannel<'c> {
         ndtr: &'c Cell<usize>,
         running: &'c Cell<bool>,
@@ -946,8 +972,7 @@ mod tests {
         }
     }
 
-    /// The controller side of the model, held apart from the ring so a test can produce between
-    /// the ring's counter read and its data read.
+    /// The controller side, apart from the ring so a test can produce between its two reads.
     struct Controller<'c> {
         len: usize,
         w: usize,
@@ -1052,7 +1077,6 @@ mod tests {
             let mut ring = model_ring(len, &ndtr, &run);
             let mut expect = 0usize;
             for step in 0..4 * len {
-                // Stalls short of a whole ring, drained each pass: the healthy path.
                 ctl.produce(step % (len - 1) + 1);
                 loop {
                     let (byte, lost) = ring.pop(&ctl.mem);
@@ -1118,26 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn an_exactly_full_ring_delivers_every_byte_where_the_position_alone_reads_empty() {
-        for len in 2..=MAX_LEN {
-            let ndtr = Cell::new(len);
-            let run = Cell::new(true);
-            let mut ctl = Controller::new(len, &ndtr);
-            let mut ring = model_ring(len, &ndtr, &run);
-            ctl.produce(len - 1);
-            assert_eq!(ring.observe(), 0);
-            ctl.produce(1);
-            assert_eq!(ring.write_pos(), 0);
-            assert_eq!(ring.observe(), 0, "an exactly full ring is not a loss");
-            assert_eq!(ring.available(), len);
-            for k in 0..len {
-                assert_eq!(ring.next_byte(&ctl.mem), Some(stream_byte(k)));
-            }
-            assert_eq!(ring.next_byte(&ctl.mem), None);
-        }
-    }
-
-    #[test]
     fn a_lap_delivers_the_newest_whole_ring_of_bytes_and_reports_the_exact_loss() {
         for len in 2..=MAX_LEN {
             for over in 1..=len {
@@ -1178,7 +1182,6 @@ mod tests {
         assert_eq!(ndtr.get(), len, "the counter was reloaded by the restart");
         assert!(ring.is_empty());
         assert_eq!(ring.write_pos(), 0);
-        // The memory still holds the pre-restart bytes; none of them comes back.
         assert_eq!(ring.observe(), 0);
         assert_eq!(ring.next_byte(&ctl.mem), None);
         ctl.produce(2);
@@ -1202,7 +1205,6 @@ mod tests {
         run.set(false);
         ring.reset_cursor();
         assert!(ring.is_empty());
-        // Re-armed: the counter is reloaded and the controller starts over at the base.
         ndtr.set(len);
         ctl.restarted();
         run.set(true);
@@ -1251,7 +1253,6 @@ mod tests {
         assert_eq!(ring.observe(), 2);
         ctl.produce(1);
         assert_eq!(ring.next_byte(&ctl.mem), Some(stream_byte(len + 2)));
-        // The substitution costs a byte but is invisible to the accounting.
         assert_eq!(ring.observe(), 0);
         assert_eq!(ring.available(), len);
     }
@@ -1378,7 +1379,6 @@ mod tests {
     fn every_shipping_ring_length_folds_a_full_ring_a_lap_and_a_starved_reload() {
         for len in SHIPPING_LENS {
             let mut c = DmaRingCursor::new(len);
-            // Filled in the 64-byte bites a bridge service takes, then closed on the wrap.
             for pos in (64..len).step_by(64) {
                 assert_eq!(c.observe(pos), 0, "len {len}");
             }
@@ -1388,7 +1388,6 @@ mod tests {
                 "an exactly full ring is not a lap, len {len}"
             );
             assert_eq!(c.available(), len, "len {len}");
-            // Three bytes past it, and the reader resynchronizes onto the oldest survivor.
             assert_eq!(c.observe(3), 3, "len {len}");
             assert_eq!(c.available(), len, "len {len}");
             assert_eq!(c.next_index(), Some(3), "len {len}");

@@ -5,15 +5,12 @@ use crate::{
     Vfs, VfsConfig, VfsFile,
 };
 
-/// The concrete volume type [`assemble`] produces: a one-file volume (`DETAILS.TXT`) with the
-/// default decoder set and no directory observer, over the firmware-owned sink `S`.
+/// A one-file (`DETAILS.TXT`) volume with the default decoders and no observer, over sink `S`.
 pub type FlashVolume<S> = Vfs<'static, S, NoObserver, AllDecoders>;
 
-/// Caller-owned static storage for a flash volume: the one-shot [`StaticCell`]s [`assemble`]
-/// initializes -- the `DETAILS.TXT` body, the file table, and the volume itself.
+/// Caller-owned static storage for a flash volume.
 pub struct VolumeStorage<S: TransferSink + 'static> {
-    /// A `ConstStaticCell`, so the 512-byte body starts in `.bss` already sized and is baked in
-    /// place; a `StaticCell` would render a sector in the caller's init frame and copy it in.
+    /// Const-initialized so the 512-byte body is baked in `.bss`, not copied from the init frame.
     details: ConstStaticCell<DetailsFile<'static>>,
     files: StaticCell<[&'static mut dyn VfsFile; 1]>,
     vfs: StaticCell<FlashVolume<S>>,
@@ -36,8 +33,7 @@ impl<S: TransferSink + 'static> Default for VolumeStorage<S> {
     }
 }
 
-/// Assemble the flash volume into caller-owned `storage`, returning the initialized volume.
-/// Each cell initializes exactly once, so call this at most once per `storage`.
+/// Assemble the flash volume into `storage`; call at most once per `storage`.
 pub fn assemble<S: TransferSink + 'static>(
     storage: &'static VolumeStorage<S>,
     sink: S,
@@ -58,13 +54,16 @@ pub fn assemble<S: TransferSink + 'static>(
     )
 }
 
-/// [`assemble`] with a full [`DeviceInfo`] and an optional reset-surviving [`ResetStamp`], whose
-/// carried status seeds `DETAILS.TXT` before the first mount.
+/// [`assemble`] with an owned boot report and its independent retained-status writer.
 pub fn assemble_info<S: TransferSink + 'static>(
     storage: &'static VolumeStorage<S>,
     sink: S,
     info: DeviceInfo<'static>,
-    stamp: Option<&'static mut crate::ResetStamp>,
+    stamp: Option<(
+        crate::BootSnapshot,
+        crate::stamp::StatusWriter<'static>,
+        crate::stamp::SteadyToken<'static>,
+    )>,
     label: &'static str,
 ) -> &'static mut FlashVolume<S> {
     // Per-probe, so two drives attached at once are distinct volumes to the host.
@@ -72,7 +71,7 @@ pub fn assemble_info<S: TransferSink + 'static>(
     // `init_with`, never `init`: `init` moves its value, building each body in this frame.
     let details: &'static mut DetailsFile<'static> = storage.details.take();
     details.bake(info);
-    if let Some(stamp) = &stamp {
+    if let Some((stamp, _, _)) = &stamp {
         if let Some((status, _failed)) = stamp.status() {
             details.seed_status(status);
         }
@@ -93,8 +92,9 @@ pub fn assemble_info<S: TransferSink + 'static>(
             NoObserver,
         )
     });
-    if let Some(stamp) = stamp {
+    if let Some((_, stamp, steady)) = stamp {
         vfs.set_reset_stamp(stamp);
+        vfs.set_steady_token(steady);
     }
     vfs
 }
@@ -102,17 +102,41 @@ pub fn assemble_info<S: TransferSink + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::dir_entry;
     use crate::{fat, MediaState, StatsSink, TransferOutcome};
     use daplink_decoder::Format;
 
-    /// Build a root-directory entry for a dropped file.
-    fn dir_entry(name: &[u8; 11], attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
-        let mut e = [0u8; 32];
-        e[0..11].copy_from_slice(name);
-        e[11] = attr;
-        e[26..28].copy_from_slice(&first_cluster.to_le_bytes());
-        e[28..32].copy_from_slice(&size.to_le_bytes());
-        e
+    #[test]
+    fn assemble_seeds_details_from_owned_boot_snapshot() {
+        static VOLUME: VolumeStorage<StatsSink> = VolumeStorage::new();
+        let mut bytes = [0; crate::stamp::RETAINED_SIZE];
+        bytes[..4].copy_from_slice(&0x6472_7375u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
+        bytes[16..19].copy_from_slice(b"old");
+        bytes[84..88].copy_from_slice(&5u32.to_le_bytes());
+        bytes[88..93].copy_from_slice(b"panic");
+        let fixture = std::boxed::Box::leak(std::boxed::Box::new(
+            crate::stamp::InitializedStamp::from_bytes(bytes),
+        ));
+        let mut boot = fixture.boot();
+        boot.status.store(b"new", false);
+        let vfs = assemble_info(
+            &VOLUME,
+            StatsSink::new(),
+            DeviceInfo {
+                version: "1",
+                serial: "1234",
+                reset_count: boot.snapshot.reset_count(),
+            },
+            Some((boot.snapshot, boot.status, boot.steady)),
+            "DAPLINK",
+        );
+        let mut sector = [0; 512];
+        vfs.read_sector(fat::DATA_START_LBA, &mut sector);
+        let text = core::str::from_utf8(&sector).unwrap();
+        assert!(text.contains("Status: old"));
+        assert!(text.contains("Fault: panic"));
+        assert!(text.contains("Reset count: 00000001"));
     }
 
     #[test]
@@ -160,7 +184,10 @@ mod tests {
         assert_eq!(stats.fmt, Some(Format::Uf2));
         assert_eq!(stats.stats.bytes, 4);
 
-        // A tick then detaches the volume for the remount cycle.
-        assert_eq!(vfs.tick(1), MediaState::Detached);
+        // Once the host is quiet the volume detaches for the remount cycle.
+        assert_eq!(
+            vfs.tick(crate::MSC_TIMEOUT_FINISHABLE_MS),
+            MediaState::Detached
+        );
     }
 }

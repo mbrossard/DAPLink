@@ -26,12 +26,10 @@ const TABLE: [u32; 16] = {
 pub struct Crc32(u32);
 
 impl Crc32 {
-    /// An empty span.
     pub const fn new() -> Self {
         Self(0xFFFF_FFFF)
     }
 
-    /// Extend the span by one byte.
     pub fn push(&mut self, b: u8) {
         let mut c = self.0;
         c = TABLE[((c ^ u32::from(b)) & 0x0F) as usize] ^ (c >> 4);
@@ -39,14 +37,12 @@ impl Crc32 {
         self.0 = c;
     }
 
-    /// Extend the span by a slice.
     pub fn extend(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.push(b);
         }
     }
 
-    /// The checksum of the span so far.
     pub const fn value(self) -> u32 {
         self.0 ^ 0xFFFF_FFFF
     }
@@ -58,7 +54,6 @@ impl Default for Crc32 {
     }
 }
 
-/// CRC32 of one slice.
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = Crc32::new();
     crc.extend(bytes);
@@ -84,8 +79,6 @@ pub fn crc16(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- checksum vectors, pinned: host and DUT must agree with each other and with the spec ---
 
     #[test]
     fn crc32_matches_the_standard_check_value() {

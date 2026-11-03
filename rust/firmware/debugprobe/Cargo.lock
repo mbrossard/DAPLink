@@ -258,10 +258,15 @@ name = "daplink-core"
 version = "0.1.0"
 
 [[package]]
+name = "daplink-decoder"
+version = "0.1.0"
+
+[[package]]
 name = "daplink-embassy-usb"
 version = "0.1.0"
 dependencies = [
  "daplink-rs",
+ "daplink-vfs",
  "embassy-futures",
  "embassy-sync",
  "embassy-time",
@@ -292,13 +297,17 @@ name = "daplink-rp-embassy"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "critical-section",
+ "daplink-core",
  "daplink-embassy-usb",
  "daplink-rp-dma-uart",
  "daplink-rs",
  "embassy-executor",
+ "embassy-futures",
  "embassy-rp",
  "embassy-time",
  "embassy-usb",
+ "embassy-usb-driver",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "pl011-baud",
@@ -334,6 +343,18 @@ name = "daplink-targets"
 version = "0.1.0"
 dependencies = [
  "daplink-flash",
+]
+
+[[package]]
+name = "daplink-vfs"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "daplink-core",
+ "daplink-decoder",
+ "heapless 0.8.0",
+ "portable-atomic",
+ "static_cell",
 ]
 
 [[package]]
@@ -390,7 +411,6 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-rp",
- "embassy-sync",
  "panic-halt",
  "portable-atomic",
  "static_cell",

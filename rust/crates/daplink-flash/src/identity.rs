@@ -30,8 +30,7 @@ impl IdentityProbe {
     }
 }
 
-/// Run every probe in `probes` via the injected `read_word`. `Ok(())` if all match (or `probes`
-/// is empty); on the first mismatch, [`Error::IdentityMismatch`].
+/// Run every probe; the first mismatch returns [`Error::IdentityMismatch`].
 pub fn check_identity<F>(probes: &[IdentityProbe], mut read_word: F) -> Result<(), Error>
 where
     F: FnMut(u32) -> Result<u32, Error>,

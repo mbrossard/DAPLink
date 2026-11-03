@@ -15,8 +15,19 @@ const D_DIRSET: isize = offset_of!(raw::gpio::RegisterBlock, dirset) as isize
 const D_DIRCLR: isize = offset_of!(raw::gpio::RegisterBlock, dirclr) as isize
     - offset_of!(raw::gpio::RegisterBlock, set) as isize;
 
-/// A GPIO line addressed by resolved register address and bit mask; the pad must already be in GPIO
-/// mode. A zero `mask` is a no-connect; `txen_mask` names an external buffer's enable pad.
+/// SWDIO/TMS bit position in GPIO port 0 (PIO0_2).
+pub(crate) const SWDIO_PIN: u32 = 2;
+/// SWDIO direction-buffer enable bit position (TXEN = PIO0_28).
+pub(crate) const TXEN_PIN: u32 = 28;
+/// SWCLK/TCK bit position (PIO0_0).
+pub(crate) const TCK_PIN: u32 = 0;
+/// JTAG TDI bit position (PIO0_1).
+pub(crate) const TDI_PIN: u32 = 1;
+/// JTAG TDO bit position (PIO0_3, shared with SWO capture).
+pub(crate) const TDO_PIN: u32 = 3;
+
+/// A GPIO line by resolved register address and mask, on a pad already in GPIO mode; zero `mask`
+/// is a no-connect.
 #[derive(Clone, Copy)]
 pub struct IoPin {
     set: usize,
@@ -27,7 +38,6 @@ pub struct IoPin {
 }
 
 impl IoPin {
-    /// Resolve the `set[port]` register address once, at construction.
     fn set_addr(port: usize) -> usize {
         // SAFETY: the GPIO block is a fixed peripheral; `addr_of!` forms no reference.
         let gpio = raw::GPIO::ptr();
@@ -56,8 +66,7 @@ impl IoPin {
         }
     }
 
-    /// A buffered open-drain line (nRESET): asserted by enabling the buffer, released by
-    /// tri-stating it so the target's own pull-up raises the wire.
+    /// A buffered open-drain line (nRESET): asserted by the buffer, released by tri-stating it.
     pub fn open_drain(data_port: usize, data_pin: u8, txen_port: usize, txen_pin: u8) -> Self {
         IoPin {
             open_drain: true,

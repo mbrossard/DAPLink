@@ -88,9 +88,7 @@ impl TargetProfile {
         format!("{dp}, {ap}")
     }
 
-    /// Context for an attach failure. A valid but wrong profile fails the same way a dead target
-    /// or a clock ceiling does -- NoAck on every DPIDR read, at every clock -- so the failure has
-    /// to say which profile it drove the DP with and what else was on offer.
+    /// Context for an attach failure: a wrong profile NoAcks like a dead target, so name it.
     pub fn attach_context(&self) -> String {
         let others: Vec<String> = PROFILES
             .iter()
@@ -146,8 +144,7 @@ mod tests {
         assert!(err.contains("rp"));
     }
 
-    /// The failure this names cost an hour: an RP2350 driven as `rp` NoAcks every DPIDR read,
-    /// which is indistinguishable from a dead target until the profile is on the error.
+    /// An RP2350 driven as `rp` NoAcks like a dead target; the error must name the profile.
     #[test]
     fn an_attach_failure_names_the_profile_it_used_and_the_alternatives() {
         let ctx = lookup("rp").unwrap().attach_context();

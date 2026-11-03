@@ -10,5 +10,5 @@ SECTIONS {
     __siramtext = LOADADDR(.ramtext);
 } INSERT AFTER .rodata;
 
-/* Catches --wrap=__pre_init silently not taking (0x20000000 is SRAM base; memory.x isn't parsed yet here). */
-ASSERT(__wrap___pre_init < 0x20000000, "sram-exec: --wrap=__pre_init did not take");
+/* Catches the wrapper landing in .ramtext, which it copies (0x20000000 is SRAM base; memory.x isn't parsed yet here). */
+ASSERT(__wrap___pre_init < 0x20000000, "sram-exec: __wrap___pre_init landed in .ramtext, not flash");

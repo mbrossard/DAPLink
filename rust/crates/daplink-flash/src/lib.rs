@@ -15,7 +15,6 @@ pub mod flash_algo;
 pub mod flash_intf;
 pub mod flash_manager;
 pub mod identity;
-pub mod reset;
 pub mod reset_sequence;
 pub mod swd_host;
 mod swd_host_core;
@@ -31,17 +30,19 @@ mod tests;
 #[cfg(test)]
 mod tests_verify;
 
+pub use daplink_core::probe::{FlashArbiter, NoArbiter, ResetControl};
 pub use error::{Error, SwdError};
 pub use flash_algo::{FlashAlgorithm, FlashRegion, RamRegion, SectorInfo, SyscallParams};
 pub use flash_intf::FlashInterface;
-pub use flash_manager::{page_buffer_ok, EraseMode, FlashManager};
+pub use flash_manager::{page_buffer_ok, EraseMode, FlashManager, FlushRun};
 pub use identity::{check_identity, IdentityProbe};
-pub use reset::{FlashArbiter, NoArbiter, ResetControl};
 pub use reset_sequence::{
-    generic_set_target_state, GenericResetSequence, ResetOps, ResetSequence, UnlockOutcome,
-    UnlockPolicy, GENERIC_RESET_SEQUENCE,
+    generic_set_target_state, GenericResetSequence, ResetOps, ResetRun, ResetSequence, ResetStep,
+    StepPoll, UnlockOutcome, UnlockPolicy, GENERIC_RESET_SEQUENCE,
 };
-pub use swd_host::{swd_dormant_wake_preamble, swd_wake_preamble, SwdHost};
+pub use swd_host::{
+    swd_dormant_wake_preamble, swd_wake_preamble, SwdHost, SyscallCheck, SyscallOps, SyscallRun,
+};
 pub use target::{
     ApAddressing, DebugPort, DefaultCallbacks, DpWake, ResetType, StateOutcome, Target,
     TargetCallbacks, TargetState,

@@ -4,20 +4,16 @@ use std::fmt::Write;
 
 use crate::stream::{Framing, Gap};
 
-/// Capture window per tier, long enough that every tier laps the probe's trace ring many times;
-/// a shorter window lets the slower tiers never fill it, and a lap-loss bug reports clean.
+/// Capture window per tier; long enough that every tier laps the probe's trace ring.
 pub const DEFAULT_WINDOW_MS: u64 = 5_000;
 
 /// Gaps listed under a row before the rest are summarized.
 pub const GAPS_SHOWN: usize = 4;
 
-/// Payload fraction of the captured bytes below which a tier is judged misframed. The 8-byte
-/// records ride in 10 ITM wire bytes, so a healthy tier yields 0.80; every recorded clean tier
-/// sits at 0.77 or above and every recorded misframed one at 0.53 or below.
+/// Payload fraction of captured bytes below which a tier is misframed; clean yields 0.80.
 pub const MIN_PAYLOAD_YIELD: f64 = 0.65;
 
-/// Captures smaller than this are too short for the yield fraction to mean anything; a tier
-/// with no capture at all is silent, not misframed.
+/// Captures below this are too short for the yield fraction to mean anything.
 pub const YIELD_GATE_MIN_BYTES: usize = 4096;
 
 /// A tier's overall judgement.
@@ -31,6 +27,8 @@ pub enum Verdict {
     Silent,
     /// Bytes were captured but too few decoded to payload: bit misalignment, not a pass.
     Misframed,
+    /// Not one byte reached the host, so the tier grades nothing and cannot pass a sweep.
+    Unrated,
 }
 
 impl Verdict {
@@ -41,13 +39,15 @@ impl Verdict {
             Verdict::Gaps => "GAPS",
             Verdict::Silent => "SILENT",
             Verdict::Misframed => "MISFRAMED",
+            Verdict::Unrated => "UNRATED",
         }
     }
 
-    /// Judge a tier. The sequence tags are the verification, but an order-only check grades a
-    /// misframed capture clean, so the yield gate demotes a full capture that decoded to little.
+    /// Judge a tier; the yield gate demotes a full capture that decoded to little.
     pub fn of(framing: &Framing, captured_bytes: usize, payload_bytes: usize) -> Verdict {
-        if framing.records == 0 {
+        if captured_bytes == 0 {
+            Verdict::Unrated
+        } else if framing.records == 0 {
             if captured_bytes >= YIELD_GATE_MIN_BYTES {
                 Verdict::Misframed
             } else {
@@ -76,7 +76,7 @@ pub struct Tier {
     pub requested_baud: u32,
     /// Baud the probe reported realizing.
     pub probe_baud: u32,
-    /// Baud the DUT's integer prescaler realizes.
+    /// Baud the DUT reported realizing in its `SWO CFG` reply.
     pub dut_baud: Option<u32>,
     /// Capture window, in milliseconds.
     pub window_ms: f64,
@@ -96,17 +96,22 @@ pub struct Tier {
     pub polls: u64,
     /// Polls that came back full, i.e. the host was already behind.
     pub full_polls: u64,
-    /// Polls the probe answered with the capture-active bit clear. Nonzero means the probe stopped
-    /// capturing mid-window, which loss counters alone cannot distinguish from bytes going missing.
+    /// Polls answered with the capture-active bit clear: the probe stopped mid-window.
     pub inactive_polls: u64,
-    /// Bytes the probe still held when the window closed.
-    pub probe_bytes_left: u32,
+    /// Post-window polls that emptied the probe, kept apart from `polls`.
+    pub drain_polls: u64,
+    /// Bytes the probe still held when the window closed; `None` when the status read failed.
+    pub probe_bytes_left: Option<u32>,
     /// SWD throughput achieved by the interleaved load, when `--swd-load` was on.
     pub swd_kib_per_s: Option<f64>,
     /// Load reads whose data differed from this tier's first chunk.
     pub swd_mismatches: u64,
     /// Load transfers the probe did not acknowledge cleanly.
     pub swd_errors: u64,
+    /// Bounded first-response evidence, independent of the trace verdict.
+    pub swd_failures: Vec<crate::capture::LoadFailure>,
+    /// The DUT's own emission ledger for this tier; `partial` is a fragment, not loss.
+    pub dut_emission: Option<daplink_test_protocol::SwoStats>,
     /// The tier's judgement.
     pub verdict: Verdict,
 }
@@ -174,8 +179,7 @@ pub fn gap_missing_display(t: &Tier, gap: &Gap) -> String {
     }
 }
 
-/// `DAP_SWO_Data` exchange rate. On a full-speed probe an exchange carries 60 payload bytes, so
-/// this is what bounds sustained capture, not the ring.
+/// `DAP_SWO_Data` exchange rate, which bounds sustained capture on a full-speed probe.
 pub fn polls_per_s(t: &Tier) -> f64 {
     if t.window_ms <= 0.0 {
         return 0.0;
@@ -191,8 +195,7 @@ pub fn full_poll_percent(t: &Tier) -> f64 {
     100.0 * t.full_polls as f64 / t.polls as f64
 }
 
-/// The loud part: everything a non-clean tier lost, named with its position. Returns nothing for
-/// a clean tier with no probe-side complaint.
+/// Everything a non-clean tier lost, with its position; empty for a clean tier.
 pub fn notes(t: &Tier) -> Vec<String> {
     let mut out = Vec::new();
     if t.inactive_polls > 0 {
@@ -202,6 +205,29 @@ pub fn notes(t: &Tier) -> Vec<String> {
              capturing mid-window, so loss below is not only bytes missing the host",
             t.requested_baud, t.inactive_polls, t.polls
         ));
+    }
+    if t.probe_bytes_left.is_none() {
+        out.push(format!(
+            "  {} baud: the closing DAP_SWO_Status failed, so what the probe still held is \
+             unmeasured",
+            t.requested_baud
+        ));
+    }
+    if t.verdict == Verdict::Unrated {
+        out.push(format!(
+            "  {} baud: not one byte captured in {:.0} ms -- the tier measured nothing and is \
+             unrated, which fails the run",
+            t.requested_baud, t.window_ms
+        ));
+    }
+    if let Some(e) = t.dut_emission {
+        if e.partial > 0 || e.dropped > 0 {
+            out.push(format!(
+                "  {} baud: the DUT charged itself {} fragmented and {} unsent emission(s) of {} \
+                 whole -- that much of the loss below is the target's, not the probe's",
+                t.requested_baud, e.partial, e.dropped, e.records
+            ));
+        }
     }
     if t.verdict == Verdict::Silent {
         out.push(format!(
@@ -269,6 +295,13 @@ pub fn notes(t: &Tier) -> Vec<String> {
             t.requested_baud, t.swd_mismatches, t.swd_errors
         ));
     }
+    for failure in &t.swd_failures {
+        out.push(format!(
+            "  SWD failure: {}ms batch {} slot {} command 0x{:02x} status 0x{:02x} completed {}/{} response {:?}",
+            failure.elapsed_ms, failure.batch, failure.slot, failure.command,
+            failure.status, failure.completed, failure.requested, failure.response_prefix,
+        ));
+    }
     if let Some(dut) = t.dut_baud {
         if dut != t.requested_baud || t.probe_baud != t.requested_baud {
             out.push(format!(
@@ -278,6 +311,20 @@ pub fn notes(t: &Tier) -> Vec<String> {
         }
     }
     out
+}
+
+/// The table's closing line: tiers run, elapsed time, how many were clean, and an early stop.
+pub fn summary(rows: &[Tier], tiers: usize, elapsed: std::time::Duration, stopped: bool) -> String {
+    let clean = rows.iter().filter(|r| r.verdict == Verdict::Clean).count();
+    let secs = elapsed.as_secs_f64();
+    if stopped {
+        format!(
+            "{} of {tiers} tier(s) in {secs:.1} s; {clean} clean; the sweep stopped early",
+            rows.len()
+        )
+    } else {
+        format!("{} tier(s) in {secs:.1} s; {clean} clean", rows.len())
+    }
 }
 
 /// Run-level context the JSON document states once.
@@ -290,6 +337,10 @@ pub struct Context<'a> {
     pub probe_serial: Option<String>,
     /// `DAP_Info` firmware version string.
     pub firmware_version: Option<String>,
+    /// The firmware registry row the record measured, when anything names it.
+    pub firmware_row: Option<String>,
+    /// What named it: `image`, `operator` or `none`.
+    pub firmware_row_source: &'static str,
     /// `DAP_PACKET_SIZE`, in bytes.
     pub packet_size: Option<u16>,
     /// `DAP_PACKET_COUNT`, outstanding packets.
@@ -310,17 +361,17 @@ pub struct Context<'a> {
     pub dut_reset: bool,
     /// Requested baud tiers, in sweep order.
     pub bauds: &'a [u32],
+    /// The error that ended the sweep before its last tier; `rows` then holds the tiers completed.
+    pub error: Option<&'a str>,
+    /// Why the closing `SWO STREAM 0` failed; the DUT may still be streaming.
+    pub teardown_error: Option<&'a str>,
 }
 
-/// Serialize the context and tier rows to the versioned JSON schema (`schema_version` 10, which
-/// dropped `probe_overflow`, `probe_trace_error` and `poll_cadence`; 9 added the idle share of
-/// each stall and `gaps_total` to `poll_cadence`; 8 made `lost_records` `null` once resyncs
-/// corrupted the tags and added `poll_cadence`; 6 added `dut_reset`; 5 added `depth_rationale`;
-/// 4 added the `MISFRAMED` verdict; 3 made the two probe status rows `null` when clear).
+/// Serialize the context and tier rows to the versioned JSON schema.
 pub fn to_json(ctx: &Context, rows: &[Tier]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{{");
-    let _ = writeln!(out, "  \"schema_version\": 10,");
+    let _ = writeln!(out, "  \"schema_version\": 17,");
     let _ = writeln!(
         out,
         "  \"timestamp_utc\": {},",
@@ -337,6 +388,16 @@ pub fn to_json(ctx: &Context, rows: &[Tier]) -> String {
         out,
         "    \"firmware_version\": {},",
         json_opt_str(&ctx.firmware_version)
+    );
+    let _ = writeln!(
+        out,
+        "    \"firmware_row\": {},",
+        json_opt_str(&ctx.firmware_row)
+    );
+    let _ = writeln!(
+        out,
+        "    \"firmware_row_source\": {},",
+        json_str(ctx.firmware_row_source)
     );
     let _ = writeln!(
         out,
@@ -371,6 +432,12 @@ pub fn to_json(ctx: &Context, rows: &[Tier]) -> String {
         let _ = write!(out, "{baud}{comma}");
     }
     let _ = writeln!(out, "],");
+    let _ = writeln!(out, "  \"error\": {},", json_opt_str_ref(ctx.error));
+    let _ = writeln!(
+        out,
+        "  \"teardown_error\": {},",
+        json_opt_str_ref(ctx.teardown_error)
+    );
 
     let _ = writeln!(out, "  \"rows\": [");
     for (i, row) in rows.iter().enumerate() {
@@ -406,8 +473,13 @@ fn json_row(t: &Tier) -> String {
     let _ = writeln!(out, "      \"polls\": {},", t.polls);
     let _ = writeln!(out, "      \"full_polls\": {},", t.full_polls);
     let _ = writeln!(out, "      \"inactive_polls\": {},", t.inactive_polls);
+    let _ = writeln!(out, "      \"drain_polls\": {},", t.drain_polls);
     let _ = writeln!(out, "      \"polls_per_s\": {},", json_f64(polls_per_s(t)));
-    let _ = writeln!(out, "      \"probe_bytes_left\": {},", t.probe_bytes_left);
+    let _ = writeln!(
+        out,
+        "      \"probe_bytes_left\": {},",
+        json_opt_num(t.probe_bytes_left)
+    );
     let _ = writeln!(
         out,
         "      \"swd_kib_per_s\": {},",
@@ -415,6 +487,33 @@ fn json_row(t: &Tier) -> String {
     );
     let _ = writeln!(out, "      \"swd_mismatches\": {},", t.swd_mismatches);
     let _ = writeln!(out, "      \"swd_errors\": {},", t.swd_errors);
+    let _ = write!(out, "      \"swd_failures\": [");
+    for (index, failure) in t.swd_failures.iter().enumerate() {
+        if index != 0 {
+            let _ = write!(out, ", ");
+        }
+        let _ = write!(out,
+            "{{\"command\": {}, \"status\": {}, \"completed\": {}, \"requested\": {}, \"elapsed_ms\": {}, \"batch\": {}, \"slot\": {}, \"response_prefix\": {:?}}}",
+            failure.command, failure.status, failure.completed, failure.requested,
+            failure.elapsed_ms, failure.batch, failure.slot, failure.response_prefix,
+        );
+    }
+    let _ = writeln!(out, "],");
+    let _ = writeln!(
+        out,
+        "      \"dut_records\": {},",
+        json_opt_num(t.dut_emission.map(|e| e.records))
+    );
+    let _ = writeln!(
+        out,
+        "      \"dut_partial_records\": {},",
+        json_opt_num(t.dut_emission.map(|e| e.partial))
+    );
+    let _ = writeln!(
+        out,
+        "      \"dut_dropped_records\": {},",
+        json_opt_num(t.dut_emission.map(|e| e.dropped))
+    );
     let _ = writeln!(out, "      \"verdict\": {},", json_str(t.verdict.label()));
     let _ = writeln!(out, "      \"gaps\": [");
     for (i, gap) in t.framing.gaps.iter().enumerate() {
@@ -478,6 +577,11 @@ fn json_opt_str(s: &Option<String>) -> String {
     s.as_deref().map_or("null".to_string(), json_str)
 }
 
+/// A borrowed optional string as a JSON string or `null`.
+fn json_opt_str_ref(s: Option<&str>) -> String {
+    s.map_or("null".to_string(), json_str)
+}
+
 /// An optional number as a JSON number or `null`.
 fn json_opt_num<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or("null".to_string(), |v| v.to_string())
@@ -525,10 +629,13 @@ mod tests {
             polls: 400,
             full_polls: 100,
             inactive_polls: 0,
-            probe_bytes_left: 0,
+            drain_polls: 0,
+            probe_bytes_left: Some(0),
             swd_kib_per_s: None,
             swd_mismatches: 0,
             swd_errors: 0,
+            swd_failures: Vec::new(),
+            dut_emission: None,
             verdict,
         }
     }
@@ -536,7 +643,7 @@ mod tests {
     #[test]
     fn verdict_follows_the_sequence_tags() {
         assert_eq!(Verdict::of(&framing(10, vec![]), 100, 80), Verdict::Clean);
-        assert_eq!(Verdict::of(&framing(0, vec![]), 0, 0), Verdict::Silent);
+        assert_eq!(Verdict::of(&framing(0, vec![]), 0, 0), Verdict::Unrated);
         let gap = Gap {
             after_seq: 4,
             missing: 3,
@@ -547,7 +654,7 @@ mod tests {
 
     #[test]
     fn a_full_capture_that_decodes_to_little_is_misframed_not_clean() {
-        // The recorded shape: line-rate byte volume, consecutive decoded subset, low yield.
+        // Line-rate byte volume, consecutive decoded subset, low yield.
         let f = framing(1_266, vec![]);
         assert!(f.is_clean());
         assert_eq!(Verdict::of(&f, 500_111, 10_128), Verdict::Misframed);
@@ -560,14 +667,13 @@ mod tests {
 
     #[test]
     fn a_legitimately_silent_tier_is_not_swept_into_the_misframe_bucket() {
-        // Nothing on the wire, or only a ragged scrap below the gate's floor.
-        assert_eq!(Verdict::of(&framing(0, vec![]), 0, 0), Verdict::Silent);
+        // A ragged scrap below the gate's floor; nothing at all is unrated, not silent.
+        assert_eq!(Verdict::of(&framing(0, vec![]), 1, 0), Verdict::Silent);
         assert_eq!(Verdict::of(&framing(0, vec![]), 64, 0), Verdict::Silent);
     }
 
     #[test]
     fn the_yield_gate_sits_between_the_recorded_populations() {
-        // Worst recorded genuine clean tier: 0.7745; best recorded misframed tier: 0.5232.
         assert!(!below_yield_gate(1_960_209, 1_518_152));
         assert!(below_yield_gate(250_025, 130_824));
         assert!(!below_yield_gate(250_000, 200_000));
@@ -626,9 +732,9 @@ mod tests {
     #[test]
     fn a_silent_tier_is_called_out_first() {
         let mut t = tier(framing(0, vec![]));
-        t.captured_bytes = 0;
+        t.captured_bytes = 64;
         t.payload_bytes = 0;
-        t.verdict = Verdict::of(&t.framing, 0, 0);
+        t.verdict = Verdict::of(&t.framing, 64, 0);
         let notes = notes(&t);
         assert!(notes[0].contains("no record framed"));
     }
@@ -669,6 +775,16 @@ mod tests {
     }
 
     #[test]
+    fn the_drain_ledger_stays_out_of_the_window_ratios() {
+        let mut t = tier(framing(10, vec![]));
+        let (full, rate) = (full_poll_percent(&t), polls_per_s(&t));
+        t.drain_polls = 8;
+        assert_eq!(full_poll_percent(&t), full);
+        assert_eq!(polls_per_s(&t), rate);
+        assert!(json_row(&t).contains("\"drain_polls\": 8"));
+    }
+
+    #[test]
     fn full_poll_percent_is_zero_without_polls() {
         let mut t = tier(framing(1, vec![]));
         t.polls = 0;
@@ -685,6 +801,8 @@ mod tests {
             probe_product: Some("probe".to_string()),
             probe_serial: None,
             firmware_version: Some("2.1.0".to_string()),
+            firmware_row: Some("firmware/mculink".to_string()),
+            firmware_row_source: "image",
             packet_size: Some(512),
             packet_count: Some(4),
             trace_buffer_bytes: Some(1023),
@@ -695,6 +813,8 @@ mod tests {
             swd_load: true,
             dut_reset: true,
             bauds: &[1_000_000, 2_000_000],
+            error: None,
+            teardown_error: None,
         };
         let gap = Gap {
             after_seq: 4,
@@ -704,15 +824,36 @@ mod tests {
         let json = to_json(&ctx, &[tier(framing(10, vec![gap]))]);
         assert!(json.starts_with("{\n"));
         assert!(json.ends_with("}\n"));
-        assert!(json.contains("\"schema_version\": 10"));
+        assert!(json.contains("\"schema_version\": 17"));
+        assert!(json.contains("\"firmware_row\": \"firmware/mculink\""));
+        assert!(json.contains("\"firmware_row_source\": \"image\""));
         assert!(json.contains("\"depth_rationale\": \"requested\""));
         assert!(json.contains("\"dut_reset\": true"));
+        assert!(json.contains("\"error\": null,\n  \"teardown_error\": null,\n  \"rows\": ["));
         assert!(json.contains("\"serial\": null"));
         assert!(json.contains("\"swd_kib_per_s\": null"));
         assert!(json.contains("\"verdict\": \"GAPS\""));
         assert!(json.contains("\"after_seq\": 4"));
         assert!(json.contains("\"lost_records\": 3"));
         assert_eq!(json.matches("\"requested_baud\"").count(), 1);
+    }
+
+    #[test]
+    fn the_summary_says_when_the_sweep_stopped_early() {
+        let mut clean = tier(framing(10, vec![]));
+        clean.verdict = Verdict::Clean;
+        let mut gapped = tier(framing(10, vec![]));
+        gapped.verdict = Verdict::Gaps;
+        let rows = [clean, gapped];
+        let elapsed = std::time::Duration::from_millis(12_340);
+        assert_eq!(
+            summary(&rows, 2, elapsed, false),
+            "2 tier(s) in 12.3 s; 1 clean"
+        );
+        assert_eq!(
+            summary(&rows, 5, elapsed, true),
+            "2 of 5 tier(s) in 12.3 s; 1 clean; the sweep stopped early"
+        );
     }
 
     /// The context the JSON tests share.
@@ -722,6 +863,8 @@ mod tests {
             probe_product: None,
             probe_serial: None,
             firmware_version: None,
+            firmware_row: Some("firmware/mculink".to_string()),
+            firmware_row_source: "image",
             packet_size: Some(64),
             packet_count: Some(4),
             trace_buffer_bytes: Some(1023),
@@ -732,10 +875,12 @@ mod tests {
             swd_load: false,
             dut_reset: true,
             bauds: &[4_000_000],
+            error: None,
+            teardown_error: None,
         }
     }
 
-    /// A tier whose tags a resync corrupted, as a 4 MBd RTIC row is.
+    /// A tier whose tags a resync corrupted.
     fn resynced_tier() -> Tier {
         let gap = Gap {
             after_seq: 12,
@@ -774,10 +919,170 @@ mod tests {
     }
 
     #[test]
+    fn a_tier_that_captured_nothing_is_unrated_not_silent() {
+        // Nothing on the wire is the absence of a measurement, so it may not grade as a result.
+        assert_eq!(Verdict::of(&framing(0, vec![]), 0, 0), Verdict::Unrated);
+        assert_eq!(Verdict::Unrated.label(), "UNRATED");
+        // One byte is a measurement, however poor, and stays SILENT.
+        assert_eq!(Verdict::of(&framing(0, vec![]), 1, 0), Verdict::Silent);
+        // The gate for a misframe still needs bytes, so it cannot claim an empty capture.
+        assert_eq!(
+            Verdict::of(&framing(0, vec![]), 4096, 0),
+            Verdict::Misframed
+        );
+    }
+
+    #[test]
+    fn an_unrated_tier_says_it_fails_the_run() {
+        let mut t = tier(framing(0, vec![]));
+        t.captured_bytes = 0;
+        t.payload_bytes = 0;
+        t.verdict = Verdict::of(&t.framing, 0, 0);
+        let lines = notes(&t);
+        assert!(lines[0].contains("unrated"), "{lines:?}");
+        assert!(lines[0].contains("fails the run"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_dut_that_fragmented_its_own_records_is_named_apart_from_probe_loss() {
+        let mut t = tier(framing(10, vec![]));
+        t.dut_emission = Some(daplink_test_protocol::SwoStats {
+            records: 61_000,
+            partial: 3,
+            dropped: 1,
+        });
+        let lines = notes(&t);
+        assert!(
+            lines.iter().any(|n| n.contains("3 fragmented")
+                && n.contains("1 unsent")
+                && n.contains("the target's, not the probe's")),
+            "{lines:?}"
+        );
+        // A clean ledger says nothing at all.
+        t.dut_emission = Some(daplink_test_protocol::SwoStats {
+            records: 61_000,
+            partial: 0,
+            dropped: 0,
+        });
+        assert!(notes(&t).is_empty(), "{:?}", notes(&t));
+    }
+
+    #[test]
+    fn the_json_row_carries_the_dut_ledger_or_null() {
+        let mut t = tier(framing(10, vec![]));
+        let row = json_row(&t);
+        assert!(row.contains("\"dut_partial_records\": null"), "{row}");
+        t.dut_emission = Some(daplink_test_protocol::SwoStats {
+            records: 61_000,
+            partial: 3,
+            dropped: 1,
+        });
+        let row = json_row(&t);
+        assert!(row.contains("\"dut_records\": 61000"), "{row}");
+        assert!(row.contains("\"dut_partial_records\": 3"), "{row}");
+        assert!(row.contains("\"dut_dropped_records\": 1"), "{row}");
+    }
+
+    #[test]
+    fn a_failed_final_status_is_unmeasured_not_zero() {
+        let mut t = tier(framing(10, vec![]));
+        assert!(json_row(&t).contains("\"probe_bytes_left\": 0,"));
+        assert!(notes(&t).is_empty(), "{:?}", notes(&t));
+        t.probe_bytes_left = None;
+        assert!(json_row(&t).contains("\"probe_bytes_left\": null,"));
+        let lines = notes(&t);
+        assert!(lines[0].contains("unmeasured"), "{lines:?}");
+    }
+
+    #[test]
+    fn failed_load_evidence_survives_a_clean_trace_grade() {
+        let mut t = tier(framing(10, vec![]));
+        t.swd_errors = 100;
+        t.swd_failures.push(crate::capture::LoadFailure {
+            command: 5,
+            status: 4,
+            completed: 0,
+            requested: 1,
+            elapsed_ms: 17,
+            batch: 2,
+            slot: 0,
+            response_prefix: vec![5, 0, 4],
+        });
+        let row = json_row(&t);
+        assert!(row.contains("\"swd_errors\": 100"));
+        assert!(row.contains("\"swd_failures\": [{\"command\": 5, \"status\": 4, \"completed\": 0, \"requested\": 1, \"elapsed_ms\": 17, \"batch\": 2, \"slot\": 0, \"response_prefix\": [5, 0, 4]}]"));
+        assert!(notes(&t)
+            .iter()
+            .any(|note| note.contains("status 0x04 completed 0/1")));
+        assert_eq!(t.verdict, Verdict::Clean);
+    }
+
+    #[test]
     fn json_escapes_strings_and_rejects_non_finite_numbers() {
         assert_eq!(json_str("a\"b\\c\n"), "\"a\\\"b\\\\c\\n\"");
         assert_eq!(json_f64(f64::NAN), "null");
         assert_eq!(json_f64(1.5), "1.500");
         assert_eq!(json_opt_num::<u16>(None), "null");
+    }
+
+    #[test]
+    fn record_corpus_matches_byte_for_byte() {
+        let ctx = Context {
+            timestamp_utc: "2026-01-02T03:04:05Z".to_string(),
+            probe_product: Some("probe\"\\\n\t\u{0001}".to_string()),
+            probe_serial: None,
+            firmware_version: Some("version\rvalue".to_string()),
+            firmware_row: Some("firmware/mculink".to_string()),
+            firmware_row_source: "image",
+            packet_size: None,
+            packet_count: Some(4),
+            trace_buffer_bytes: None,
+            target: "target\"name",
+            window_ms: 5000,
+            depth: 4,
+            depth_rationale: "requested\nvalue",
+            swd_load: true,
+            dut_reset: false,
+            bauds: &[115_200, 4_000_000],
+            error: Some("capturing at 4000000 baud failed: \"x\""),
+            teardown_error: Some("stopping the DUT stream failed"),
+        };
+        let gap = Gap {
+            after_seq: 7,
+            missing: 2,
+            byte_offset: 64,
+        };
+        let mut clean = tier(framing(10, vec![]));
+        clean.verdict = Verdict::Clean;
+        clean.dut_emission = Some(daplink_test_protocol::SwoStats {
+            records: 12,
+            partial: 1,
+            dropped: 2,
+        });
+        clean.swd_kib_per_s = Some(f64::NAN);
+
+        let mut gapped = tier(framing(10, vec![gap]));
+        gapped.verdict = Verdict::Gaps;
+        gapped.window_ms = f64::INFINITY;
+        gapped.kib_per_s = f64::NEG_INFINITY;
+
+        let mut unknown = resynced_tier();
+        unknown.verdict = Verdict::Misframed;
+        unknown.dut_baud = None;
+        unknown.dut_emission = None;
+        unknown.probe_bytes_left = None;
+
+        let mut silent = tier(framing(0, vec![]));
+        silent.captured_bytes = 1;
+        silent.payload_bytes = 0;
+        silent.verdict = Verdict::Silent;
+
+        let mut unrated = tier(framing(0, vec![]));
+        unrated.captured_bytes = 0;
+        unrated.payload_bytes = 0;
+        unrated.verdict = Verdict::Unrated;
+
+        let json = to_json(&ctx, &[clean, gapped, unknown, silent, unrated]);
+        assert_eq!(json, include_str!("report/fixtures/record.json"));
     }
 }

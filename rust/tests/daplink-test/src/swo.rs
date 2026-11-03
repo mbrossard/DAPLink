@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use daplink_test_protocol as proto;
 use probe_rs::architecture::arm::swo::SwoConfig;
 
+use crate::load::DapLoad;
 use crate::util::chain;
 use crate::{rtt, Ctx, Failure};
 
@@ -26,12 +27,26 @@ const EMIT_WINDOW: Duration = Duration::from_secs(6);
 const CAPTURE_DEADLINE: Duration = Duration::from_millis(750);
 /// Final drain after the last emission, for a buffered transport to hand over captured bytes.
 const FINAL_DRAIN: Duration = Duration::from_millis(500);
-/// Poll interval between `read_swo` calls.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// The one rate the loaded variant runs; finding the ceiling is the unloaded sweep's job.
+const LOAD_BAUD: u32 = 1_000_000;
+/// Reads the loaded variant requires before its capture result counts as taken under load.
+const MIN_LOAD_READS: u64 = 4;
 
-/// Run and decide one emit/capture window per rate; all rates must pass. Driven through
-/// `SwoAccess`, never `setup_tracing`, which would reprogram the TPIU the DUT owns.
+/// Run one emit/capture window per rate; never `setup_tracing`, which reprograms the DUT's TPIU.
 pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
+    inner(cx, None)
+}
+
+/// One window with a `read_32` loop running throughout; capture and the loop must both hold.
+pub(crate) fn run_loaded(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
+    let mut load = DapLoad::new(cx.read_addr);
+    let outcome = inner(cx, Some(&mut load));
+    // The load's own verdict only matters once capture has been judged.
+    outcome.and_then(|()| load.progress(MIN_LOAD_READS).map_err(Failure::Failed))
+}
+
+fn inner(cx: &mut Ctx, mut load: Option<&mut DapLoad>) -> Result<(), Failure> {
     let dut_elf = cx.dut_elf.clone();
     // DBGMCU_CR: TRACE_IOEN (bit 5) routes the trace pin to the TPIU, TRACE_MODE (7:6) = async.
     let dbgmcu_cr = cx
@@ -53,12 +68,19 @@ pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
             .map_err(|e| Failure::Failed(format!("route trace pin: {}", chain(e))))?;
     }
 
-    for &baud in SWO_BAUDS {
-        run_at_rate(session, dut_elf.as_deref(), baud).map_err(|f| match f {
-            Failure::Failed(msg) => Failure::Failed(format!("SWO at {baud} baud: {msg}")),
-            Failure::Fatal(msg) => Failure::Fatal(format!("SWO at {baud} baud: {msg}")),
-            Failure::Skip(reason) => Failure::Skip(reason),
-        })?;
+    let bauds: &[u32] = if load.is_some() {
+        &[LOAD_BAUD]
+    } else {
+        SWO_BAUDS
+    };
+    for &baud in bauds {
+        run_at_rate(session, dut_elf.as_deref(), baud, load.as_deref_mut()).map_err(
+            |f| match f {
+                Failure::Failed(msg) => Failure::Failed(format!("SWO at {baud} baud: {msg}")),
+                Failure::Fatal(msg) => Failure::Fatal(format!("SWO at {baud} baud: {msg}")),
+                Failure::Skip(reason) => Failure::Skip(reason),
+            },
+        )?;
     }
     Ok(())
 }
@@ -68,9 +90,9 @@ fn run_at_rate(
     session: &mut probe_rs::Session,
     dut_elf: Option<&str>,
     baud: u32,
+    load: Option<&mut DapLoad>,
 ) -> Result<(), Failure> {
-    // Reprogram the DUT's TPIU rate over RTT before touching probe capture. The reply carries the
-    // rate the DUT's divisor realizes, which the sweep's rates divide exactly.
+    // Reprogram the DUT's TPIU over RTT first; the reply carries the realized rate.
     {
         let mut core = session.core(0).map_err(|e| Failure::Fatal(chain(e)))?;
         let mut rtt = rtt::attach(&mut core, dut_elf).map_err(Failure::Fatal)?;
@@ -109,9 +131,8 @@ fn run_at_rate(
             .map_err(|e| Failure::Failed(format!("enable SWO capture: {}", chain(e))))?;
     }
 
-    let outcome = window(session, dut_elf);
+    let outcome = window(session, dut_elf, load);
 
-    // Always stop capture, whatever the outcome.
     if let Ok(interface) = session.get_arm_interface() {
         let _ = interface.disable_swo();
     }
@@ -121,7 +142,11 @@ fn run_at_rate(
 }
 
 /// Emit each tag over RTT and poll for its framed bytes; returns the flags in issue order.
-fn window(session: &mut probe_rs::Session, dut_elf: Option<&str>) -> Result<Vec<bool>, Failure> {
+fn window(
+    session: &mut probe_rs::Session,
+    dut_elf: Option<&str>,
+    mut load: Option<&mut DapLoad>,
+) -> Result<Vec<bool>, Failure> {
     let mut delivered = Vec::new();
     let mut captured: Vec<u8> = Vec::new();
     let start = Instant::now();
@@ -132,7 +157,6 @@ fn window(session: &mut probe_rs::Session, dut_elf: Option<&str>) -> Result<Vec<
             break;
         }
 
-        // Fire one emission over RTT (its own borrow of the session's core).
         {
             let mut core = session.core(0).map_err(|e| Failure::Fatal(chain(e)))?;
             let mut rtt = rtt::attach(&mut core, dut_elf).map_err(Failure::Fatal)?;
@@ -146,12 +170,20 @@ fn window(session: &mut probe_rs::Session, dut_elf: Option<&str>) -> Result<Vec<
             .map_err(|e| Failure::Failed(format!("emit tag {tag}: {e}")))?;
         }
 
-        // Poll the probe for this emission's framed bytes.
+        // The competing DAP traffic the loaded variant is named for, between emissions.
+        if let Some(load) = load.as_deref_mut() {
+            load.tick_session(session);
+        }
+
         let framed = framed(&payload_for(tag));
+        let waited = Instant::now();
         let got = await_capture(session, &mut captured, &framed)?;
+        // A rate past the ceiling always spends the deadline, so only a capture says how close it came.
+        if got {
+            crate::wait::note("swo.capture", CAPTURE_DEADLINE, waited.elapsed());
+        }
         delivered.push(got);
 
-        // Stop as soon as the confirmation phase is complete.
         if let Some(first) = delivered.iter().position(|d| *d) {
             if delivered.len() - (first + 1) >= CONFIRM_EMISSIONS {
                 break;
@@ -169,8 +201,7 @@ fn window(session: &mut probe_rs::Session, dut_elf: Option<&str>) -> Result<Vec<
     Ok(delivered)
 }
 
-/// Poll `read_swo` until `target` appears in the accumulated capture or [`CAPTURE_DEADLINE`]
-/// elapses.
+/// Poll `read_swo` until `target` appears or [`CAPTURE_DEADLINE`] elapses.
 fn await_capture(
     session: &mut probe_rs::Session,
     captured: &mut Vec<u8>,
@@ -205,7 +236,6 @@ fn drain(
     }
 }
 
-/// One `read_swo` call, appended to `captured`.
 fn read_chunk(session: &mut probe_rs::Session, captured: &mut Vec<u8>) -> Result<(), Failure> {
     let interface = session
         .get_arm_interface()
@@ -217,8 +247,7 @@ fn read_chunk(session: &mut probe_rs::Session, captured: &mut Vec<u8>) -> Result
     Ok(())
 }
 
-/// The pass criterion: capture began, and the [`CONFIRM_EMISSIONS`] emissions after the first
-/// delivery all arrived intact.
+/// Passes when capture began and the next [`CONFIRM_EMISSIONS`] emissions arrived intact.
 fn decide(delivered: &[bool]) -> Result<(), String> {
     if delivered.is_empty() {
         return Err("no emission was issued in the window".into());
@@ -266,7 +295,6 @@ fn framed(payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// `true` if `haystack` contains `needle` as a contiguous sub-slice.
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -303,9 +331,7 @@ mod tests {
         assert!(decide(&[false, true, false, false, false]).is_err());
         // A window ending before confirmation is inconclusive, not a pass.
         assert!(decide(&[false, true, true]).is_err());
-        // A silent window fails.
         assert!(decide(&[false; 6]).is_err());
-        // Nothing issued fails.
         assert!(decide(&[]).is_err());
     }
 }

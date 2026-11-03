@@ -1,10 +1,8 @@
-//! Drag-n-drop driven through the Bulk-Only transport into the real volume.
-//!
-//! The transport's own tests answer against a mock block device, and the volume's tests call
-//! `write_sector` directly; nothing joins the two. These drive `run_command` over [`DirectIo`]
-//! and a live [`Vfs`], so a Command Block Wrapper reaches the flash backend the way a host's
-//! does: CBW, 64-byte OUT packets, data-phase bracket, CSW.
+//! Drag-n-drop through the Bulk-Only transport into a live volume, CBW to CSW.
 
+mod common;
+
+use common::{dir_entry, uf2_numbered};
 use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
@@ -16,7 +14,7 @@ use daplink_core::{FlashBackend, FlashPhase, MSC_SECTOR_SIZE};
 use daplink_targets::{targets::rp2040::RP2040, Target};
 use daplink_vfs::{
     fat, run_command, BulkIn, BulkOut, DetailsFile, DeviceInfo, DirectIo, FlashSink, MediaState,
-    NoObserver, TransferOutcome, VfsConfig, VfsFile,
+    NoObserver, TransferOutcome, VfsConfig, VfsFile, YieldSleep,
 };
 
 type TestVfs<'a> = daplink_vfs::Vfs<'a, FlashSink<RecordingBackend>, NoObserver>;
@@ -131,8 +129,7 @@ fn rw10(op: u8, lba: u32, count: u16) -> [u8; 10] {
     [op, 0x00, l[0], l[1], l[2], l[3], 0x00, c[0], c[1], 0x00]
 }
 
-/// One host command against the live volume: returns the data-phase bytes and the CSW triple,
-/// plus how many host-to-device bytes the transport actually consumed.
+/// One host command: returns data-phase bytes, the CSW triple, and OUT bytes consumed.
 fn run_cmd(
     vfs: &mut TestVfs<'_>,
     cbw: &[u8; CBW_LEN],
@@ -149,13 +146,15 @@ fn run_cmd(
     let mut ua = false;
     {
         let mut io = DirectIo::new(vfs);
-        block_on(run_command::<_, _, _, 64>(
+        block_on(run_command::<_, _, _, _, 64>(
             &mut ep_in,
             &mut ep_out,
             &mut io,
+            &mut YieldSleep,
             &mut sector,
             &mut sense,
             &mut ua,
+            &mut false,
             &parsed,
         ));
     }
@@ -174,33 +173,11 @@ fn run_cmd(
     )
 }
 
-fn dir_entry(name: &[u8; 11], attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
-    let mut e = [0u8; 32];
-    e[0..11].copy_from_slice(name);
-    e[11] = attr;
-    e[26..28].copy_from_slice(&first_cluster.to_le_bytes());
-    e[28..32].copy_from_slice(&size.to_le_bytes());
-    e
-}
-
 const XIP_BASE: u32 = 0x1000_0000;
 const USER_CLUSTER: u16 = 10;
 
 fn user_lba(sector: u32) -> u32 {
     fat::cluster_to_lba(USER_CLUSTER as u32) + sector
-}
-
-fn uf2_block(block_no: u32, num_blocks: u32, payload: &[u8]) -> [u8; 512] {
-    let mut b = [0u8; 512];
-    b[0..4].copy_from_slice(&0x0A32_4655u32.to_le_bytes());
-    b[4..8].copy_from_slice(&0x9E5D_5157u32.to_le_bytes());
-    b[12..16].copy_from_slice(&(XIP_BASE + block_no * 256).to_le_bytes());
-    b[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    b[20..24].copy_from_slice(&block_no.to_le_bytes());
-    b[24..28].copy_from_slice(&num_blocks.to_le_bytes());
-    b[32..32 + payload.len()].copy_from_slice(payload);
-    b[508..512].copy_from_slice(&0x0AB1_6F30u32.to_le_bytes());
-    b
 }
 
 /// The root-directory sector carrying one entry for the dropped image.
@@ -234,8 +211,8 @@ fn a_drop_delivered_as_write10_commands_programs_the_image() {
         let p0 = [0xA1u8; 256];
         let p1 = [0xB2u8; 256];
         let mut image = Vec::new();
-        image.extend_from_slice(&uf2_block(0, 2, &p0));
-        image.extend_from_slice(&uf2_block(1, 2, &p1));
+        image.extend_from_slice(&uf2_numbered(0, 2, XIP_BASE, &p0));
+        image.extend_from_slice(&uf2_numbered(1, 2, XIP_BASE + 256, &p1));
 
         let dirent = run_cmd(
             &mut vfs,
@@ -253,9 +230,12 @@ fn a_drop_delivered_as_write10_commands_programs_the_image() {
         assert_eq!(data.1, (2, 0, CSW_PASSED), "the two-sector image command");
         assert_eq!(data.2, 1024, "both sectors are consumed");
 
-        // The medium may not change under an open command: only the tick after it detaches.
+        // The medium may not change under an open command: the write silence after it detaches.
         assert_eq!(vfs.media(), MediaState::Ready);
-        assert_eq!(vfs.tick(1), MediaState::Detached);
+        assert_eq!(
+            vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_MS),
+            MediaState::Detached
+        );
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&p0);
@@ -297,7 +277,7 @@ fn a_write10_length_disagreement_never_reaches_the_flash_backend() {
         assert_eq!(dirent.1, (4, 0, CSW_PASSED));
 
         // Two sectors declared as one: accepting the phase would program a half image.
-        let image = uf2_block(0, 1, &p0);
+        let image = uf2_numbered(0, 1, XIP_BASE, &p0);
         let (data, csw, consumed) = run_cmd(
             &mut vfs,
             &cbw(5, 512, false, &rw10(0x2A, user_lba(0), 2)),

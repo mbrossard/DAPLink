@@ -20,6 +20,28 @@ const BATCH_TIMEOUT: Duration = Duration::from_millis(2000);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 /// Polls after `Control(Stop)` that drain whatever the probe still holds.
 const DRAIN_POLLS: usize = 8;
+const LOAD_FAILURE_SAMPLES: usize = 4;
+
+/// Bounded evidence for a failed loaded transfer; raw status is not a fault-event count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadFailure {
+    /// CMSIS-DAP command identifier.
+    pub command: u8,
+    /// Unmodified CMSIS-DAP transfer status byte.
+    pub status: u8,
+    /// Transfers the response reports completing.
+    pub completed: u16,
+    /// Transfers requested by this command.
+    pub requested: u16,
+    /// Host observation time after the batch, relative to capture start.
+    pub elapsed_ms: u64,
+    /// One-based submitted batch number.
+    pub batch: u64,
+    /// Zero-based command slot within the batch.
+    pub slot: usize,
+    /// At most 16 bytes from the received response.
+    pub response_prefix: Vec<u8>,
+}
 
 /// The concurrent SWD read the `--swd-load` mode interleaves with the capture polls.
 #[derive(Debug, Clone, Copy)]
@@ -94,19 +116,22 @@ pub struct Capture {
     pub elapsed: Duration,
     /// `DAP_SWO_Data` exchanges issued.
     pub polls: u64,
-    /// Polls that came back completely full: the probe had at least as much as one packet holds,
-    /// so the host was not keeping up.
+    /// Polls that came back full: the host was not keeping up.
     pub full_polls: u64,
     /// Polls the probe answered with capture inactive.
     pub inactive_polls: u64,
+    /// Post-window polls that emptied the probe, kept apart from `polls`.
+    pub drain_polls: u64,
     /// Words read by the interleaved SWD load.
     pub swd_words: u64,
     /// Load reads whose data differed from the first chunk read at this tier.
     pub swd_mismatches: u64,
     /// Load transfers the probe did not acknowledge cleanly.
     pub swd_errors: u64,
-    /// `DAP_SWO_Status` read once just before capture stopped.
-    pub final_status: swo::Status,
+    /// First four failed load responses, without recovery or changes to the submitted traffic.
+    pub swd_failures: Vec<LoadFailure>,
+    /// `DAP_SWO_Status` read once just before capture stopped; `None` when that read failed.
+    pub final_status: Option<swo::Status>,
 }
 
 /// Per-tier capture knobs.
@@ -124,8 +149,7 @@ pub struct Config {
     pub load: Option<LoadPlan>,
 }
 
-/// The command sequence one batch submits: a plain capture polls, a loaded capture pushes a
-/// TAR/block pair in front of each poll so both share one pipelined window.
+/// One batch's command sequence; a loaded capture puts a TAR/block pair before each poll.
 pub fn batch_slots(depth: usize, loaded: bool) -> Vec<Slot> {
     let depth = depth.max(1);
     let mut slots = Vec::with_capacity(depth * 3);
@@ -209,8 +233,8 @@ fn status(probe: &mut Probe) -> Result<swo::Status> {
     Ok(swo::decode_status(&resp)?)
 }
 
-/// Configure, capture for the window, stop, and drain; a failure stops the capture first, so the
-/// probe is never left capturing.
+/// Configure, capture, stop and drain; a failed stop may leave capture active.
+/// A window error outranks the stop's; `final_status` is `None` when the closing status failed.
 pub fn run(probe: &mut Probe, cfg: &Config) -> Result<Capture> {
     if cfg.data_count == 0 {
         bail!("the probe's packet size leaves no room for SWO payload");
@@ -223,17 +247,11 @@ pub fn run(probe: &mut Probe, cfg: &Config) -> Result<Capture> {
     if probe.is_desynced() {
         let _ = probe.resynchronize();
     }
-    let final_status = match status(probe) {
-        Ok(status) => status,
-        Err(_) => {
-            // A status that will not decode means the stream is off by one.
-            probe.mark_desynced();
-            swo::Status {
-                active: false,
-                bytes_available: 0,
-            }
-        }
-    };
+    let final_status = status(probe).ok();
+    if final_status.is_none() {
+        // A status that will not decode means the stream is off by one.
+        probe.mark_desynced();
+    }
     let stop = control(probe, swo::Control::Stop);
 
     let mut capture = outcome?;
@@ -275,18 +293,30 @@ fn window(probe: &mut Probe, cfg: &Config) -> Result<Capture> {
                 )
             });
         }
-        for (slot, resp) in slots.iter().zip(&responses) {
+        for (position, (slot, resp)) in slots.iter().zip(&responses).enumerate() {
             match slot {
                 Slot::TarWrite => {
                     let decoded = dap::decode_transfer(resp)?;
-                    if !decoded.status.is_ok() || decoded.transfer_count != 1 {
-                        cap.swd_errors += 1;
-                    }
+                    observe_load(
+                        &mut cap,
+                        *slot,
+                        resp,
+                        u16::from(decoded.transfer_count),
+                        1,
+                        (batches, position, started),
+                    );
                 }
                 Slot::BlockRead => {
                     let decoded = dap::decode_transfer_block(resp)?;
-                    if !decoded.status.is_ok() {
-                        cap.swd_errors += 1;
+                    let requested = cfg.load.expect("block slots require a load plan").words as u16;
+                    if observe_load(
+                        &mut cap,
+                        *slot,
+                        resp,
+                        decoded.transfer_count,
+                        requested,
+                        (batches, position, started),
+                    ) {
                         continue;
                     }
                     cap.swd_words += u64::from(decoded.transfer_count);
@@ -315,6 +345,36 @@ fn window(probe: &mut Probe, cfg: &Config) -> Result<Capture> {
     Ok(cap)
 }
 
+fn observe_load(
+    cap: &mut Capture,
+    slot: Slot,
+    response: &[u8],
+    completed: u16,
+    requested: u16,
+    observation: (u64, usize, Instant),
+) -> bool {
+    let (batch, position, started) = observation;
+    // Callers have decoded and validated the response header before this observation.
+    let status = response[if slot == Slot::TarWrite { 2 } else { 3 }];
+    if dap::TransferStatus::from_byte(status).is_ok() && completed == requested {
+        return false;
+    }
+    cap.swd_errors += 1;
+    if cap.swd_failures.len() < LOAD_FAILURE_SAMPLES {
+        cap.swd_failures.push(LoadFailure {
+            command: slot.command_id(),
+            status,
+            completed,
+            requested,
+            elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            batch,
+            slot: position,
+            response_prefix: response[..response.len().min(16)].to_vec(),
+        });
+    }
+    true
+}
+
 /// Drain the bytes the probe still buffers once capture has stopped.
 fn drain(probe: &mut Probe, cfg: &Config, cap: &mut Capture) -> Result<()> {
     let request = swo::encode_data(cfg.data_count);
@@ -328,13 +388,21 @@ fn drain(probe: &mut Probe, cfg: &Config, cap: &mut Capture) -> Result<()> {
                 return Err(e.into());
             }
         };
-        cap.polls += 1;
-        if data.bytes.is_empty() {
+        if !absorb_drain(cap, &data) {
             break;
         }
-        cap.bytes.extend_from_slice(&data.bytes);
     }
     Ok(())
+}
+
+/// Fold one drained response into the capture; returns whether the probe still held bytes.
+fn absorb_drain(cap: &mut Capture, data: &swo::Data) -> bool {
+    cap.drain_polls += 1;
+    if data.bytes.is_empty() {
+        return false;
+    }
+    cap.bytes.extend_from_slice(&data.bytes);
+    true
 }
 
 /// A zeroed capture the window fills in.
@@ -346,19 +414,73 @@ fn empty_capture() -> Capture {
         polls: 0,
         full_polls: 0,
         inactive_polls: 0,
+        drain_polls: 0,
         swd_words: 0,
         swd_mismatches: 0,
         swd_errors: 0,
-        final_status: swo::Status {
-            active: false,
-            bytes_available: 0,
-        },
+        swd_failures: Vec::new(),
+        final_status: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_are_bounded_but_the_counter_is_not() {
+        let mut cap = empty_capture();
+        for batch in 1..=9 {
+            assert!(observe_load(
+                &mut cap,
+                Slot::TarWrite,
+                &[5, 0, 4],
+                0,
+                1,
+                (batch, 2, Instant::now())
+            ));
+        }
+        assert_eq!(cap.swd_errors, 9);
+        assert_eq!(cap.swd_failures.len(), 4);
+        let first = &cap.swd_failures[0];
+        assert_eq!(
+            (
+                first.command,
+                first.status,
+                first.completed,
+                first.requested
+            ),
+            (5, 4, 0, 1)
+        );
+        assert_eq!((first.batch, first.slot), (1, 2));
+        assert_eq!(first.response_prefix, [5, 0, 4]);
+    }
+
+    #[test]
+    fn short_ok_block_is_a_failure_and_raw_evidence_is_bounded() {
+        let mut cap = empty_capture();
+        let mut response = vec![6, 3, 0, 1];
+        response.extend([0; 32]);
+        assert!(observe_load(
+            &mut cap,
+            Slot::BlockRead,
+            &response,
+            3,
+            4,
+            (1, 1, Instant::now())
+        ));
+        assert_eq!(cap.swd_failures[0].status, 1);
+        assert_eq!(cap.swd_failures[0].response_prefix.len(), 16);
+        assert!(!observe_load(
+            &mut cap,
+            Slot::BlockRead,
+            &response,
+            3,
+            3,
+            (2, 1, Instant::now())
+        ));
+        assert_eq!(cap.swd_errors, 1);
+    }
 
     fn config(load: Option<LoadPlan>) -> Config {
         Config {
@@ -464,6 +586,31 @@ mod tests {
         // A short batch is a mismatch of its own, not a silent zip truncation.
         assert!(check_slots(&slots, &responses[..2]).is_err());
         assert!(check_slots(&slots, &[vec![], vec![], vec![]]).is_err());
+    }
+
+    #[test]
+    fn a_drain_cannot_move_the_window_poll_ratios() {
+        let mut cap = empty_capture();
+        cap.polls = 100;
+        cap.full_polls = 60;
+        cap.inactive_polls = 4;
+        let before = (cap.polls, cap.full_polls, cap.inactive_polls);
+        // A stopped probe answers a drain with its capture bit clear and, at first, a full packet.
+        let full = swo::Data {
+            active: false,
+            bytes: vec![0u8; 508],
+        };
+        assert!(absorb_drain(&mut cap, &full));
+        assert!(absorb_drain(&mut cap, &full));
+        let empty = swo::Data {
+            active: false,
+            bytes: Vec::new(),
+        };
+        assert!(!absorb_drain(&mut cap, &empty));
+        assert_eq!((cap.polls, cap.full_polls, cap.inactive_polls), before);
+        // The drain is counted in its own ledger, and its bytes still belong to the tier.
+        assert_eq!(cap.drain_polls, 3);
+        assert_eq!(cap.bytes.len(), 1016);
     }
 
     #[test]

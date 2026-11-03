@@ -9,8 +9,8 @@ use daplink_test_protocol::v1::{
 pub use daplink_test_protocol::v1::{Direction, DEFAULT_INTERVAL};
 
 use crate::budget::{DapAchieved, Demand};
+use crate::counters::Conservation;
 
-/// Both directions, in report order.
 pub const DIRECTIONS: [Direction; 2] = [Direction::HostToDut, Direction::DutToHost];
 
 /// Goodput a direction claiming the line rate must hold, as a fraction of the payload budget.
@@ -20,8 +20,7 @@ pub const PASS_FRAC: f64 = 0.99;
 pub const WARMUP_SECS: f64 = 5.0;
 /// Seconds between checkpoints inside a measured window.
 pub const CHECKPOINT_SECS: f64 = 5.0;
-/// Delivered fraction a checkpoint must hold before the window is abandoned, for a direction
-/// claiming the line rate.
+/// Delivered fraction below which a line-rate checkpoint abandons the window.
 pub const CHECKPOINT_FLOOR: f64 = 0.90;
 /// Shortest window a discovery rung is measured over, seconds.
 pub const DISCOVERY_SECS: f64 = 30.0;
@@ -88,10 +87,9 @@ impl Default for Seeds {
 /// What each end transmits in a run, and how the result may be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Shape {
-    /// Both ends transmit their whole budget at line rate: the acceptance test.
+    /// Both ends transmit their whole budget at line rate.
     Duplex,
-    /// Both ends transmit, the DUT only as far as the host's cumulative grants reach: claims no
-    /// line rate.
+    /// Both ends transmit, the DUT only as far as the host's grants reach; claims no line rate.
     Credit,
     /// Both ends transmit, the host leg paced to a fraction so the return leg keeps the bridge.
     ReturnPriority,
@@ -154,8 +152,7 @@ pub struct Plan {
     pub interval: u32,
     /// The nominal window, which is what goodput is denominated over.
     pub secs: f64,
-    /// The rate each end reported programming; a direction's budget derives from its own
-    /// transmitter's clock, the only one that can pace it.
+    /// The rate each end reported; each direction's budget derives from its own transmitter.
     pub dut_baud: u32,
     pub probe_baud: u32,
     /// Fraction of the line rate the host transmitter is paced to.
@@ -244,8 +241,7 @@ impl Plan {
         }
     }
 
-    /// The same operating point with the host leg paced, for when a symmetric point does not fit
-    /// the bus budget.
+    /// The same operating point with the host leg paced, for when a symmetric point does not fit.
     pub fn as_return_priority(&self) -> Plan {
         Plan {
             shape: Shape::ReturnPriority,
@@ -331,8 +327,7 @@ impl Slice {
     }
 }
 
-/// One read of the running host-side ledger; it reads counters the engines already keep, never
-/// pausing the stream.
+/// One read of the running host-side ledger, taken without pausing the stream.
 #[derive(Clone, Copy, Debug)]
 pub struct Checkpoint {
     /// Seconds from arming to this read.
@@ -350,18 +345,18 @@ impl Checkpoint {
     }
 }
 
-/// What the shape of one direction's checkpoint series says the run is doing.
+/// Checkpoint shape classification, not proof of the underlying cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Trend {
     /// Every checkpoint at the budget.
     Holding,
-    /// A steady slight shortfall with no trend: a fixed per-packet cost, not a defect.
+    /// A steady slight shortfall; the series does not establish its cause.
     Shortfall,
-    /// High and then falling away: progressive starvation, a backlog filling.
+    /// High then falling away.
     Declining,
-    /// Low from the first checkpoint and flat: a leg pinned by a scheduling bound.
+    /// Low from the first checkpoint and flat.
     Structural,
-    /// A cliff to nothing: a wedge, or a verifier that lost the stream.
+    /// A cliff to nothing; device and verifier causes are not distinguished.
     Cliff,
     /// None of the known shapes; the series is the evidence and the class is open.
     Mixed,
@@ -382,7 +377,7 @@ impl Trend {
         }
     }
 
-    /// What the shape reads as, for the report.
+    /// Heuristic report interpretation; its causal labels are not established by the series.
     pub fn reads_as(self) -> &'static str {
         match self {
             Trend::Holding => "at the budget throughout",
@@ -444,8 +439,7 @@ pub fn classify(f: &[f64]) -> Trend {
     Trend::Mixed
 }
 
-/// The ones that fall strictly inside the window; the closing interval is judged by the run's own
-/// ledgers instead.
+/// Checkpoints strictly inside the window; the closing interval is judged by the ledgers.
 pub fn checkpoints_inside(secs: f64, period: f64) -> usize {
     if period <= 0.0 || secs <= 0.0 {
         return 0;
@@ -496,8 +490,7 @@ impl Sampler {
         }
     }
 
-    /// Reads the running ledgers if a checkpoint is due at `elapsed`, and says whether the window
-    /// is worth finishing.
+    /// Reads the ledgers if a checkpoint is due at `elapsed`; says whether to keep going.
     pub fn sample(
         &mut self,
         elapsed: f64,
@@ -509,8 +502,7 @@ impl Sampler {
         }
         let span = elapsed - self.last_at;
         self.last_at = elapsed;
-        // A poll that arrives a period late skips the checkpoints it missed, rather than firing one
-        // per poll after.
+        // A late poll skips the checkpoints it missed rather than firing them all.
         while self.due <= elapsed {
             self.due += self.period;
         }
@@ -636,8 +628,7 @@ pub struct Leg {
 }
 
 impl Leg {
-    /// Over the nominal window or the time the receiver was actually taking bytes, whichever is
-    /// longer.
+    /// Over the nominal window or the receiver's active time, whichever is longer.
     pub fn goodput_bps(&self, secs: f64) -> f64 {
         let took = secs.max(f64::from(self.rx.elapsed_us) / 1e6);
         if took > 0.0 {
@@ -657,224 +648,13 @@ impl Leg {
         }
     }
 
-    /// Every byte the transmitter sent is accounted for at the receiver, and both ends agree on the
-    /// total.
+    /// Every transmitted byte is accounted for at the receiver, and both ends agree on the total.
     pub fn reconciles(&self) -> bool {
         self.rx.eos
             && self.rx.accounted() == self.tx_payload
             && self
                 .rx_eos_total
                 .is_none_or(|total| total == self.tx_payload)
-    }
-}
-
-/// The probe's own VCOM byte ledger; every field is a free-running counter, differenced by
-/// wrapping subtraction. The high-water marks only ever ratchet up, so their difference is the
-/// growth inside a bracket, not a count.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct VcomCounters {
-    /// Bytes the bridge took off the UART.
-    pub uart_rx: u32,
-    /// Bytes the CDC IN endpoint accepted for the host; a probe that stages toward the endpoint
-    /// credits them at the stream and takes the credit back when a stage is discarded, so the
-    /// field is exact once the stage drains.
-    pub cdc_in: u32,
-    /// Bytes taken off the UART that the host would not take, a discarded stage included.
-    pub host_dropped: u32,
-    /// Bytes dropped because the probe's receive ring was full.
-    pub ring_full: u32,
-    /// Error-flagged reception, in the unit the `units` word declares.
-    pub frame_err: u32,
-    /// Receive overrun, in the unit the `units` word declares.
-    pub overrun: u32,
-    /// Bytes the probe accepted from the CDC OUT endpoint.
-    pub cdc_out: u32,
-    /// Bytes the probe's transmit path put on the wire.
-    pub uart_tx: u32,
-    /// Receive-DMA faults the probe recovered from.
-    pub rx_dma_err: u32,
-    /// Counter coverage; `None` denotes a legacy response with unknown coverage.
-    pub valid: Option<u32>,
-    /// Two bits per slot, evidence quality per sourced counter; `None` before the v2 reply.
-    pub grade: Option<u32>,
-    /// One bit per slot, set where the counter is episodes rather than bytes; `None` before v2.
-    pub units: Option<u32>,
-}
-
-/// The six receive-ledger slots every reply carries, and the identity three inside them.
-pub const VALID_RX_LEDGER: u32 = 0b11_1111;
-const VALID_IDENTITY: u32 = 0b000111;
-pub const VALID_RX_DMA_ERR: u32 = 1 << SLOT_RX_DMA_ERR;
-
-/// Slot indices into the mask words, in wire order.
-pub const SLOT_RING_FULL: usize = 3;
-pub const SLOT_FRAME_ERR: usize = 4;
-pub const SLOT_OVERRUN: usize = 5;
-pub const SLOT_CDC_OUT: usize = 6;
-pub const SLOT_UART_TX: usize = 7;
-pub const SLOT_RX_DMA_ERR: usize = 8;
-
-pub const GRADE_LOWER_BOUND: u32 = 1;
-pub const GRADE_EXACT: u32 = 2;
-
-/// One slot's grade out of the two-bit-per-slot word; `None` on a reply without the word.
-pub fn slot_grade(grade: Option<u32>, slot: usize) -> Option<u32> {
-    grade.map(|g| (g >> (2 * slot)) & 0b11)
-}
-
-/// Whether a slot's counter is episodes rather than bytes; a reply without the word means bytes.
-pub fn slot_episodes(units: Option<u32>, slot: usize) -> bool {
-    units.is_some_and(|u| u & (1 << slot) != 0)
-}
-
-/// Whether the seam behind this reply sources the slot at all. A legacy reply carries no coverage
-/// word, so its slots are taken at face value; a slot with its bit clear reads zero by contract
-/// and means "I cannot tell you", never "nothing happened".
-pub fn slot_sourced(valid: Option<u32>, slot: usize) -> bool {
-    valid.is_none_or(|mask| mask & (1 << slot) != 0)
-}
-
-/// One counter rendered against its own coverage, grade and unit: `unsourced` where the seam does
-/// not source the slot, `>=` where the seam grades it a lower bound, and an episode count labeled
-/// so it is never read as bytes.
-pub fn render_counter(c: &VcomCounters, value: u32, slot: usize) -> String {
-    if !slot_sourced(c.valid, slot) {
-        return "unsourced".into();
-    }
-    let bound = match slot_grade(c.grade, slot) {
-        Some(GRADE_LOWER_BOUND) => ">=",
-        _ => "",
-    };
-    let unit = if slot_episodes(c.units, slot) {
-        " episodes"
-    } else {
-        ""
-    };
-    format!("{bound}{value}{unit}")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConservationClass {
-    CompleteClean,
-    PartialClean,
-    ObservedLoss,
-    IdentityFailed,
-    /// A DMA channel was reinitialised under live traffic, so the bracket's counters are not
-    /// evidence of anything.
-    DmaFaulted,
-}
-
-impl ConservationClass {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::CompleteClean => "complete-clean",
-            Self::PartialClean => "partial-clean",
-            Self::ObservedLoss => "observed-loss",
-            Self::IdentityFailed => "identity-failed",
-            Self::DmaFaulted => "dma-faulted",
-        }
-    }
-}
-
-impl VcomCounters {
-    pub fn since(self, base: Self) -> Self {
-        Self {
-            uart_rx: self.uart_rx.wrapping_sub(base.uart_rx),
-            cdc_in: self.cdc_in.wrapping_sub(base.cdc_in),
-            host_dropped: self.host_dropped.wrapping_sub(base.host_dropped),
-            ring_full: self.ring_full.wrapping_sub(base.ring_full),
-            frame_err: self.frame_err.wrapping_sub(base.frame_err),
-            overrun: self.overrun.wrapping_sub(base.overrun),
-            cdc_out: self.cdc_out.wrapping_sub(base.cdc_out),
-            uart_tx: self.uart_tx.wrapping_sub(base.uart_tx),
-            rx_dma_err: self.rx_dma_err.wrapping_sub(base.rx_dma_err),
-            valid: match (self.valid, base.valid) {
-                (Some(a), Some(b)) => Some(a & b),
-                _ => None,
-            },
-            // Coverage words are constants per firmware, so the closing sample's carry over.
-            grade: base.grade.and(self.grade),
-            units: base.units.and(self.units),
-        }
-    }
-
-    /// Every byte the bridge took off the UART is accounted for on the host side or charged to a
-    /// loss site.
-    pub fn identity_holds(self) -> bool {
-        self.uart_rx == self.cdc_in.wrapping_add(self.host_dropped)
-    }
-
-    /// The probe charged a loss to a named site.
-    pub fn lost_any(self) -> bool {
-        self.host_dropped != 0 || self.ring_full != 0 || self.frame_err != 0 || self.overrun != 0
-    }
-
-    /// The sourced DMA-error counter moved: a channel was reinitialised under live traffic.
-    pub fn dma_faulted(self) -> bool {
-        let sourced = |bit| self.valid.is_none_or(|mask: u32| mask & bit != 0);
-        self.rx_dma_err != 0 && sourced(VALID_RX_DMA_ERR)
-    }
-}
-
-/// The probe's ledger sampled either side of a verb's windows; the bracket spans every window the
-/// verb ran.
-#[derive(Clone, Copy, Debug)]
-pub struct Conservation {
-    pub before: VcomCounters,
-    pub after: VcomCounters,
-}
-
-impl Conservation {
-    /// What the bracketed windows put through the bridge.
-    pub fn delta(&self) -> VcomCounters {
-        self.after.since(self.before)
-    }
-
-    /// The identity holds at the closing sample, and nothing inside the bracket was lost.
-    pub fn clean(&self) -> bool {
-        matches!(
-            self.classification(),
-            ConservationClass::CompleteClean | ConservationClass::PartialClean
-        )
-    }
-
-    pub fn classification(&self) -> ConservationClass {
-        let delta = self.delta();
-        let valid = delta.valid;
-        // First: a recovered fault means nothing else in the bracket is evidence.
-        if delta.dma_faulted() {
-            return ConservationClass::DmaFaulted;
-        }
-        if valid.is_some_and(|mask| mask & VALID_IDENTITY == VALID_IDENTITY)
-            && !delta.identity_holds()
-        {
-            return ConservationClass::IdentityFailed;
-        }
-        let loss = [
-            delta.host_dropped,
-            delta.ring_full,
-            delta.frame_err,
-            delta.overrun,
-        ];
-        let loss_bits = [1 << 2, 1 << 3, 1 << 4, 1 << 5];
-        if loss
-            .into_iter()
-            .zip(loss_bits)
-            .any(|(n, bit)| n != 0 && valid.is_none_or(|mask| mask & bit != 0))
-        {
-            return ConservationClass::ObservedLoss;
-        }
-        // Complete needs more than coverage: a lower-bound counter at zero proves nothing, so
-        // every receive-ledger slot must also grade exact. A v1 reply cannot say, so it stays
-        // partial.
-        let exact = delta
-            .grade
-            .is_some_and(|g| (0..6).all(|slot| (g >> (2 * slot)) & 0b11 == GRADE_EXACT));
-        if valid.is_some_and(|mask| mask & VALID_RX_LEDGER == VALID_RX_LEDGER) && exact {
-            ConservationClass::CompleteClean
-        } else {
-            ConservationClass::PartialClean
-        }
     }
 }
 
@@ -898,15 +678,13 @@ pub struct Run {
     pub ovr: u32,
     /// Bytes the DUT's receive ring discarded before its software read them.
     pub drop: u32,
-    /// Abort waits the DUT's DMA driver gave up on with the channel still busy; sticky across
-    /// `STATS RESET`, so a nonzero read taints every counter taken since it latched.
+    /// DMA aborts abandoned with the channel busy; sticky, so nonzero taints every counter.
     pub stuck: u32,
     /// Host wall time from arming to the end of the drain.
     pub measured_secs: f64,
     /// The streams did not end even after the host closed them.
     pub timed_out: bool,
-    /// The host closed the streams rather than both transmitters meeting their budgets; normal for
-    /// a shape that claims no line rate.
+    /// The host closed the streams before both transmitters met their budgets.
     pub closed: bool,
     pub abandoned: Option<Abandon>,
     pub series: Series,
@@ -921,8 +699,7 @@ impl Run {
         self.legs.iter().find(|leg| leg.dir == dir)
     }
 
-    /// Its whole window, or the checkpoint it was abandoned at; every rate is denominated over
-    /// this.
+    /// Its whole window, or the checkpoint it was abandoned at.
     pub fn sustained_secs(&self) -> f64 {
         match &self.abandoned {
             Some(a) => a.at_secs,
@@ -930,8 +707,7 @@ impl Run {
         }
     }
 
-    /// One direction's goodput as a fraction of its payload budget, over the seconds the run
-    /// actually held.
+    /// One direction's goodput as a fraction of its payload budget, over the seconds held.
     pub fn budget_frac(&self, dir: Direction) -> f64 {
         self.leg(dir).map_or(0.0, |leg| {
             leg.budget_frac(&self.plan, self.sustained_secs())
@@ -1043,8 +819,7 @@ impl Run {
         }
     }
 
-    /// A rung's grade. `Qualified` relaxes only the goodput floor and the probe's loss counters;
-    /// loss no counter saw is never qualified, because nothing bounds it.
+    /// A rung's grade; loss no counter saw is never `Qualified`.
     pub fn grade(&self) -> Grade {
         if self.verdict().pass {
             return Grade::Clean;
@@ -1153,6 +928,8 @@ pub fn legs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::counters::tests::ledger;
+    use crate::counters::VcomCounters;
     use daplink_test_protocol::v1::{Encoder, Verifier};
 
     const BAUD: u32 = 2_625_000;
@@ -1172,8 +949,6 @@ mod tests {
             credit_window: CREDIT_WINDOW,
         }
     }
-
-    // --- budget arithmetic ---
 
     #[test]
     fn the_payload_fraction_is_the_interval_over_the_interval_plus_a_frame() {
@@ -1312,8 +1087,6 @@ mod tests {
         }
     }
 
-    // --- ledger reconciliation and verdicts ---
-
     /// A DUT report of a clean run: `tx` payload bytes emitted, `rx` verified.
     fn clean_report(tx: u32, rx: u32, interval: u32) -> V1Report {
         let (frames, rx_frames) = (tx / interval + 1, rx / interval + 1);
@@ -1365,7 +1138,6 @@ mod tests {
             payload: u64::from(out),
             frames: out / plan.interval + 1,
             credit: 0,
-            complete: true,
         };
         let rx = clean_rx(u64::from(back), back / plan.interval + 1);
         Run {
@@ -1396,127 +1168,6 @@ mod tests {
             assert!(leg.reconciles());
             assert!((run.budget_frac(dir) - 1.0).abs() < 1e-3);
         }
-    }
-
-    /// A probe ledger that took `uart_rx` bytes off the UART and delivered all of them.
-    fn ledger(uart_rx: u32) -> VcomCounters {
-        VcomCounters {
-            uart_rx,
-            cdc_in: uart_rx,
-            ..VcomCounters::default()
-        }
-    }
-
-    #[test]
-    fn free_running_counters_are_differenced_by_wrapping() {
-        let before = ledger(u32::MAX - 100);
-        let after = ledger(923);
-        assert_eq!(after.since(before).uart_rx, 1024);
-    }
-
-    /// A grade word claiming exact on every receive-ledger slot.
-    const EXACT_LEDGER: u32 = 0b10_10_10_10_10_10;
-
-    #[test]
-    fn conservation_classifies_full_partial_loss_and_identity_failure() {
-        let classify = |after: VcomCounters| {
-            Conservation {
-                before: VcomCounters {
-                    valid: after.valid,
-                    grade: after.grade,
-                    units: after.units,
-                    ..VcomCounters::default()
-                },
-                after,
-            }
-            .classification()
-        };
-        assert_eq!(
-            classify(VcomCounters {
-                valid: Some(VALID_RX_LEDGER),
-                grade: Some(EXACT_LEDGER),
-                units: Some(0),
-                ..ledger(10)
-            }),
-            ConservationClass::CompleteClean
-        );
-        // Coverage without exactness proves nothing was seen, not that nothing was lost.
-        assert_eq!(
-            classify(VcomCounters {
-                valid: Some(VALID_RX_LEDGER),
-                ..ledger(10)
-            }),
-            ConservationClass::PartialClean
-        );
-        assert_eq!(
-            classify(VcomCounters {
-                valid: Some(VALID_RX_LEDGER),
-                grade: Some(EXACT_LEDGER & !(0b11 << 6) | (GRADE_LOWER_BOUND << 6)),
-                units: Some(0),
-                ..ledger(10)
-            }),
-            ConservationClass::PartialClean
-        );
-        assert_eq!(classify(ledger(10)), ConservationClass::PartialClean);
-        assert_eq!(
-            classify(VcomCounters {
-                cdc_in: 9,
-                host_dropped: 1,
-                ..ledger(10)
-            }),
-            ConservationClass::ObservedLoss
-        );
-        assert_eq!(
-            classify(VcomCounters {
-                cdc_in: 9,
-                valid: Some(VALID_IDENTITY),
-                ..ledger(10)
-            }),
-            ConservationClass::IdentityFailed
-        );
-        assert_eq!(
-            classify(VcomCounters {
-                cdc_in: 9,
-                ..ledger(10)
-            }),
-            ConservationClass::PartialClean
-        );
-        // A recovered DMA fault outranks everything else the bracket seems to say.
-        assert_eq!(
-            classify(VcomCounters {
-                rx_dma_err: 1,
-                valid: Some(VALID_RX_LEDGER | VALID_RX_DMA_ERR),
-                grade: Some(EXACT_LEDGER),
-                units: Some(0),
-                ..ledger(10)
-            }),
-            ConservationClass::DmaFaulted
-        );
-        // An unsourced DMA-error slot cannot fault a bracket.
-        assert_eq!(
-            classify(VcomCounters {
-                rx_dma_err: 3,
-                valid: Some(VALID_RX_LEDGER),
-                ..ledger(10)
-            }),
-            ConservationClass::PartialClean
-        );
-    }
-
-    #[test]
-    fn a_lower_bound_counter_renders_as_a_bound_and_an_unsourced_one_says_so() {
-        let c = VcomCounters {
-            valid: Some(VALID_RX_LEDGER),
-            grade: Some(
-                (GRADE_LOWER_BOUND << (2 * SLOT_RING_FULL)) | (GRADE_EXACT << (2 * SLOT_OVERRUN)),
-            ),
-            units: Some(1 << SLOT_OVERRUN),
-            ..VcomCounters::default()
-        };
-        assert_eq!(render_counter(&c, 7, SLOT_RING_FULL), ">=7");
-        assert_eq!(render_counter(&c, 3, SLOT_OVERRUN), "3 episodes");
-        // Outside the coverage word the slot reads zero by contract, which is not a measurement.
-        assert_eq!(render_counter(&c, 0, SLOT_UART_TX), "unsourced");
     }
 
     #[test]
@@ -1705,8 +1356,6 @@ mod tests {
         assert!(!run.verdict().pass);
     }
 
-    // --- closing a run the host ended, rather than dropping it ---
-
     /// A run the host closed short of its budget: each transmitter emitted `frac` of it.
     fn closed_run(plan: Plan, frac: f64) -> Run {
         let out = (f64::from(plan.budget_h2d()) * frac) as u32;
@@ -1716,7 +1365,6 @@ mod tests {
             payload: u64::from(out),
             frames: out / plan.interval + 1,
             credit: 0,
-            complete: true,
         };
         let rx = clean_rx(u64::from(back), back / plan.interval + 1);
         let took = (plan.secs * frac * 1e6) as u32;
@@ -1796,8 +1444,7 @@ mod tests {
 
     #[test]
     fn a_budget_delivered_inside_the_drain_margin_is_not_a_line_rate() {
-        // A budget that arrives a second late must not be scored as line rate just because the
-        // window was short.
+        // A late budget is not line rate just because the window was short.
         let p = plan(Shape::Duplex, 10.0);
         let mut run = clean_run(p);
         for leg in &mut run.legs {
@@ -1831,15 +1478,12 @@ mod tests {
             .any(|r| r.contains("abandoned at checkpoint 2 (7.0s)")));
     }
 
-    // --- checkpoints: reads of the running ledger, and the shapes they make ---
-
     /// A host transmit ledger after `payload` bytes.
     fn tx_at(payload: u64) -> TxCounters {
         TxCounters {
             payload,
             frames: 0,
             credit: 0,
-            complete: false,
         }
     }
 
@@ -1851,8 +1495,7 @@ mod tests {
         }
     }
 
-    /// Drive a sampler over `secs` seconds, with both directions delivering the per-second fraction
-    /// `rate` gives.
+    /// Drive a sampler over `secs` seconds, both directions delivering the fraction `rate(t)`.
     fn sweep(
         plan: &Plan,
         secs: f64,
@@ -1979,8 +1622,7 @@ mod tests {
 
     #[test]
     fn a_steady_slight_shortfall_runs_the_whole_window_and_is_reported_as_one() {
-        // A fixed per-packet cost is not a defect to cut a window short for, though it still fails
-        // the rung.
+        // A fixed per-packet cost fails the rung but does not cut the window short.
         let p = plan(Shape::Duplex, 60.0);
         let (series, abandon) = sweep(&p, 60.0, |_| 0.976, |_| 0);
         assert!(abandon.is_none());
@@ -2017,10 +1659,7 @@ mod tests {
         assert_eq!(classify(&[0.5, 0.95, 0.6, 0.93]), Trend::Mixed);
     }
 
-    // --- the engines, through an in-process pipe ---
-
-    /// Run `plan`'s host transmitter into a verifier of the same stream, dropping the byte at
-    /// `drop` if given.
+    /// Run `plan`'s host transmitter into a verifier, dropping the byte at `drop`.
     fn pipe(plan: &Plan, drop: Option<usize>) -> (TxCounters, RxCounters) {
         let mut encoder = plan.host_encoder().expect("a transmitting shape");
         let mut verifier = v1::Verifier::new(

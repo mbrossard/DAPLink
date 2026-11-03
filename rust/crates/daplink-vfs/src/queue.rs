@@ -27,13 +27,11 @@ pub enum MscOp {
     },
     /// Write the carried sector.
     Write(Sector),
-    /// The transport entered (`true`) or left (`false`) a host command's data phase. In-band, so
-    /// the worker sees it in order with the sectors it brackets; no epoch, it is not the volume.
+    /// Data phase entered or left; in-band, so ordered with the sectors it brackets.
     DataPhase(bool),
 }
 
-/// A single-producer / single-consumer queue of pending sector operations. `DEPTH` is the backing
-/// buffer size; the usable capacity is `DEPTH - 1` operations.
+/// An SPSC queue of sector operations; usable capacity is `DEPTH - 1`.
 pub struct OpQueue<const DEPTH: usize = 4> {
     inner: Queue<MscOp, DEPTH>,
 }
@@ -62,8 +60,7 @@ impl<const DEPTH: usize> Default for OpQueue<DEPTH> {
     }
 }
 
-/// Whether the operation queue can still accept work. [`Backpressure::YieldToWorker`] is an
-/// obligation: a USB service outranking the worker must yield, or nothing can free a slot.
+/// Whether the queue accepts work; [`Backpressure::YieldToWorker`] obliges the caller to yield.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[must_use = "a full operation queue obliges a USB service that outranks its sector worker to \
               yield to it; ignoring this livelocks the mass-storage path on the first host write"]
@@ -80,8 +77,7 @@ pub struct OpProducer<'a, const DEPTH: usize> {
 }
 
 impl<const DEPTH: usize> OpProducer<'_, DEPTH> {
-    /// Enqueue `op`; a full queue hands it back as `Err`, which the caller treats as
-    /// backpressure and retries on the next poll.
+    /// Enqueue `op`; a full queue hands it back as `Err` for a retry on the next poll.
     // Handed back by value: there is no heap in firmware to box it into.
     #[allow(clippy::result_large_err)]
     pub fn try_push(&mut self, op: MscOp) -> Result<(), MscOp> {
@@ -120,8 +116,7 @@ impl<const DEPTH: usize> OpConsumer<'_, DEPTH> {
     }
 }
 
-/// A one-slot mailbox for a read reply. [`take`](ReplySlot::take) matches LBA and media epoch,
-/// so a reply left over from a previous mount is discarded once a remount bumps the epoch.
+/// A one-slot read mailbox; mismatched LBA/epoch replies stay stored but are not delivered.
 pub struct ReplySlot {
     inner: Mutex<RefCell<Option<Sector>>>,
 }
@@ -141,8 +136,7 @@ impl ReplySlot {
         });
     }
 
-    /// Take the stored reply if it matches both `lba` and `epoch`, clearing the slot; a mismatch
-    /// leaves it untouched.
+    /// Take the stored reply if it matches `lba` and `epoch`, clearing the slot.
     pub fn take(&self, lba: u32, epoch: u32) -> Option<[u8; 512]> {
         critical_section::with(|cs| {
             let slot = self.inner.borrow(cs);

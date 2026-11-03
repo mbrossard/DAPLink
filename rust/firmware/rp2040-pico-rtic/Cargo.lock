@@ -143,8 +143,10 @@ name = "daplink-rp-hal"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "critical-section",
  "daplink-rs",
  "daplink-usb-device",
+ "defmt 1.1.1",
  "pl011-baud",
  "portable-atomic",
  "rp2040-flash",
@@ -188,8 +190,10 @@ dependencies = [
 name = "daplink-usb-device"
 version = "0.1.0"
 dependencies = [
+ "daplink-core",
  "daplink-rs",
  "daplink-vfs",
+ "defmt 1.1.1",
  "usb-device",
 ]
 
@@ -200,6 +204,7 @@ dependencies = [
  "critical-section",
  "daplink-core",
  "daplink-decoder",
+ "defmt 1.1.1",
  "heapless",
  "portable-atomic",
  "static_cell",

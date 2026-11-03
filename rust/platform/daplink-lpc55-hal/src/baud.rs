@@ -3,37 +3,30 @@
 /// VCOM (Flexcomm0) function clock: the Flexcomm source clock whole, at the 48 MHz FRG ceiling.
 pub(crate) const VCOM_CLOCK_HZ: u32 = crate::clocks::FLEXCOMM_SRC_HZ;
 
-/// VCOM OSR floor. 9, above the hardware minimum of 5: NXP's own USART driver searches 16 down
-/// to 9 and goes lower only when a rate is otherwise unreachable, since a smaller oversample
-/// places the sample point less accurately within the bit. The rungs it withholds start at
-/// 48 MHz / 8 = 6 MBd, past the ceiling of every target this bridge has been paired with.
+/// VCOM oversample floor; independent of the receive-only SWO policy.
 pub(crate) const VCOM_OSR_MIN: u32 = 9;
 
-/// SWO OSR floor: the hardware minimum (OSRVAL 0x4 = 5 clocks per bit), usable on the RX-only
-/// capture path.
+/// SWO oversample floor: the hardware minimum of five clocks per bit.
 pub(crate) const SWO_OSR_MIN: u32 = 5;
 
-/// Baud an `(osr, brg)` pair yields off `fclk_hz`, rounded to nearest: the realized-rate reply
-/// describes the wire, not the divide that reached it. Both must be nonzero.
+/// Rounded baud for a valid, nonzero `(osr, brg)` pair.
 pub(crate) const fn realized(fclk_hz: u32, osr: u32, brg: u32) -> u32 {
     let divisor = osr * brg;
     (fclk_hz + divisor / 2) / divisor
 }
 
-/// Best 1-based `(osr, brg)` pair for `baud` (`baud = fclk / (osr * brg)`, OSR `osr_min..=16`,
-/// 16-bit BRG), preferring larger OSR on ties; `None` when `baud` is 0 or no in-range BRG exists.
+/// Best 1-based divisors, preferring larger OSR on ties; `None` for invalid or unattainable input.
 pub(crate) const fn flexcomm_osr_brg(fclk_hz: u32, baud: u32, osr_min: u32) -> Option<(u32, u32)> {
-    if baud == 0 {
+    if baud == 0 || osr_min < 5 || osr_min > 16 {
         return None;
     }
     let mut best_diff = u32::MAX;
     let mut best = None;
     let mut osr = 16u32;
     while osr >= osr_min {
-        let brg = fclk_hz / (osr * baud);
+        let brg = fclk_hz / osr / baud;
         if brg != 0 && brg < 0xffff {
-            // Truncating on purpose: this is the selection metric, and it chose the pairs the
-            // fleet is measured on.
+            // Selection uses truncated baud, not the rounded rate reported to the host.
             let diff = baud.abs_diff(fclk_hz / (osr * brg));
             if diff < best_diff {
                 best_diff = diff;
@@ -45,8 +38,7 @@ pub(crate) const fn flexcomm_osr_brg(fclk_hz: u32, baud: u32, osr_min: u32) -> O
     best
 }
 
-/// The rates the bench walks, pinned per build: [`VCOM_CLOCK_HZ`] comes off FRO_HF and not the
-/// core clock, so the 96 MHz and 150 MHz profiles must derive the same divisors.
+// Flexcomm divisors must stay independent of the core profile.
 const _: () = {
     const fn vcom(baud: u32) -> (u32, u32, u32) {
         match flexcomm_osr_brg(VCOM_CLOCK_HZ, baud, VCOM_OSR_MIN) {
@@ -71,3 +63,75 @@ const _: () = {
     ));
     assert!(flexcomm_osr_brg(VCOM_CLOCK_HZ, 0, VCOM_OSR_MIN).is_none());
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference(clock: u32, baud: u32, floor: u32) -> Option<(u32, u32)> {
+        if baud == 0 || !(5..=16).contains(&floor) {
+            return None;
+        }
+        (floor..=16)
+            .rev()
+            .filter_map(|osr| {
+                let brg = u64::from(clock) / (u64::from(osr) * u64::from(baud));
+                (1..0xffff).contains(&brg).then(|| {
+                    let rate = u64::from(clock) / (u64::from(osr) * brg);
+                    (u64::from(baud).abs_diff(rate), osr, brg as u32)
+                })
+            })
+            .min_by_key(|&(error, osr, _)| (error, 16 - osr))
+            .map(|(_, osr, brg)| (osr, brg))
+    }
+
+    #[test]
+    fn all_host_baud_boundaries_match_widened_reference() {
+        for clock in [0, 12_000_000, VCOM_CLOCK_HZ, u32::MAX] {
+            for floor in [0, 4, 5, 9, 16, 17, u32::MAX] {
+                for baud in [
+                    0,
+                    1,
+                    45,
+                    46,
+                    47,
+                    9600,
+                    115_200,
+                    921_600,
+                    3_000_000,
+                    5_250_000,
+                    6_000_000,
+                    0x0fff_fffe,
+                    0x0fff_ffff,
+                    0x1000_0000,
+                    0x1000_0001,
+                    u32::MAX,
+                ] {
+                    assert_eq!(
+                        flexcomm_osr_brg(clock, baud, floor),
+                        reference(clock, baud, floor),
+                        "clock={clock} baud={baud} floor={floor}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn divisor_edges_and_ties_preserve_selection() {
+        for floor in [SWO_OSR_MIN, VCOM_OSR_MIN] {
+            for osr in floor..=16 {
+                for brg in [1, 2, 13, 500, 0xfffe, 0xffff] {
+                    let baud = VCOM_CLOCK_HZ / (osr * brg);
+                    for requested in baud.saturating_sub(1)..=baud + 1 {
+                        assert_eq!(
+                            flexcomm_osr_brg(VCOM_CLOCK_HZ, requested, floor),
+                            reference(VCOM_CLOCK_HZ, requested, floor)
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(flexcomm_osr_brg(VCOM_CLOCK_HZ, 3_000_000, 9), Some((16, 1)));
+    }
+}

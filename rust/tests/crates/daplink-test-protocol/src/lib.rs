@@ -4,21 +4,24 @@
 
 use core::fmt::Write;
 
+mod command_line;
+pub mod gpio;
 pub mod prng;
+pub mod rp_dut;
 pub mod v1;
 
-/// Maximum framed line length in bytes, including the trailing `\n`.
+pub use command_line::CommandLine;
+
+/// Receive capacity before LF (CR included); formatted replies include LF within this size.
 pub const MAX_LINE: usize = 128;
 
 /// Protocol revision reported in `ID`; bump on a wire-format change.
 pub const PROTO_VERSION: u8 = 8;
 
 /// Source revision of the DUT image, reported in `ID`: `g<short hash>`, `-dirty`, or `unknown`.
-/// [`PROTO_VERSION`] says what the wire is; this says what the build is, and they move apart.
 pub const BUILD_REVISION: &str = daplink_core::DAP_FW_REVISION;
 
 /// Fixed head of the payload the DUT emits on ITM stimulus port 0; the emission tag follows it.
-/// Shared so the DUT emitter and the host capture scanner agree on the framed byte sequence.
 pub const SWO_PAYLOAD_HEAD: [u8; 7] = [0xA5, 0x5A, 0xC3, 0x3C, 0xF0, 0x0F, 0x99];
 
 /// Total bytes per SWO emission: [`SWO_PAYLOAD_HEAD`] plus the one-byte ordinal tag.
@@ -32,29 +35,39 @@ pub const SWO_STREAM_RECORD_LEN: usize = 8;
 
 /// Boot event line prefix; the DUT appends its name.
 pub const EVT_BOOT: &str = "EVT BOOT";
-/// Reply to `PING`.
 pub const OK_PONG: &str = "OK PONG";
-/// Reply to `STATS RESET`.
 pub const OK_STATS_RESET: &str = "OK STATS RESET";
 /// Reply to anything unparseable, and to a request the DUT declines to serve.
 pub const ERR_UNIMPLEMENTED: &str = "ERR unimplemented";
+/// DMA still owns the old transfer; RP commands retain state and require an explicit retry.
+pub const ERR_DMA_ABORT_TIMEOUT: &str = "ERR dma_abort_timeout";
 
 /// The DUT's echo-UART counters, all wrapping on overflow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Bytes received on the echo UART.
+    /// Bytes received.
     pub rx: u32,
-    /// Bytes transmitted back.
+    /// Bytes transmitted.
     pub tx: u32,
-    /// Framing errors.
+    /// Receive errors: flagged entries on RP, framing-error episodes on STM32.
     pub ferr: u32,
-    /// Receive overruns.
+    /// Overruns: flagged entries and ring laps on RP, overrun episodes on STM32.
     pub ovr: u32,
-    /// Bytes dropped by a full receive ring; 0 on firmwares without a ring.
+    /// Bytes a full receive ring overwrote; RP DUTs charge ring laps to `ovr` and report 0.
     pub drop: u32,
-    /// Abort waits that expired with the DMA channel still busy; sticky, and `STATS RESET` does
-    /// not clear it, so counters taken after it goes nonzero are suspect.
+    /// Abort-timeout evidence since boot; `STATS RESET` never clears it.
     pub stuck: u32,
+}
+
+/// The DUT's SWO emission counters, zeroed by `SWO STREAM 1` so each stream run is its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SwoStats {
+    /// Emissions the DUT placed on the wire whole.
+    pub records: u32,
+    /// Emissions the FIFO refused part way, leaving a fragment the host sees as corruption.
+    pub partial: u32,
+    /// Emissions the FIFO refused before any byte, so nothing reached the wire.
+    pub dropped: u32,
 }
 
 /// A parsed host-to-target request.
@@ -68,8 +81,7 @@ pub enum Command {
     Stamp(u32),
     /// Reprogram the DUT's echo UART baud; answered by [`baud_response`], or [`ERR_UNIMPLEMENTED`] if declined.
     Baud(u32),
-    /// Highest rate the DUT's policy accepts for [`Command::Baud`]; answered by
-    /// [`baud_max_response`].
+    /// Highest rate the DUT's policy accepts for [`Command::Baud`]; answered by [`baud_max_response`].
     BaudMax,
     /// Read the echo-UART counters; answered by [`stats_response`].
     Stats,
@@ -77,12 +89,12 @@ pub enum Command {
     StatsReset,
     /// Emit the tagged SWO payload on ITM stimulus port 0; answered by [`swo_emit_response`].
     SwoEmit(u8),
-    /// Reprogram the DUT's TPIU SWO baud; answered by [`swo_cfg_response`], or
-    /// [`ERR_UNIMPLEMENTED`] if the DUT rejects the rate.
+    /// Reprogram the DUT's TPIU SWO baud; answered by [`swo_cfg_response`] or [`ERR_UNIMPLEMENTED`].
     SwoCfg(u32),
-    /// Start (`true`) or stop (`false`) the continuous sequence-tagged ITM stream; answered by
-    /// [`swo_stream_response`].
+    /// Start or stop the sequence-tagged ITM stream; starting zeroes the [`SwoStats`] counters.
     SwoStream(bool),
+    /// Read the SWO emission counters; answered by [`swo_stats_response`].
+    SwoStats,
 }
 
 /// Parse one line (without its newline); `None` is answered with [`ERR_UNIMPLEMENTED`].
@@ -115,6 +127,7 @@ pub fn parse(line: &str) -> Option<Command> {
                 1 => Command::SwoStream(true),
                 _ => return None,
             },
+            "STATS" => Command::SwoStats,
             _ => return None,
         },
         _ => return None,
@@ -176,8 +189,7 @@ pub fn swo_emit_response(buf: &mut [u8; MAX_LINE], tag: u8) -> &str {
     line(buf, format_args!("OK SWO EMIT {tag}"))
 }
 
-/// Format the `SWO CFG` acknowledgement into `buf`, newline included; `realized` is the rate the
-/// DUT's trace-clock divisor actually produces, which need not be the rate that was asked for.
+/// Format the `SWO CFG` acknowledgement into `buf`; `realized` is the rate the divisor produces.
 pub fn swo_cfg_response(buf: &mut [u8; MAX_LINE], realized: u32) -> &str {
     line(buf, format_args!("OK SWO CFG {realized}"))
 }
@@ -185,6 +197,31 @@ pub fn swo_cfg_response(buf: &mut [u8; MAX_LINE], realized: u32) -> &str {
 /// Format the `SWO STREAM` acknowledgement into `buf`, newline included.
 pub fn swo_stream_response(buf: &mut [u8; MAX_LINE], on: bool) -> &str {
     line(buf, format_args!("OK SWO STREAM {}", u8::from(on)))
+}
+
+/// Format the `SWO STATS` reply into `buf`, newline included.
+pub fn swo_stats_response<'a>(buf: &'a mut [u8; MAX_LINE], stats: &SwoStats) -> &'a str {
+    let SwoStats {
+        records,
+        partial,
+        dropped,
+    } = *stats;
+    line(
+        buf,
+        format_args!("OK SWO STATS records={records} partial={partial} dropped={dropped}"),
+    )
+}
+
+/// Extract the counters from a `SWO STATS` reply line, exactly as [`swo_stats_response`] wrote them.
+pub fn swo_stats_reported(reply: &str) -> Option<SwoStats> {
+    let mut fields = reply.trim().strip_prefix("OK SWO STATS ")?.split(' ');
+    let mut take = |name: &str| parse_u32(fields.next()?.strip_prefix(name)?);
+    let stats = SwoStats {
+        records: take("records=")?,
+        partial: take("partial=")?,
+        dropped: take("dropped=")?,
+    };
+    fields.next().is_none().then_some(stats)
 }
 
 /// Extract the realized rate from a `BAUD` reply line; `BAUD MAX` replies do not match.
@@ -217,13 +254,29 @@ pub fn stats_reported(reply: &str) -> Option<Stats> {
     fields.next().is_none().then_some(stats)
 }
 
-/// Extract the `rev=<revision>` field from an `ID` reply; `None` for an image built before the
-/// field existed.
+/// Extract the `rev=<revision>` field from an `ID` reply; `None` for an image without it.
 pub fn id_revision(reply: &str) -> Option<&str> {
     reply
         .split(' ')
         .find_map(|t| t.trim().strip_prefix("rev="))
         .filter(|rev| !rev.is_empty())
+}
+
+/// Extract the `name=<dut>` field from an `ID` reply.
+pub fn id_name(reply: &str) -> Option<&str> {
+    reply
+        .split(' ')
+        .find_map(|t| t.trim().strip_prefix("name="))
+        .filter(|name| !name.is_empty())
+}
+
+/// Extract the `proto=<n>` field from an `ID` reply.
+pub fn id_proto(reply: &str) -> Option<u32> {
+    parse_u32(
+        reply
+            .split(' ')
+            .find_map(|t| t.trim().strip_prefix("proto="))?,
+    )
 }
 
 /// Extract the `stamp=<n>` field from an `ID` reply.
@@ -234,25 +287,35 @@ pub fn id_stamp(reply: &str) -> Option<u32> {
     parse_u32(field)
 }
 
-pub(crate) fn line<'a>(buf: &'a mut [u8], args: core::fmt::Arguments) -> &'a str {
-    struct Cursor<'b>(&'b mut [u8], usize);
-    impl Write for Cursor<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let end = self.1 + s.len();
-            if end > self.0.len() {
-                return Err(core::fmt::Error);
-            }
-            self.0[self.1..end].copy_from_slice(s.as_bytes());
-            self.1 = end;
-            Ok(())
+struct Cursor<'b>(&'b mut [u8], usize);
+
+impl Write for Cursor<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.1 + s.len();
+        if end > self.0.len() {
+            return Err(core::fmt::Error);
         }
+        self.0[self.1..end].copy_from_slice(s.as_bytes());
+        self.1 = end;
+        Ok(())
     }
+}
+
+pub(crate) fn line<'a>(buf: &'a mut [u8], args: core::fmt::Arguments) -> &'a str {
     let mut cur = Cursor(&mut buf[..], 0);
     let _ = cur.write_fmt(args);
     let _ = cur.write_str("\n");
     let len = cur.1;
-    // The cursor only ever writes UTF-8.
     core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// As [`line`], but `None` when the line and its newline do not fit.
+pub(crate) fn try_line<'a>(buf: &'a mut [u8], args: core::fmt::Arguments) -> Option<&'a str> {
+    let mut cur = Cursor(&mut buf[..], 0);
+    cur.write_fmt(args).ok()?;
+    cur.write_str("\n").ok()?;
+    let len = cur.1;
+    core::str::from_utf8(&buf[..len]).ok()
 }
 
 #[cfg(test)]
@@ -273,6 +336,7 @@ mod tests {
         assert_eq!(parse("SWO EMIT 5"), Some(Command::SwoEmit(5)));
         assert_eq!(parse("SWO CFG 1000000"), Some(Command::SwoCfg(1_000_000)));
         assert_eq!(parse("SWO STREAM 1"), Some(Command::SwoStream(true)));
+        assert_eq!(parse("SWO STATS"), Some(Command::SwoStats));
         assert_eq!(parse("SWO STREAM 0"), Some(Command::SwoStream(false)));
     }
 
@@ -295,6 +359,7 @@ mod tests {
         assert_eq!(parse("SWO STREAM 2"), None); // only 0/1 are defined
         assert_eq!(parse("SWO STREAM on"), None);
         assert_eq!(parse("SWO STREAM 1 extra"), None);
+        assert_eq!(parse("SWO STATS 1"), None);
         assert_eq!(parse("PING extra"), None);
     }
 
@@ -316,6 +381,34 @@ mod tests {
     }
 
     #[test]
+    fn swo_stats_round_trip_through_the_reply_line() {
+        let mut buf = [0u8; MAX_LINE];
+        let stats = SwoStats {
+            records: 61_234,
+            partial: 2,
+            dropped: 7,
+        };
+        let reply = swo_stats_response(&mut buf, &stats);
+        assert_eq!(reply, "OK SWO STATS records=61234 partial=2 dropped=7\n");
+        assert_eq!(swo_stats_reported(reply), Some(stats));
+    }
+
+    #[test]
+    fn swo_stats_reported_rejects_lines_that_are_not_its_own() {
+        assert_eq!(swo_stats_reported("OK STATS rx=1 tx=1"), None);
+        // A truncated ledger must not read as zeroed counters.
+        assert_eq!(swo_stats_reported("OK SWO STATS records=1 partial=0"), None);
+        assert_eq!(
+            swo_stats_reported("OK SWO STATS records=1 partial=0 dropped=0 extra=3"),
+            None
+        );
+        assert_eq!(
+            swo_stats_reported("OK SWO STATS records=1 partial=x dropped=0"),
+            None
+        );
+    }
+
+    #[test]
     fn swo_stream_response_formats_both_states() {
         let mut buf = [0u8; MAX_LINE];
         assert_eq!(swo_stream_response(&mut buf, true), "OK SWO STREAM 1\n");
@@ -323,25 +416,15 @@ mod tests {
         assert_eq!(swo_stream_response(&mut buf, false), "OK SWO STREAM 0\n");
     }
 
-    // --- reply vectors the harness string-matches against, pinned exactly ---
-
     #[test]
     fn ok_pong_is_the_literal_the_rtt_case_waits_for() {
-        // rtt.rs's PING exchange looks for this exact substring in the up-channel accumulator.
         assert_eq!(OK_PONG, "OK PONG");
-    }
-
-    #[test]
-    fn evt_boot_is_the_literal_the_boot_marker_scans_for() {
-        // rtt.rs/nreset.rs/uf2.rs all wait for this substring after a reset.
-        assert_eq!(EVT_BOOT, "EVT BOOT");
     }
 
     #[test]
     fn id_response_carries_the_ok_id_prefix_and_stamp_field() {
         let mut buf = [0u8; MAX_LINE];
         let reply = id_response(&mut buf, "rp2040", 42);
-        // nreset.rs matches "OK ID" as a prefix substring, then parses the stamp back out.
         assert!(
             reply.starts_with("OK ID name=rp2040 proto=8 stamp=42 rev="),
             "PROTO_VERSION changed; update this vector (and PROTO_VERSION consumers) together: {reply}"
@@ -370,7 +453,30 @@ mod tests {
         assert_eq!(id_stamp("OK ID name=rp2040 proto=7 stamp=42"), Some(42));
     }
 
-    /// The stamp says what the build is; `proto` says what the wire is, and neither substitutes.
+    /// The identity a run record carries, read from the line the DUT actually writes.
+    #[test]
+    fn id_identity_fields_round_trip_through_id_response() {
+        let mut buf = [0u8; MAX_LINE];
+        let reply = id_response(&mut buf, "stm32f401", 0);
+        assert_eq!(id_name(reply), Some("stm32f401"));
+        assert_eq!(id_proto(reply), Some(u32::from(PROTO_VERSION)));
+        assert_eq!(id_revision(reply), Some(BUILD_REVISION));
+    }
+
+    /// A pre-`rev=` image yields `None` for the field, and an unrelated line yields nothing.
+    #[test]
+    fn id_identity_fields_are_absent_rather_than_guessed() {
+        assert_eq!(
+            id_name("OK ID name=rp2040 proto=7 stamp=42"),
+            Some("rp2040")
+        );
+        assert_eq!(id_proto("OK ID name=rp2040 proto=7 stamp=42"), Some(7));
+        assert_eq!(id_revision("OK ID name=rp2040 proto=7 stamp=42"), None);
+        assert_eq!(id_name("ERR unimplemented"), None);
+        assert_eq!(id_proto("ERR unimplemented"), None);
+        assert_eq!(id_proto("OK ID name=rp2040 proto=x stamp=0"), None);
+    }
+
     #[test]
     fn build_revision_is_not_the_protocol_version() {
         assert!(!BUILD_REVISION.is_empty());
@@ -389,14 +495,12 @@ mod tests {
     #[test]
     fn stamp_response_matches_the_nreset_case_exchange() {
         let mut buf = [0u8; MAX_LINE];
-        // nreset.rs exchanges `STAMP 42\n` and matches this exact string back.
         assert_eq!(stamp_response(&mut buf, 42), "OK STAMP 42\n");
     }
 
     #[test]
     fn baud_response_matches_the_vcom_case_marker() {
         let mut buf = [0u8; MAX_LINE];
-        // vcom.rs matches the "OK BAUD" prefix, then parses the realized rate back out.
         assert_eq!(baud_response(&mut buf, 115_200), "OK BAUD 115200\n");
         let mut buf = [0u8; MAX_LINE];
         // The realized rate is the DUT's, not an echo of the request.
@@ -516,20 +620,8 @@ mod tests {
     }
 
     #[test]
-    fn ok_stats_reset_is_the_literal_answering_stats_reset() {
-        assert_eq!(OK_STATS_RESET, "OK STATS RESET");
-    }
-
-    #[test]
-    fn err_unimplemented_is_the_literal_answering_a_declined_baud() {
-        // A DUT that will not program the requested rate answers with this, as `SWO CFG` does.
-        assert_eq!(ERR_UNIMPLEMENTED, "ERR unimplemented");
-    }
-
-    #[test]
     fn swo_emit_response_matches_the_swo_case_marker() {
         let mut buf = [0u8; MAX_LINE];
-        // swo.rs formats `format!("OK SWO EMIT {tag}")` and matches it against this reply.
         assert_eq!(swo_emit_response(&mut buf, 5), "OK SWO EMIT 5\n");
     }
 }

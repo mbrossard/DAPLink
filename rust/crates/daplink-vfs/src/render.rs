@@ -1,5 +1,4 @@
-//! A `core::fmt`-free status renderer appending into a caller-owned buffer, truncating at its
-//! capacity so a renderer can never panic or overflow.
+//! A `core::fmt`-free status renderer that truncates at capacity rather than panic.
 
 /// Appends bytes and small integer renderings into a fixed byte buffer, truncating at capacity.
 pub struct StatusWriter<'b> {

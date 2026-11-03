@@ -1,0 +1,74 @@
+//! Target description for the Nordic nRF52833 (512 KiB internal NVMC flash, 128 KiB RAM).
+
+use daplink_flash::identity::IdentityProbe;
+use daplink_flash::reset_sequence::ResetSequence;
+use daplink_flash::target::ResetType;
+
+use crate::algorithms::nrf52::NRF52_ALGO;
+use crate::families::nrf52::{info_part_probe, CODEPAGESIZE_PROBE, NRF52_RESET_SEQUENCE};
+use crate::{FlashRegion, RamRegion, SectorInfo, Target};
+
+/// `FICR.INFO.PART` on every nRF52833.
+pub const NRF52833_INFO_PART: u32 = 0x0005_2833;
+
+/// Official Microsoft UF2 family id for the nRF52833 (`uf2families.json`, "Nordic NRF52833").
+pub const NRF52833_UF2_FAMILY: u32 = 0x621E_937A;
+
+/// Identity: an exact `FICR.INFO.PART` match, then the 4 KiB `FICR.CODEPAGESIZE`.
+pub static IDENTITY_PROBES: [IdentityProbe; 2] =
+    [info_part_probe(NRF52833_INFO_PART), CODEPAGESIZE_PROBE];
+
+/// Flash (programmable) regions of the device: 512 KiB of code flash at `0x0`.
+pub static FLASH_REGIONS: [FlashRegion<'static>; 1] = [FlashRegion {
+    start: 0x0000_0000,
+    end: 0x0008_0000,
+    is_default: true,
+    algo: &NRF52_ALGO,
+}];
+
+/// RAM regions of the device (128 KiB Data RAM from the SRAM base).
+pub static RAM_REGIONS: [RamRegion; 1] = [RamRegion {
+    start: 0x2000_0000,
+    end: 0x2002_0000,
+}];
+
+/// Sector layout: uniform 4 KiB pages.
+pub static SECTORS: [SectorInfo; 1] = [SectorInfo {
+    start: 0x0000_0000,
+    size: 0x0000_1000,
+    count: 128,
+}];
+
+/// Page-staging scratch size: the algorithm's program buffer, one 4 KiB page.
+pub const PROGRAM_BUFFER_SIZE: usize = NRF52_ALGO.program_buffer_size as usize;
+
+/// The target description type for this device.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NRF52833;
+
+impl Target for NRF52833 {
+    fn name(&self) -> &'static str {
+        "nRF52833"
+    }
+    fn flash_regions(&self) -> &[FlashRegion<'_>] {
+        &FLASH_REGIONS
+    }
+    fn ram_regions(&self) -> &[RamRegion] {
+        &RAM_REGIONS
+    }
+    fn sectors(&self) -> &[SectorInfo] {
+        &SECTORS
+    }
+    fn reset_type(&self) -> ResetType {
+        ResetType::SoftwareSysReset
+    }
+    fn reset_sequence(&self) -> &dyn ResetSequence {
+        &NRF52_RESET_SEQUENCE
+    }
+    fn identity_probes(&self) -> &[IdentityProbe] {
+        &IDENTITY_PROBES
+    }
+    fn uf2_family(&self) -> Option<u32> {
+        Some(NRF52833_UF2_FAMILY)
+    }
+}

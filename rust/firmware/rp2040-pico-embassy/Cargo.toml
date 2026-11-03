@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Own workspace: this firmware pins its own embedded target and HAL feature graph.
 [workspace]
 
 [dependencies]
@@ -12,14 +11,11 @@ embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "execu
 embassy-rp = { version = "0.10.0", features = ["unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
 embassy-usb = "0.6.0"
 embassy-futures = "0.1"
-# The pipelined DAP loop's two edge-triggered signals between its reader and executor futures.
-embassy-sync = "0.8"
 embedded-io-async = "0.7"
-# The carrier-bank heartbeat's periodic tick; only spawned under `carrier-leds`.
 embassy-time = { version = "0.5", optional = true }
 
 daplink-rs = { path = "../../crates/daplink-rs" }
-daplink-rp-embassy = { path = "../../platform/daplink-rp-embassy" }
+daplink-rp-embassy = { path = "../../platform/daplink-rp-embassy", features = ["rp2040"] }
 daplink-embassy-usb = { path = "../../platform/daplink-embassy-usb" }
 daplink-rp-pio = { path = "../../platform/daplink-rp-pio", features = ["rp2040"], optional = true }
 daplink-vfs = { path = "../../crates/daplink-vfs", optional = true }
@@ -32,20 +28,17 @@ panic-halt = "0.2"
 # thumbv6m has no atomic CAS; portable-atomic routes through critical-section (from embassy-rp).
 portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
 
-# Optional defmt-RTT bring-up logging, off by default.
 defmt = { version = "1", optional = true }
 defmt-rtt = { version = "1", optional = true }
 panic-probe = { version = "1", optional = true, features = ["print-defmt"] }
 
-# `accel` drives SWD from PIO and fuses JTAG words. `bitbang` selects the CPU engine and wins
-# when both features are enabled, so it can override the accelerated default.
 [features]
-default = ["accel", "guard"]
-accel = ["dep:daplink-rp-pio", "daplink-rs/rp2040-jtag-accel"]
-bitbang = []
-overclock-200mhz = ["daplink-rp-embassy/clock-200mhz", "daplink-rp-pio?/clock-200mhz"]
-# RTT-backed defmt logging, captured by a probe attached over SWD; host-side only (no image
-# growth beyond the `.defmt` string table, which the linker keeps out of the loadable image).
+default = ["accel"]
+# Generic PIO0 for sequences and fallbacks, shared PIO1 for complete SWD/JTAG transfers.
+accel = ["dep:daplink-rp-pio"]
+overclock-200mhz = []
+# A 512-byte DAP packet spanning several 64-byte bulk packets.
+dap-packet-512 = ["daplink-embassy-usb/multi-packet"]
 defmt = [
     "dep:defmt",
     "dep:defmt-rtt",
@@ -53,17 +46,16 @@ defmt = [
     "embassy-executor/defmt",
     "embassy-rp/defmt",
     "daplink-rs/defmt",
+    "daplink-vfs?/defmt",
 ]
-# `flash` adds the drag-n-drop mass-storage drive and the vendor flash commands over the
-# flash-wins mux; it is the target-less spine, so a `flash-<chip>` row must select the target.
-flash = ["dep:daplink-vfs", "dep:daplink-targets", "daplink-embassy-usb/flash"]
+# Target-less drag-n-drop spine; a `flash-<chip>` row selects the target.
+flash = ["dep:daplink-vfs", "dep:daplink-targets",]
 flash-rp2040 = ["flash", "daplink-targets/rp2040"]
 flash-stm32f401 = ["flash", "daplink-targets/stm32f401ce"]
-# `guard` bounds-checks each report against the engine's consumption before dispatch.
-guard = ["daplink-rs/guard"]
-# `carrier-leds` claims the Pico-family carrier's five-LED debug bank (GP10/11/12/14/15); off by
-# default, since it is a carrier-specific wiring choice, not every Pico deployment's.
-carrier-leds = ["dep:embassy-time", "daplink-rp-embassy/carrier-leds"]
+flash-nrf52840 = ["flash", "daplink-targets/nrf52840"]
+flash-nrf52833 = ["flash", "daplink-targets/nrf52833"]
+# The carrier's five-LED debug bank (GP10/11/12/14/15).
+carrier-leds = ["dep:embassy-time"]
 
 [[bin]]
 name = "rp2040-pico-embassy"
@@ -74,7 +66,6 @@ bench = false
 opt-level = 3
 lto = true
 codegen-units = 1
-# Keep debug info in the ELF (probe-rs uses it); flashable images are unaffected.
 debug = 2
 panic = "abort"
 overflow-checks = false

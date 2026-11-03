@@ -6,10 +6,9 @@ use rp2040_hal::gpio::{Function, FunctionUart, Pin, PullType, PullUp};
 use rp2040_hal::pac;
 use static_cell::ConstStaticCell;
 
-/// SWO capture ring size, matching the RP embassy seam: 8 KiB is 20.5 ms of hold at 4 MBd.
+/// SWO capture ring size, matching the RP embassy seam.
 const N: usize = 8192;
 
-/// 8-bit word length code for `UARTLCR_H.WLEN`.
 const WLEN_8BIT: u8 = 3;
 /// Placeholder divisor baud; the host reprograms the real rate via `DAP_SWO_Baudrate`.
 const INIT_BAUD: u32 = 115_200;
@@ -19,8 +18,7 @@ pub type SwoProducer = ByteProducer<'static, N>;
 /// The Pico SWO slot: the raw UART0-RX mechanism paired with the ring consumer.
 pub type Uart0Swo = RingSwo<UartSwoHw, ByteConsumer<'static, N>>;
 
-/// Raw UART0 SWO mechanism: PL011 fixed-point baud programming and RX-interrupt mask/unmask. The
-/// pad is muxed to the UART once at construction and never switched back.
+/// Raw UART0 SWO mechanism; the pad is muxed to the UART once and never switched back.
 pub struct UartSwoHw {
     uart: pac::UART0,
     /// The `clk_peri` rate the divisors are computed against, sampled once at construction.
@@ -29,8 +27,7 @@ pub struct UartSwoHw {
 
 impl SwoBackend for UartSwoHw {
     fn set_baudrate(&mut self, baud: u32) -> u32 {
-        // Trace capture can refuse: a rate the lattice cannot serve reports 0 and programs
-        // nothing, leaving the previous divisors in place.
+        // A rate the lattice cannot serve reports 0 and leaves the previous divisors in place.
         let Some(dx64) = pl011_baud::div_x64(self.peri_hz, baud) else {
             return 0;
         };
@@ -71,8 +68,7 @@ impl SwoBackend for UartSwoHw {
     }
 }
 
-/// UART0 interrupt body: drain the RX FIFO into the ring producer, at most one FIFO's worth per
-/// entry so a line that never idles cannot hold the interrupt. Sole producer for that ring.
+/// UART0 interrupt body: drain at most one FIFO's worth per entry into the ring producer.
 pub fn swo_drain(producer: &mut SwoProducer) {
     // SAFETY: single-core, and the only other RX FIFO reads are `Swo` calls that never preempt this.
     let uart = unsafe { &*pac::UART0::ptr() };
@@ -85,15 +81,13 @@ pub fn swo_drain(producer: &mut SwoProducer) {
     });
 }
 
-/// Bring UART0 up as an RX-only SWO capture, permanently routing `rx` (GP13) to it, and return the
-/// SWO slot plus the ring producer for the RX interrupt. Call once per image.
+/// Bring UART0 up as RX-only SWO capture on GP13; call once per image.
 pub fn uart0_swo<F: Function, P: PullType>(
     uart: pac::UART0,
     resets: &mut pac::RESETS,
     rx: Pin<Gpio13, F, P>,
     peri_hz: u32,
 ) -> (Uart0Swo, SwoProducer) {
-    // Bring UART0 out of reset and wait for it to be ready.
     resets.reset().modify(|_, w| w.uart0().clear_bit());
     while resets.reset_done().read().uart0().bit_is_clear() {}
 
@@ -103,7 +97,6 @@ pub fn uart0_swo<F: Function, P: PullType>(
         .into_pull_type::<PullUp>();
     rx.set_input_enable(true);
 
-    // Disable while configuring, then program the placeholder divisor.
     uart.uartcr().write(|w| w);
     let (ibrd, fbrd) = pl011_baud::split(
         pl011_baud::div_x64(peri_hz, INIT_BAUD).unwrap_or(pl011_baud::DIV_X64_MIN),
@@ -116,7 +109,6 @@ pub fn uart0_swo<F: Function, P: PullType>(
     // 8N1, FIFOs enabled (also latches the divisor).
     uart.uartlcr_h()
         .write(|w| unsafe { w.wlen().bits(WLEN_8BIT).fen().set_bit() });
-    // Enable UART + RX only (RX-only SWO capture; TX stays off).
     uart.uartcr().write(|w| {
         w.uarten().set_bit();
         w.rxe().set_bit()

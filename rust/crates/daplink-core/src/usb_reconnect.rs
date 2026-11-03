@@ -1,7 +1,6 @@
 //! USB re-enumeration seam: the mechanism a volume remount uses to flush a host's cached view.
 
-/// Hardware mechanism that detaches the probe from the USB bus and reattaches it. The caller owns
-/// the timing -- detach, wait, attach -- and both operations must be cheap and non-blocking.
+/// Detaches the probe from the USB bus and reattaches it; the caller owns the timing.
 pub trait UsbReconnect {
     /// Drop off the bus (e.g. disable the D+ pull-up): the host sees a disconnect.
     fn detach(&mut self);

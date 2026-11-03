@@ -1,44 +1,59 @@
-//! Generated feature shapes. The registry names the images the fleet flashes; this crosses those
-//! rows with the features no row names, so a combination nobody flashes still has to compile.
+//! Generated feature shapes: registry rows crossed with `defmt` and hand-named combinations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::manifest_facts::{Error, ManifestFacts};
 use crate::registry::{Firmware, FIRMWARE};
-use crate::workspaces::{EMBEDDED, EXCLUDED, WORKSPACES};
 
-/// A combination the matrix deliberately does not build, and why. Naming one here is how the
-/// gate states its bound instead of silently dropping the shape.
+/// A combination the matrix deliberately does not build; `reason` is its `compile_error!` text.
 pub struct Incompatible {
     pub path: &'static str,
     pub added: &'static [&'static str],
     pub reason: &'static str,
 }
 
-pub const INCOMPATIBLE: &[Incompatible] = &[];
+pub const INCOMPATIBLE: &[Incompatible] = &[
+    Incompatible {
+        path: "firmware/stm32f103-embassy",
+        added: &["accel"],
+        reason: "`accel` composes only on the `nanodap` board wiring",
+    },
+    Incompatible {
+        path: "firmware/stm32f103-embassy",
+        added: &["flash"],
+        reason: "`flash` composes only on the `nanodap` board wiring",
+    },
+    Incompatible {
+        path: "firmware/stlinkv2",
+        added: &["accel", "conntest"],
+        reason: "accel and conntest reserve incompatible probe-pad compositions",
+    },
+    Incompatible {
+        path: "firmware/stm32h523-embassy",
+        added: &["spi-block", "flash"],
+        reason: "spi-block runs half-duplex and holds the bus without the flash mux",
+    },
+    Incompatible {
+        path: "firmware/stm32h523-embassy",
+        added: &["spi-block", "accel-duplex"],
+        reason: "spi-block runs half-duplex and holds the bus without the flash mux",
+    },
+    Incompatible {
+        path: "firmware/stm32h523-embassy",
+        added: &["plain-bitbang", "accel"],
+        reason: "plain-bitbang replaces the fast bit-bang engine; accel is a third engine",
+    },
+];
 
-/// A declared feature no gate row reaches, and why that is allowed to stand. The reason must
-/// name what keeps the feature alive -- an out-of-tree consumer, a path only a test takes --
-/// because an excuse nobody can check is how a feature stays uncompiled.
-pub struct Unreached {
-    pub path: &'static str,
-    pub feature: &'static str,
-    pub reason: &'static str,
-}
-
-pub const UNREACHED: &[Unreached] = &[];
-
-/// A feature pair no registry row builds together: the row it extends, and the features added on
-/// top of that row's own. Named by hand rather than generated, because crossing every pair of a
-/// crate's features costs far more build time than the combinations are worth.
+/// A hand-named feature pair no registry row builds: the row it extends and the features added.
 pub struct Pair {
     pub base: &'static str,
     pub added: &'static [&'static str],
 }
 
 pub const PAIRS: &[Pair] = &[
-    // `carrier-leds` next to `flash`, on both LED backends: the embassy seam drives the bank,
-    // the RTIC one drives it from `daplink-rp-hal`.
+    // `carrier-leds` next to `flash`, on both LED backends.
     Pair {
         base: "firmware/rp2040-pico-embassy-flash",
         added: &["carrier-leds"],
@@ -47,16 +62,7 @@ pub const PAIRS: &[Pair] = &[
         base: "firmware/rp2040-pico-rtic-flash",
         added: &["carrier-leds"],
     },
-    // The Debug Probe overclock remains orthogonal to its bitbang control.
-    Pair {
-        base: "firmware/debugprobe-overclock-180mhz",
-        added: &["bitbang"],
-    },
-    // Both Pico runtimes retain one exact overclock, crossed with each optional composition.
-    Pair {
-        base: "firmware/rp2040-pico-embassy-overclock-200mhz",
-        added: &["bitbang"],
-    },
+    // Both Pico runtimes retain one exact overclock, crossed with the ancillary compositions.
     Pair {
         base: "firmware/rp2040-pico-embassy-overclock-200mhz",
         added: &["flash-rp2040"],
@@ -67,27 +73,32 @@ pub const PAIRS: &[Pair] = &[
     },
     Pair {
         base: "firmware/rp2040-pico-rtic-overclock-200mhz",
-        added: &["bitbang"],
-    },
-    Pair {
-        base: "firmware/rp2040-pico-rtic-overclock-200mhz",
         added: &["flash-rp2040"],
     },
     Pair {
         base: "firmware/rp2040-pico-rtic-overclock-200mhz",
         added: &["carrier-leds"],
     },
-    // `usb-counters` next to `flash`: both forward into `daplink-embassy-usb`, so one row
-    // compiles the combination the two seams share.
+    // `carrier-leds` on the Pico 2 flash row, the RP2040 pairs' counterpart.
+    Pair {
+        base: "firmware/rp2350-pico2-embassy-flash",
+        added: &["carrier-leds"],
+    },
+    // The duplex and plain engines under the flash mux, which no H523 row composes.
+    Pair {
+        base: "firmware/stm32h523-embassy-accel-duplex",
+        added: &["flash", "flash-stm32f401"],
+    },
+    Pair {
+        base: "firmware/stm32h523-embassy-plain",
+        added: &["flash", "flash-stm32f401"],
+    },
+    // `usb-counters` next to `flash`: both forward into `daplink-embassy-usb`.
     Pair {
         base: "firmware/rp2350-pico2-embassy-flash",
         added: &["usb-counters"],
     },
-    // The Pico 2 overclock remains orthogonal to its control and optional compositions.
-    Pair {
-        base: "firmware/rp2350-pico2-embassy-overclock-200mhz",
-        added: &["bitbang"],
-    },
+    // The Pico 2 overclock remains orthogonal to its ancillary compositions.
     Pair {
         base: "firmware/rp2350-pico2-embassy-overclock-200mhz",
         added: &["flash-rp2350"],
@@ -100,6 +111,62 @@ pub const PAIRS: &[Pair] = &[
         base: "firmware/rp2350-pico2-embassy-overclock-200mhz",
         added: &["usb-counters"],
     },
+    // The Pico 2 flash target no registry row selects.
+    Pair {
+        base: "firmware/rp2350-pico2-embassy",
+        added: &["flash-rp2040"],
+    },
+    // Diagnostic features, on the H523 accel image they instrument.
+    Pair {
+        base: "firmware/stm32h523-embassy-accel",
+        added: &["dap-trace"],
+    },
+    Pair {
+        base: "firmware/stm32h523-embassy-accel",
+        added: &["wire-probe"],
+    },
+    Pair {
+        base: "firmware/stm32h523-embassy-accel",
+        added: &["usb-counters"],
+    },
+    Pair {
+        base: "firmware/mculink",
+        added: &["probe-timing"],
+    },
+    // Bit-banged flash on MCU-Link: `bitbang` under the flash mux.
+    Pair {
+        base: "firmware/mculink-bitbang",
+        added: &["flash", "flash-stm32f401"],
+    },
+    // The nRF52 targets, which no bench row flashes, beside each flash row's own target.
+    Pair {
+        base: "firmware/rp2040-pico-embassy-flash",
+        added: &["flash-nrf52840", "flash-nrf52833"],
+    },
+    Pair {
+        base: "firmware/rp2040-pico-rtic-flash",
+        added: &["flash-nrf52840", "flash-nrf52833"],
+    },
+    Pair {
+        base: "firmware/rp2350-pico2-embassy-flash",
+        added: &["flash-nrf52840", "flash-nrf52833"],
+    },
+    Pair {
+        base: "firmware/stm32h523-embassy-flash",
+        added: &["flash-nrf52840", "flash-nrf52833"],
+    },
+    Pair {
+        base: "firmware/mculink-flash",
+        added: &["flash-nrf52840", "flash-nrf52833"],
+    },
+    Pair {
+        base: "firmware/stm32f103-embassy-flash",
+        added: &["flash-nrf52840", "flash-nrf52833"],
+    },
+    Pair {
+        base: "firmware/stm32f103-embassy-accel-flash",
+        added: &["flash-nrf52840", "flash-nrf52833"],
+    },
 ];
 
 /// A no-default feature proof generated from a registry row without becoming a flashed image.
@@ -109,26 +176,35 @@ pub struct NoDefault {
 }
 
 pub const NO_DEFAULTS: &[NoDefault] = &[
+    // Overclocking is orthogonal to the engine composition selected without defaults.
     NoDefault {
-        base: "firmware/rp2040-pico-embassy",
-        features: &["bitbang", "guard"],
+        base: "firmware/rp2040-pico-embassy-bitbang",
+        features: &["overclock-200mhz"],
     },
     NoDefault {
-        base: "firmware/debugprobe",
-        features: &["bitbang", "guard"],
+        base: "firmware/rp2040-pico-rtic-bitbang",
+        features: &["overclock-200mhz"],
     },
     NoDefault {
-        base: "firmware/rp2040-pico-rtic",
-        features: &["bitbang", "guard"],
+        base: "firmware/debugprobe-bitbang",
+        features: &["overclock-180mhz"],
     },
     NoDefault {
-        base: "firmware/rp2350-pico2-embassy",
-        features: &["bitbang", "guard"],
+        base: "firmware/rp2350-pico2-embassy-bitbang",
+        features: &["overclock-200mhz"],
+    },
+    // Bit-banged flash: `cfg(all(flash, not(accel)))`, otherwise compiled only by the RTIC crate.
+    NoDefault {
+        base: "firmware/rp2040-pico-embassy-bitbang",
+        features: &["flash", "flash-rp2040"],
+    },
+    NoDefault {
+        base: "firmware/rp2350-pico2-embassy-bitbang",
+        features: &["flash", "flash-rp2350"],
     },
 ];
 
-/// One generated shape: a registry row's crate and default-feature disposition, plus the
-/// features the crossing adds on top of that row's own.
+/// One generated shape: a registry row plus the features the crossing adds.
 pub struct Shape {
     pub base: &'static Firmware,
     pub features: Vec<String>,
@@ -148,173 +224,21 @@ impl Shape {
     }
 }
 
-/// One entry of a `[features]` value: a same-crate feature, an optional dependency the feature
-/// activates, or a feature turned on in another crate.
-enum Entry {
-    Own(String),
-    Dep(String),
-    Forward {
-        pkg: String,
-        feat: String,
-        weak: bool,
-    },
-}
-
-impl Entry {
-    /// The same-crate feature this entry names, if it names one.
-    fn own(&self) -> Option<&str> {
-        match self {
-            Entry::Own(f) => Some(f),
-            _ => None,
-        }
-    }
-
-    /// Read one `[features]` string: `dep:x`, `pkg/feat`, `pkg?/feat`, or a plain feature.
-    fn parse(s: &str) -> Entry {
-        if let Some(pkg) = s.strip_prefix("dep:") {
-            return Entry::Dep(pkg.to_string());
-        }
-        match s.split_once('/') {
-            Some((pkg, feat)) => Entry::Forward {
-                pkg: pkg.trim_end_matches('?').to_string(),
-                feat: feat.to_string(),
-                weak: pkg.ends_with('?'),
-            },
-            None => Entry::Own(s.to_string()),
-        }
-    }
-}
-
-/// One dependency declaration and what the declaring crate turns on in it. A `dev` entry is
-/// compiled only for that crate's own test targets, so only a gate row on the crate sees it.
-struct Dep {
-    name: String,
-    optional: bool,
-    default_features: bool,
-    features: Vec<String>,
-    dev: bool,
-}
-
-/// A parsed manifest: enough of one to follow a feature from a gate row into the crates it
-/// forwards to.
-#[derive(Default)]
-struct Manifest {
-    name: String,
-    members: Vec<String>,
-    features: BTreeMap<String, Vec<Entry>>,
-    deps: Vec<Dep>,
-}
-
-/// Parse a crate's manifest. Hand-read rather than deserialized: the walk needs three tables of
-/// manifests this tree writes, which is cheaper than pulling a TOML parser into the root lockfile.
-fn manifest(root: &Path, path: &str) -> Manifest {
-    let text = match std::fs::read_to_string(root.join(path).join("Cargo.toml")) {
-        Ok(s) => s,
-        Err(_) => return Manifest::default(),
-    };
-    let mut out = Manifest::default();
-    let mut section = String::new();
-    let (mut key, mut value, mut depth) = (String::new(), String::new(), 0i32);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        if depth == 0 {
-            if trimmed.starts_with('[') {
-                section = trimmed.to_string();
-                continue;
-            }
-            let Some((name, rest)) = line.split_once('=') else {
-                continue;
-            };
-            if name.starts_with(char::is_whitespace) {
-                continue;
-            }
-            key = name.trim().trim_matches('"').to_string();
-            value = rest.to_string();
-            depth += value_depth(&value);
-        } else {
-            value.push_str(line);
-            depth += value_depth(line);
-        }
-        if depth != 0 {
-            continue;
-        }
-        if section == "[package]" && key == "name" {
-            out.name = value.trim().trim_matches('"').to_string();
-        } else if section == "[workspace]" && key == "members" {
-            out.members = strings(&value);
-        } else if section == "[features]" {
-            let entries = strings(&value).iter().map(|s| Entry::parse(s)).collect();
-            out.features.insert(key.clone(), entries);
-        } else if section.ends_with("dependencies]") {
-            out.deps.push(Dep {
-                name: key.clone(),
-                optional: value.contains("optional = true"),
-                default_features: !value.contains("default-features = false"),
-                features: dep_features(&value),
-                dev: section.contains("dev-dependencies"),
-            });
-        }
-    }
-    out
+/// Whether a `[features]` entry names a same-crate feature rather than another crate's.
+fn is_own(entry: &str) -> bool {
+    !entry.starts_with("dep:") && !entry.contains('/')
 }
 
 /// The crate's own `[features]` table: each feature and the same-crate features it turns on.
-/// `dep:` and `<pkg>/<feat>` entries name other crates and carry no closure here -- following
-/// those is [`reach`]'s job, not a shape's.
-fn feature_table(root: &Path, path: &str) -> BTreeMap<String, Vec<String>> {
-    manifest(root, path)
-        .features
-        .iter()
+fn feature_table(root: &Path, path: &str) -> Result<BTreeMap<String, Vec<String>>, Error> {
+    Ok(ManifestFacts::read(root.join(path).join("Cargo.toml"))?
+        .features()?
+        .into_iter()
         .map(|(k, v)| {
-            let own = v
-                .iter()
-                .filter_map(Entry::own)
-                .map(str::to_string)
-                .collect();
-            (k.clone(), own)
+            let own = v.into_iter().filter(|entry| is_own(entry)).collect();
+            (k, own)
         })
-        .collect()
-}
-
-/// Net bracket depth a manifest line adds, so a multi-line value reads as one.
-fn value_depth(text: &str) -> i32 {
-    text.chars()
-        .map(|c| match c {
-            '[' | '{' => 1,
-            ']' | '}' => -1,
-            _ => 0,
-        })
-        .sum()
-}
-
-/// The quoted strings of a manifest value.
-fn strings(value: &str) -> Vec<String> {
-    value
-        .split('"')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_string)
-        .collect()
-}
-
-/// The `features = [...]` array of a dependency declaration; `default-features` is not it.
-fn dep_features(value: &str) -> Vec<String> {
-    let mut rest = value;
-    while let Some(at) = rest.find("features") {
-        let dashed = rest[..at].ends_with('-');
-        rest = &rest[at + "features".len()..];
-        if dashed {
-            continue;
-        }
-        match (rest.find('['), rest.find(']')) {
-            (Some(open), Some(close)) if open < close => return strings(&rest[open..close]),
-            _ => continue,
-        }
-    }
-    Vec::new()
+        .collect())
 }
 
 /// Every same-crate feature a set of seeds turns on, the table's implications followed through.
@@ -363,8 +287,7 @@ fn shape(base: &'static Firmware, added: Vec<String>, no_default_features: bool)
     }
 }
 
-/// A shape a registry row already compiles is dropped: the variant rows the fleet flashes are
-/// themselves crossings, so generating them again would only double the gate's cost.
+/// A shape a registry row already compiles is dropped.
 fn is_registry_row(
     table: &BTreeMap<String, Vec<String>>,
     rows: &[&'static Firmware],
@@ -380,24 +303,19 @@ fn is_registry_row(
     })
 }
 
-/// The shapes the matrix adds to the registry: every row of a `defmt`-capable crate crossed with
-/// `defmt`, then each declared feature still built by nothing, on that crate's canonical row.
-pub fn shapes(root: &Path) -> Vec<Shape> {
+/// The shapes the matrix adds: `defmt` crossings, then [`PAIRS`] and [`NO_DEFAULTS`].
+pub fn shapes(root: &Path) -> Result<Vec<Shape>, Error> {
     let mut out = Vec::new();
     let mut done: BTreeSet<&str> = BTreeSet::new();
     for fw in FIRMWARE {
         if !done.insert(fw.path) {
             continue;
         }
-        let table = feature_table(root, fw.path);
+        let table = feature_table(root, fw.path)?;
         if table.is_empty() {
             continue;
         }
         let rows: Vec<&'static Firmware> = FIRMWARE.iter().filter(|f| f.path == fw.path).collect();
-        let mut covered: BTreeSet<String> = BTreeSet::new();
-        for row in &rows {
-            covered.extend(row_features(&table, row));
-        }
 
         if table.contains_key("defmt") {
             for row in &rows {
@@ -412,28 +330,14 @@ pub fn shapes(root: &Path) -> Vec<Shape> {
                 }
             }
         }
-
-        let canonical = rows.iter().find(|f| f.name == f.path).unwrap_or(&rows[0]);
-        for feat in table.keys().filter(|f| *f != "default") {
-            let added = vec![feat.clone()];
-            if covered.contains(feat) || is_incompatible(fw.path, &added) {
-                continue;
-            }
-            covered.extend(closure(&table, &added));
-            let s = shape(canonical, added, canonical.no_default_features);
-            if !is_registry_row(&table, &rows, &s) {
-                out.push(s);
-            }
-        }
     }
-    out.extend(pair_shapes(root));
-    out.extend(no_default_shapes(root));
-    out
+    out.extend(pair_shapes(root)?);
+    out.extend(no_default_shapes(root)?);
+    Ok(out)
 }
 
-/// The shapes [`PAIRS`] names, each on the registry row it extends. An entry naming a row or a
-/// feature that does not exist generates nothing; a test says so instead.
-fn pair_shapes(root: &Path) -> Vec<Shape> {
+/// The shapes [`PAIRS`] names, each on the registry row it extends.
+fn pair_shapes(root: &Path) -> Result<Vec<Shape>, Error> {
     let mut out = Vec::new();
     for p in PAIRS {
         let Some(base) = FIRMWARE.iter().find(|f| f.name == p.base) else {
@@ -443,7 +347,7 @@ fn pair_shapes(root: &Path) -> Vec<Shape> {
         if is_incompatible(base.path, &added) {
             continue;
         }
-        let table = feature_table(root, base.path);
+        let table = feature_table(root, base.path)?;
         let rows: Vec<&'static Firmware> =
             FIRMWARE.iter().filter(|f| f.path == base.path).collect();
         let s = shape(base, added, base.no_default_features);
@@ -451,17 +355,17 @@ fn pair_shapes(root: &Path) -> Vec<Shape> {
             out.push(s);
         }
     }
-    out
+    Ok(out)
 }
 
-fn no_default_shapes(root: &Path) -> Vec<Shape> {
+fn no_default_shapes(root: &Path) -> Result<Vec<Shape>, Error> {
     let mut out = Vec::new();
     for n in NO_DEFAULTS {
         let Some(base) = FIRMWARE.iter().find(|f| f.name == n.base) else {
             continue;
         };
         let added: Vec<String> = n.features.iter().map(|f| f.to_string()).collect();
-        let table = feature_table(root, base.path);
+        let table = feature_table(root, base.path)?;
         let rows: Vec<&'static Firmware> =
             FIRMWARE.iter().filter(|f| f.path == base.path).collect();
         let s = shape(base, added, true);
@@ -469,223 +373,42 @@ fn no_default_shapes(root: &Path) -> Vec<Shape> {
             out.push(s);
         }
     }
-    out
-}
-
-/// Every gated workspace's manifest, keyed by its path under `rust/`. The three lists in
-/// `workspaces.rs` name every `Cargo.toml` in the tree -- a closure test there says so -- so a
-/// crate cannot escape this map by being unlisted.
-struct Universe {
-    by_path: BTreeMap<String, Manifest>,
-    by_name: BTreeMap<String, String>,
-}
-
-fn universe(root: &Path) -> Universe {
-    let paths = WORKSPACES
-        .iter()
-        .chain(EMBEDDED)
-        .map(|w| w.path)
-        .chain(EXCLUDED.iter().map(|e| e.path));
-    let mut by_path = BTreeMap::new();
-    let mut by_name = BTreeMap::new();
-    for path in paths {
-        let mut m = manifest(root, path);
-        // A row on a virtual manifest stands for its single member: the root row runs cargo at
-        // `rust/`, and `xtask` is the crate that resolves there.
-        if m.name.is_empty() {
-            if let [member] = m.members.as_slice() {
-                m = manifest(root, &format!("{path}/{member}"));
-            }
-        }
-        by_name.insert(m.name.clone(), path.to_string());
-        by_path.insert(path.to_string(), m);
-    }
-    Universe { by_path, by_name }
-}
-
-/// The `(path, feature)` pairs one gate invocation compiles: the row's own features, followed
-/// through every `dep:` and `<pkg>/<feat>` entry and through the dependency declarations of the
-/// crates they name. `dev` says whether the row compiles test targets, since a dev-dependency's
-/// features reach a crate only then.
-///
-/// A `<pkg>?/<feat>` forward counts only where the row already activated `<pkg>`: a weak forward
-/// compiles nothing on its own, and counting it would be coverage the gate cannot back.
-fn reach(
-    u: &Universe,
-    path: &str,
-    features: &[String],
-    defaults: bool,
-    dev: bool,
-) -> BTreeSet<(String, String)> {
-    let mut pkgs: BTreeSet<String> = BTreeSet::from([path.to_string()]);
-    let mut with_defaults: BTreeSet<String> = BTreeSet::new();
-    if defaults {
-        with_defaults.insert(path.to_string());
-    }
-    let mut feats: BTreeSet<(String, String)> = features
-        .iter()
-        .map(|f| (path.to_string(), f.clone()))
-        .collect();
-    loop {
-        let before = (pkgs.len(), with_defaults.len(), feats.len());
-        for p in pkgs.clone() {
-            let Some(m) = u.by_path.get(&p) else {
-                continue;
-            };
-            if with_defaults.contains(&p) && m.features.contains_key("default") {
-                feats.insert((p.clone(), "default".to_string()));
-            }
-            for d in &m.deps {
-                if d.dev && !(dev && p == path) {
-                    continue;
-                }
-                let Some(dp) = u.by_name.get(&d.name) else {
-                    continue;
-                };
-                if !d.optional {
-                    pkgs.insert(dp.clone());
-                }
-                if !pkgs.contains(dp) {
-                    continue;
-                }
-                if d.default_features {
-                    with_defaults.insert(dp.clone());
-                }
-                feats.extend(d.features.iter().map(|f| (dp.clone(), f.clone())));
-            }
-        }
-        for (p, f) in feats.clone() {
-            let Some(entries) = u.by_path.get(&p).and_then(|m| m.features.get(&f)) else {
-                continue;
-            };
-            for e in entries {
-                match e {
-                    Entry::Own(g) => {
-                        feats.insert((p.clone(), g.clone()));
-                    }
-                    Entry::Dep(x) => {
-                        if let Some(xp) = u.by_name.get(x) {
-                            pkgs.insert(xp.clone());
-                        }
-                    }
-                    Entry::Forward { pkg, feat, weak } => {
-                        let Some(xp) = u.by_name.get(pkg) else {
-                            continue;
-                        };
-                        if *weak && !pkgs.contains(xp) {
-                            continue;
-                        }
-                        pkgs.insert(xp.clone());
-                        feats.insert((xp.clone(), feat.clone()));
-                    }
-                }
-            }
-        }
-        if (pkgs.len(), with_defaults.len(), feats.len()) == before {
-            return feats;
-        }
-    }
-}
-
-/// Every `(path, feature)` the tree compiles anywhere: the host gate's rows with their test
-/// targets, the embedded rows at their defaults, every registry row, and every generated shape.
-fn compiled(root: &Path) -> BTreeSet<(String, String)> {
-    let u = universe(root);
-    let mut out = BTreeSet::new();
-    let owned = |fs: &[&str]| fs.iter().map(|f| f.to_string()).collect::<Vec<String>>();
-    for w in WORKSPACES {
-        out.extend(reach(&u, w.path, &owned(w.features), true, true));
-    }
-    for w in EMBEDDED {
-        out.extend(reach(&u, w.path, &owned(w.features), true, false));
-    }
-    for f in FIRMWARE {
-        out.extend(reach(
-            &u,
-            f.path,
-            &owned(f.features),
-            !f.no_default_features,
-            false,
-        ));
-    }
-    for s in shapes(root) {
-        out.extend(reach(
-            &u,
-            s.base.path,
-            &s.features,
-            !s.no_default_features,
-            false,
-        ));
-    }
-    out
-}
-
-/// Every declared feature nothing in the tree compiles and no list excuses. The gate's whole
-/// claim is that this is empty: a feature here is dead as far as every check in the tree goes.
-pub fn unreached(root: &Path) -> Vec<(String, String)> {
-    let compiled = compiled(root);
-    let excused = |path: &str, feat: &String| {
-        UNREACHED
-            .iter()
-            .any(|u| u.path == path && u.feature == feat)
-            || INCOMPATIBLE
-                .iter()
-                .any(|i| i.path == path && i.added.contains(&feat.as_str()))
-    };
-    let mut out = Vec::new();
-    for (path, m) in &universe(root).by_path {
-        for feat in m.features.keys() {
-            if feat == "default"
-                || compiled.contains(&(path.clone(), feat.clone()))
-                || excused(path, feat)
-            {
-                continue;
-            }
-            out.push((path.clone(), feat.clone()));
-        }
-    }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn forwards(entries: &[Entry]) -> BTreeSet<(&str, &str, bool)> {
+    fn manifest(root: &Path, path: &str) -> BTreeMap<String, Vec<String>> {
+        ManifestFacts::read(root.join(path).join("Cargo.toml"))
+            .unwrap()
+            .features()
+            .unwrap()
+    }
+
+    /// The `<pkg>/<feat>` entries of a `[features]` value, weak forwards flagged.
+    fn forwards(entries: &[String]) -> BTreeSet<(String, String, bool)> {
         entries
             .iter()
-            .filter_map(|entry| match entry {
-                Entry::Forward { pkg, feat, weak } => Some((pkg.as_str(), feat.as_str(), *weak)),
-                _ => None,
+            .filter_map(|entry| entry.split_once('/'))
+            .map(|(pkg, feat)| {
+                (
+                    pkg.trim_end_matches('?').to_string(),
+                    feat.to_string(),
+                    pkg.ends_with('?'),
+                )
             })
             .collect()
     }
 
-    /// The gate's feature closure: a feature no row, shape or dependency declaration compiles is
-    /// dead as far as every check in the tree is concerned, whether a firmware or a library
-    /// declares it. Excusing one means naming it in [`UNREACHED`] or [`INCOMPATIBLE`].
-    #[test]
-    fn every_declared_feature_is_compiled_by_something() {
-        let orphans = unreached(&crate::root());
-        let listed: Vec<String> = orphans
-            .iter()
-            .map(|(p, f)| format!("`{p}` declares `{f}`"))
-            .collect();
-        assert!(
-            orphans.is_empty(),
-            "no row, shape or dependency compiles: {}",
-            listed.join(", ")
-        );
-    }
-
-    /// The `defmt` crossing is the rule the matrix exists for: no image ships logging on, so
-    /// nothing but the crossing ever compiles a bench feature next to it.
+    /// No image ships `defmt`, so only the crossing compiles bench features next to it.
     #[test]
     fn every_row_of_a_defmt_capable_crate_is_crossed_with_defmt() {
         let root = crate::root();
-        let shapes = shapes(&root);
+        let shapes = shapes(&root).unwrap();
         for fw in FIRMWARE {
-            let table = feature_table(&root, fw.path);
+            let table = feature_table(&root, fw.path).unwrap();
             if !table.contains_key("defmt") || row_features(&table, fw).contains("defmt") {
                 continue;
             }
@@ -706,17 +429,16 @@ mod tests {
         }
     }
 
-    /// A manifest whose `[features]` table the parser misreads would silently shrink the gate.
     #[test]
     fn the_feature_table_reads_multi_line_arrays_and_drops_foreign_features() {
-        let table = feature_table(&crate::root(), "firmware/mculink");
-        assert_eq!(table["default"], ["accel", "guard"]);
+        let table = feature_table(&crate::root(), "firmware/mculink").unwrap();
+        assert_eq!(table["default"], ["accel"]);
         assert_eq!(table["flash-stm32f401"], ["flash"]);
         assert!(
             table["defmt"].is_empty(),
             "defmt forwards to other crates only"
         );
-        assert!(table.contains_key("pass-trace"));
+        assert!(table.contains_key("probe-timing"));
     }
 
     #[test]
@@ -724,8 +446,6 @@ mod tests {
         struct Model {
             path: &'static str,
             overclock: &'static str,
-            accel_forwards: &'static [(&'static str, &'static str, bool)],
-            clock_forwards: &'static [(&'static str, &'static str, bool)],
             crossings: &'static [&'static str],
         }
 
@@ -733,71 +453,61 @@ mod tests {
             Model {
                 path: "firmware/rp2040-pico-embassy",
                 overclock: "overclock-200mhz",
-                accel_forwards: &[("daplink-rs", "rp2040-jtag-accel", false)],
-                clock_forwards: &[
-                    ("daplink-rp-embassy", "clock-200mhz", false),
-                    ("daplink-rp-pio", "clock-200mhz", true),
-                ],
-                crossings: &["bitbang", "flash-rp2040", "carrier-leds"],
+                crossings: &["flash-rp2040", "carrier-leds"],
             },
             Model {
                 path: "firmware/rp2040-pico-rtic",
                 overclock: "overclock-200mhz",
-                accel_forwards: &[("daplink-rs", "rp2040-jtag-accel", false)],
-                clock_forwards: &[
-                    ("daplink-rp-hal", "clock-200mhz", false),
-                    ("daplink-rp-pio", "clock-200mhz", true),
-                ],
-                crossings: &["bitbang", "flash-rp2040", "carrier-leds"],
+                crossings: &["flash-rp2040", "carrier-leds"],
             },
             Model {
                 path: "firmware/debugprobe",
                 overclock: "overclock-180mhz",
-                accel_forwards: &[],
-                clock_forwards: &[
-                    ("daplink-rp-embassy", "clock-180mhz", false),
-                    ("daplink-rp-pio", "clock-180mhz", true),
-                ],
-                crossings: &["bitbang"],
+                crossings: &[],
             },
             Model {
                 path: "firmware/rp2350-pico2-embassy",
                 overclock: "overclock-200mhz",
-                accel_forwards: &[("daplink-rs", "rp2040-jtag-accel", false)],
-                clock_forwards: &[
-                    ("daplink-rp-embassy", "clock-200mhz", false),
-                    ("daplink-rp-pio", "clock-200mhz", true),
-                ],
-                crossings: &["bitbang", "flash-rp2350", "carrier-leds", "usb-counters"],
+                crossings: &["flash-rp2350", "carrier-leds", "usb-counters"],
             },
         ];
 
         let root = crate::root();
-        let shapes = shapes(&root);
+        let shapes = shapes(&root).unwrap();
+        let retired = [
+            "bitbang",
+            "pio-swd",
+            "pio-jtag",
+            "pio-swd-fast",
+            "pio-swd-transaction",
+            "pio-jtag-autonomous",
+            "optimized-pio",
+        ];
         for model in MODELS {
-            let table = feature_table(&root, model.path);
+            let table = feature_table(&root, model.path).unwrap();
             let manifest = manifest(&root, model.path);
-            assert_eq!(table["default"], ["accel", "guard"], "{}", model.path);
-            assert!(manifest.features["bitbang"].is_empty(), "{}", model.path);
+            assert_eq!(table["default"], ["accel"], "{}", model.path);
+            for feature in retired {
+                assert!(
+                    !table.contains_key(feature),
+                    "{} still declares retired `{feature}`",
+                    model.path
+                );
+            }
             assert!(
-                manifest.features["accel"]
+                manifest["accel"]
                     .iter()
-                    .any(|entry| matches!(entry, Entry::Dep(name) if name == "daplink-rp-pio")),
+                    .any(|entry| entry == "dep:daplink-rp-pio"),
                 "{} accel does not activate daplink-rp-pio",
                 model.path
             );
             assert_eq!(
-                forwards(&manifest.features["accel"]),
-                model.accel_forwards.iter().copied().collect(),
+                forwards(&manifest["accel"]),
+                BTreeSet::new(),
                 "{} accel forwarding",
                 model.path
             );
-            assert_eq!(
-                forwards(&manifest.features["guard"]),
-                [("daplink-rs", "guard", false)].into_iter().collect(),
-                "{} guard forwarding",
-                model.path
-            );
+            assert!(!manifest.contains_key("guard"));
 
             let default = FIRMWARE
                 .iter()
@@ -806,7 +516,7 @@ mod tests {
             assert!(!default.no_default_features && default.features.is_empty());
             assert_eq!(
                 row_features(&table, default),
-                ["accel", "default", "guard"]
+                ["accel", "default"]
                     .into_iter()
                     .map(str::to_string)
                     .collect(),
@@ -819,32 +529,11 @@ mod tests {
                 .iter()
                 .find(|fw| fw.name == bitbang_name)
                 .unwrap_or_else(|| panic!("`{}` has no bitbang registry row", model.path));
-            assert!(!bitbang.no_default_features);
-            assert_eq!(bitbang.features, ["bitbang"]);
+            assert!(bitbang.no_default_features);
+            assert!(bitbang.features.is_empty());
             assert_eq!(
                 row_features(&table, bitbang),
-                ["accel", "bitbang", "default", "guard"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                "{} default plus bitbang",
-                model.path
-            );
-
-            let no_default = shapes
-                .iter()
-                .find(|s| {
-                    s.base.name == model.path
-                        && s.no_default_features
-                        && s.added == ["bitbang", "guard"]
-                })
-                .unwrap_or_else(|| panic!("`{}` has no no-default bitbang proof", model.path));
-            assert_eq!(
-                closure(&table, &no_default.features),
-                ["bitbang", "guard"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+                BTreeSet::new(),
                 "{} no-default bitbang",
                 model.path
             );
@@ -861,15 +550,18 @@ mod tests {
                 .find(|fw| fw.name == overclock_name)
                 .unwrap_or_else(|| panic!("`{}` has no overclock registry row", model.path));
             assert!(!overclock.no_default_features);
-            assert_eq!(overclock.features, [model.overclock]);
-
-            assert_eq!(
-                forwards(&manifest.features[model.overclock]),
-                model.clock_forwards.iter().copied().collect(),
-                "{} {} forwarding",
-                model.path,
-                model.overclock
+            assert!(
+                matches!(overclock.features, [f] | [f, "dap-packet-512"] if *f == model.overclock),
+                "{overclock_name} features"
             );
+            for (pkg, feature, _) in forwards(&manifest[model.overclock]) {
+                assert!(
+                    pkg != "daplink-rp-embassy" && pkg != "daplink-rp-pio",
+                    "{} {} forwards retired {pkg}/{feature}",
+                    model.path,
+                    model.overclock
+                );
+            }
 
             for added in model.crossings {
                 assert!(
@@ -881,6 +573,15 @@ mod tests {
                     "`{overclock_name} +{added}` generates no shape"
                 );
             }
+            assert!(
+                shapes.iter().any(|s| {
+                    s.base.name == bitbang.name
+                        && s.no_default_features
+                        && s.added == [model.overclock]
+                }),
+                "`{bitbang_name}` never compiles with {}",
+                model.overclock
+            );
             if table.contains_key("defmt") {
                 assert!(
                     shapes.iter().any(|s| {
@@ -892,56 +593,34 @@ mod tests {
                 );
             }
         }
+
+        assert!(!FIRMWARE
+            .iter()
+            .filter(|fw| MODELS.iter().any(|model| model.path == fw.path))
+            .any(|fw| retired.iter().any(|feature| fw.features.contains(feature))));
+        assert!(!manifest(&root, "crates/daplink-rs").contains_key("rp2040-jtag-accel"));
+        for path in ["platform/daplink-rp-embassy", "platform/daplink-rp-pio"] {
+            let table = feature_table(&root, path).unwrap();
+            assert!(!table.contains_key("clock-180mhz"), "{path}");
+            assert!(!table.contains_key("clock-200mhz"), "{path}");
+        }
+        for model in MODELS {
+            let build = std::fs::read_to_string(root.join(model.path).join("build.rs")).unwrap();
+            assert!(!build.contains("rp_accel"), "{} build.rs", model.path);
+        }
     }
 
-    /// The dependency half of the same parser: a misread declaration would drop a whole crate
-    /// out of the walk, or hand it features its dependent never asked for.
-    #[test]
-    fn the_dependency_table_reads_optionality_defaults_and_features() {
-        let m = manifest(&crate::root(), "platform/daplink-usb-device");
-        let core = m.deps.iter().find(|d| d.name == "daplink-core").unwrap();
-        assert!(core.dev, "the fixture dependency is a dev-dependency");
-        assert_eq!(core.features, ["bot-fixtures"]);
-        let m = manifest(&crate::root(), "firmware/mculink");
-        assert_eq!(m.name, "mculink");
-        let targets = m.deps.iter().find(|d| d.name == "daplink-targets").unwrap();
-        assert!(targets.optional && !targets.default_features && targets.features.is_empty());
-    }
-
-    /// A manifest the walk cannot name is a crate no forward can reach, so every gated workspace
-    /// has to parse to its own name.
-    #[test]
-    fn every_gated_workspace_parses_to_a_distinct_package_name() {
-        let u = universe(&crate::root());
-        assert_eq!(u.by_name.len(), u.by_path.len());
-        assert!(!u.by_name.contains_key(""));
-    }
-
-    /// What the walk reaches from one row, checked against a forward the gate depends on: the
-    /// firmware's `accel` is the only thing that compiles the LPC55 seam's masked-GPIO engine.
-    #[test]
-    fn the_walk_follows_a_firmware_feature_into_a_platform_crate() {
-        let u = universe(&crate::root());
-        let feats = reach(&u, "firmware/mculink", &[], true, false);
-        assert!(feats.contains(&(
-            "platform/daplink-lpc55-hal".to_string(),
-            "masked-swd".to_string()
-        )));
-        assert!(!feats.contains(&("crates/daplink-vfs".to_string(), "defmt".to_string())));
-    }
-
-    /// A pair entry that names no row, no feature, or a combination a registry row already
-    /// builds is an entry the gate silently drops.
+    /// A pair entry naming no row, no feature, or an existing registry row is silently dropped.
     #[test]
     fn every_pair_entry_names_a_real_row_and_generates_a_shape() {
         let root = crate::root();
-        let shapes = shapes(&root);
+        let shapes = shapes(&root).unwrap();
         for p in PAIRS {
             let base = FIRMWARE
                 .iter()
                 .find(|f| f.name == p.base)
                 .unwrap_or_else(|| panic!("`{}` is no registry row", p.base));
-            let table = feature_table(&root, base.path);
+            let table = feature_table(&root, base.path).unwrap();
             for a in p.added {
                 assert!(table.contains_key(*a), "`{}` declares no `{a}`", base.path);
             }
@@ -959,13 +638,13 @@ mod tests {
     #[test]
     fn every_no_default_entry_names_a_real_row_and_generates_a_shape() {
         let root = crate::root();
-        let shapes = shapes(&root);
+        let shapes = shapes(&root).unwrap();
         for n in NO_DEFAULTS {
             let base = FIRMWARE
                 .iter()
                 .find(|f| f.name == n.base)
                 .unwrap_or_else(|| panic!("`{}` is no registry row", n.base));
-            let table = feature_table(&root, base.path);
+            let table = feature_table(&root, base.path).unwrap();
             for feature in n.features {
                 assert!(
                     table.contains_key(*feature),
@@ -988,7 +667,7 @@ mod tests {
     fn an_incompatible_entry_names_a_real_crate_and_feature() {
         let root = crate::root();
         for i in INCOMPATIBLE {
-            let table = feature_table(&root, i.path);
+            let table = feature_table(&root, i.path).unwrap();
             assert!(!table.is_empty(), "`{}` names no crate", i.path);
             for a in i.added {
                 assert!(table.contains_key(*a), "`{}` declares no `{a}`", i.path);
@@ -996,26 +675,14 @@ mod tests {
         }
     }
 
-    /// An excuse for a feature that is compiled, or for one no crate declares, is an excuse
-    /// nobody will ever revisit.
+    /// The gate matches `reason` against the failing build, so it must be a guard's exact text.
     #[test]
-    fn an_unreached_entry_names_a_real_feature_that_is_still_unreached() {
+    fn every_incompatible_reason_is_a_guard_in_its_crate() {
         let root = crate::root();
-        let compiled = compiled(&root);
-        for u in UNREACHED {
-            let table = feature_table(&root, u.path);
-            assert!(
-                table.contains_key(u.feature),
-                "`{}` declares no `{}`",
-                u.path,
-                u.feature
-            );
-            assert!(
-                !compiled.contains(&(u.path.to_string(), u.feature.to_string())),
-                "`{}`'s `{}` is compiled; drop the excuse",
-                u.path,
-                u.feature
-            );
+        for i in INCOMPATIBLE {
+            let main = std::fs::read_to_string(root.join(i.path).join("src/main.rs")).unwrap();
+            let guard = format!("compile_error!(\"{}\")", i.reason);
+            assert!(main.contains(&guard), "`{}` has no guard `{guard}`", i.path);
         }
     }
 }

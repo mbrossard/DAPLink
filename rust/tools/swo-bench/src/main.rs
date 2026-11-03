@@ -8,8 +8,7 @@ use dap_bench::{adi, dap, transport};
 
 use swo_bench::{capture, dut, interrupt, itm, report, stream, swo, target};
 
-/// Default baud sweep: the rates the DUT's 84 MHz trace clock divides plus the slow rung a
-/// serial-console user would pick.
+/// Default baud sweep: rates the DUT's 84 MHz trace clock divides, plus a console rate.
 const DEFAULT_BAUD_LIST: &str = "115200,500k,1M,2M,4M";
 /// SWJ clock for the `--swd-load` attach, in Hz.
 const DEFAULT_SWD_CLOCK_HZ: u32 = 10_000_000;
@@ -58,16 +57,20 @@ struct RunArgs {
     /// SWJ clock for the `--swd-load` attach, in Hz.
     #[arg(long = "swd-clock", default_value_t = DEFAULT_SWD_CLOCK_HZ)]
     swd_clock: u32,
-    /// Commands kept outstanding on the bulk pair, clamped to the probe's advertised
-    /// `DAP_PACKET_COUNT`; `1` is lockstep. Default: chosen by transport class, stated in
-    /// the header.
+    /// Commands kept outstanding on the bulk pair; `1` is lockstep. Default: by transport class.
+    ///
+    /// Clamped to the probe's advertised `DAP_PACKET_COUNT`; the header states the depth used.
     #[arg(long = "depth")]
     depth: Option<usize>,
     /// Skip the one DUT reset the sweep takes before its first tier.
     #[arg(long = "no-dut-reset", default_value_t = false)]
     no_dut_reset: bool,
-    /// Emit a single JSON document to stdout instead of the human table; all other run output
-    /// moves to stderr.
+    /// Firmware registry row on the probe, for an image too old to name its own.
+    ///
+    /// `cargo xtask list` names the rows; `external:<name>` names an image outside them.
+    #[arg(long = "firmware-row")]
+    firmware_row: Option<String>,
+    /// Emit one JSON document to stdout instead of the table; other output moves to stderr.
     #[arg(long = "json")]
     json: bool,
 }
@@ -114,16 +117,12 @@ fn parse_baud_list(list: &str) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-/// Auto depth for a full-speed probe: measured to lift the exchange rate past the 6667/s that
-/// 4 MBd needs, where depth 1 is drain-bound.
+/// Auto depth for a full-speed probe, where depth 1 is drain-bound at 4 MBd.
 const FULL_SPEED_AUTO_DEPTH: usize = 4;
 /// Packet size at or above which a probe is treated as high-speed.
 const HIGH_SPEED_PACKET_SIZE: u16 = 512;
 
-/// Resolve `--depth`. An explicit request is clamped to the probe's advertised
-/// `DAP_PACKET_COUNT` with a warning; absent one, the transport decides -- depth helps when the
-/// exchange rate binds and hurts when the payloads are already unfilled -- and the returned
-/// rationale states the choice so a recorded run carries its own reasoning.
+/// Resolve `--depth`: clamp a request to `DAP_PACKET_COUNT`, else choose by transport class.
 fn resolve_depth(
     requested: Option<usize>,
     packet_size: Option<u16>,
@@ -180,14 +179,14 @@ struct Identity {
     product: Option<String>,
     serial: Option<String>,
     firmware_version: Option<String>,
+    firmware_row: firmware_row::Resolved,
     packet_size: Option<u16>,
     packet_count: Option<u8>,
     trace_buffer_bytes: Option<u32>,
     capabilities: Option<u8>,
 }
 
-/// One optional identity query. A refused query must not leave its answer stranded for the next
-/// one to pick up, so it resynchronizes before moving on.
+/// One optional identity query; a refused query resynchronizes before moving on.
 fn optional_query(probe: &mut transport::Probe, req: Vec<u8>) -> Option<Vec<u8>> {
     let out = probe.transfer(&req, INFO_TIMEOUT).ok();
     if out.is_none() || probe.is_desynced() {
@@ -197,9 +196,12 @@ fn optional_query(probe: &mut transport::Probe, req: Vec<u8>) -> Option<Vec<u8>>
 }
 
 /// Query the identity fields; a probe that rejects one leaves that field empty.
-fn query_identity(probe: &mut transport::Probe) -> Identity {
+fn query_identity(probe: &mut transport::Probe, operator_row: Option<&str>) -> Identity {
     let mut query = |req: Vec<u8>| optional_query(probe, req);
     let non_empty = |s: String| if s.is_empty() { None } else { Some(s) };
+    let image_row = query(dap::encode_info(dap::InfoId::FirmwareRow))
+        .and_then(|r| dap::decode_info_string(&r).ok());
+    let firmware_row = firmware_row::resolve(image_row.as_deref(), operator_row);
     Identity {
         product: query(dap::encode_info(dap::InfoId::ProductId))
             .and_then(|r| dap::decode_info_string(&r).ok())
@@ -210,6 +212,7 @@ fn query_identity(probe: &mut transport::Probe) -> Identity {
         firmware_version: query(dap::encode_info(dap::InfoId::FirmwareVersion))
             .and_then(|r| dap::decode_info_string(&r).ok())
             .and_then(non_empty),
+        firmware_row,
         packet_size: query(dap::encode_info(dap::InfoId::PacketSize))
             .and_then(|r| dap::decode_info_packet_size(&r).ok()),
         packet_count: query(dap::encode_info(dap::InfoId::PacketCount))
@@ -221,8 +224,7 @@ fn query_identity(probe: &mut transport::Probe) -> Identity {
     }
 }
 
-/// Print the self-describing header. In `--json` mode it goes to stderr, keeping stdout as the
-/// sole JSON document.
+/// Print the self-describing header; to stderr in `--json` mode.
 fn print_header(
     identity: &Identity,
     profile: &target::TargetProfile,
@@ -247,6 +249,10 @@ fn print_header(
         "firmware {}",
         identity.firmware_version.clone().unwrap_or_else(dash)
     ));
+    line(format!("row      {}", identity.firmware_row.describe()));
+    for warning in &identity.firmware_row.warnings {
+        line(format!("warning: {warning}"));
+    }
     line(format!(
         "packet   {} bytes x {} outstanding",
         identity.packet_size.map_or_else(dash, |v| v.to_string()),
@@ -339,15 +345,14 @@ impl<F: FnOnce()> Drop for DropGuard<F> {
     }
 }
 
-/// Put the DUT into (or out of) its continuous stream at `baud`, resetting it first when
-/// `reset` is set.
+/// Put the DUT into or out of its stream at `baud`, returning the rate the DUT reports realizing.
 fn setup_dut(
     selector: &str,
     profile: &target::TargetProfile,
     elf: Option<&str>,
     baud: Option<u32>,
     reset: bool,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let mut d = dut::Dut::attach(selector, profile.chip, elf)?;
     if reset {
         d.reset()
@@ -355,15 +360,32 @@ fn setup_dut(
     }
     // Always stop first: a tier's rate change must not land mid-stream.
     d.set_stream(false)?;
-    if let Some(baud) = baud {
-        d.set_swo_baud(baud)?;
-        d.set_stream(true)?;
-    }
-    Ok(())
+    let Some(baud) = baud else {
+        return Ok(None);
+    };
+    let realized = d.set_swo_baud(baud)?;
+    d.set_stream(true)?;
+    Ok(Some(realized))
 }
 
-/// Attach over raw bulk and confirm one block read, leaving the MEM-AP programmed for the
-/// interleaved load; the handle is dropped so the capture loop owns the one command stream.
+/// Read the DUT's emission ledger for the tier just captured; an image without the verb skips it.
+fn dut_emission(
+    selector: &str,
+    profile: &target::TargetProfile,
+    elf: Option<&str>,
+    baud: u32,
+) -> Option<daplink_test_protocol::SwoStats> {
+    let stats = dut::Dut::attach(selector, profile.chip, elf).and_then(|mut d| d.swo_stats());
+    match stats {
+        Ok(stats) => Some(stats),
+        Err(e) => {
+            eprintln!("note: the {baud} baud tier could not read the DUT's SWO ledger: {e:#}");
+            None
+        }
+    }
+}
+
+/// Attach over raw bulk, confirm one block read, and leave the MEM-AP programmed for the load.
 fn prepare_load(
     probe: &mut transport::Probe,
     profile: &target::TargetProfile,
@@ -423,7 +445,7 @@ fn run_tier(
     depth: usize,
     reset: bool,
 ) -> Result<report::Tier> {
-    setup_dut(
+    let dut_baud = setup_dut(
         selector,
         profile,
         args.dut_elf.as_deref(),
@@ -431,10 +453,19 @@ fn run_tier(
         reset,
     )
     .with_context(|| format!("preparing the DUT for {baud} baud failed"))?;
+    let modeled = profile.realized_baud(baud);
+    if dut_baud != modeled {
+        let show = |b: Option<u32>| b.map_or_else(|| "-".to_string(), |b| b.to_string());
+        eprintln!(
+            "note: the DUT reported realizing {} for {baud} baud; the '{}' profile models {}",
+            show(dut_baud),
+            profile.name,
+            show(modeled)
+        );
+    }
 
     let mut probe = open_probe(selector)?;
-    // The trace-pin enable lives in the debug domain, which a probe-rs attach rewrites
-    // wholesale, so it must be routed after the tier's last attach.
+    // probe-rs restores its attach-time DBGMCU_CR on session drop, so route after the last drop.
     route_trace_raw(&mut probe, profile, args.swd_clock)
         .with_context(|| format!("routing the {baud} baud tier's trace pin failed"))?;
     if probe.stale_on_claim() > 0 {
@@ -460,12 +491,19 @@ fn run_tier(
     let captured = capture::run(&mut probe, &cfg)
         .with_context(|| format!("capturing at {baud} baud failed"))?;
     release_probe(probe, baud);
+    let emission = dut_emission(selector, profile, args.dut_elf.as_deref(), baud);
 
-    Ok(tier_from(profile, baud, &captured, args.swd_load))
+    Ok(tier_from(
+        profile,
+        baud,
+        dut_baud,
+        &captured,
+        args.swd_load,
+        emission,
+    ))
 }
 
-/// Release a tier's bulk handle only once the wire is quiet: dropping it does not cancel a
-/// response the probe already armed, which the next tier's claim would inherit.
+/// Release a tier's handle only once the wire is quiet, so no armed response leaks to the next.
 fn release_probe(mut probe: transport::Probe, baud: u32) {
     if probe.is_desynced() {
         match probe.resynchronize() {
@@ -480,8 +518,7 @@ fn release_probe(mut probe: transport::Probe, baud: u32) {
     drop(probe);
 }
 
-/// The probe's `DAP_PACKET_SIZE`, falling back to the CMSIS-DAP minimum. As the tier's first
-/// command, a silent fallback would absorb a leftover response, so it announces and resyncs.
+/// The probe's `DAP_PACKET_SIZE`, or the CMSIS-DAP minimum with a warning and a resync.
 fn probe_packet_size(probe: &mut transport::Probe) -> u16 {
     let decoded = optional_query(probe, dap::encode_info(dap::InfoId::PacketSize))
         .and_then(|r| dap::decode_info_packet_size(&r).ok())
@@ -503,8 +540,10 @@ fn probe_packet_size(probe: &mut transport::Probe) -> u16 {
 fn tier_from(
     profile: &target::TargetProfile,
     baud: u32,
+    dut_baud: Option<u32>,
     captured: &capture::Capture,
     swd_load: bool,
+    dut_emission: Option<daplink_test_protocol::SwoStats>,
 ) -> report::Tier {
     let decoded = itm::decode_port(&captured.bytes, profile.stimulus_port);
     let framing = stream::scan(&decoded.payload);
@@ -513,7 +552,7 @@ fn tier_from(
     report::Tier {
         requested_baud: baud,
         probe_baud: captured.actual_baud,
-        dut_baud: profile.realized_baud(baud),
+        dut_baud,
         window_ms: captured.elapsed.as_secs_f64() * 1000.0,
         captured_bytes: captured.bytes.len(),
         kib_per_s: captured.bytes.len() as f64 / 1024.0 / seconds,
@@ -525,10 +564,13 @@ fn tier_from(
         polls: captured.polls,
         full_polls: captured.full_polls,
         inactive_polls: captured.inactive_polls,
-        probe_bytes_left: captured.final_status.bytes_available,
+        drain_polls: captured.drain_polls,
+        probe_bytes_left: captured.final_status.map(|s| s.bytes_available),
         swd_kib_per_s: swd_load.then(|| captured.swd_words as f64 * 4.0 / 1024.0 / seconds),
         swd_mismatches: captured.swd_mismatches,
         swd_errors: captured.swd_errors,
+        swd_failures: captured.swd_failures.clone(),
+        dut_emission,
     }
 }
 
@@ -549,7 +591,7 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
 
     let identity = {
         let mut probe = open_probe(&selector)?;
-        query_identity(&mut probe)
+        query_identity(&mut probe, args.firmware_row.as_deref())
     };
     let (depth, depth_rationale, warning) =
         resolve_depth(args.depth, identity.packet_size, identity.packet_count);
@@ -574,52 +616,32 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
 
     interrupt::install();
     let started = Instant::now();
-    let mut rows = Vec::with_capacity(bauds.len());
     // A panic must not skip the teardown; the normal path disarms this and stops the DUT loudly.
     let mut guard = DropGuard::new(|| {
         if let Err(e) = setup_dut(&selector, profile, args.dut_elf.as_deref(), None, false) {
             eprintln!("error: stopping the DUT stream failed: {e:#}");
         }
     });
-    // Once per invocation, never per tier: on a rig where the DUT hangs off its own USB lead a
-    // reset churns that port, and one per case has taken a host controller down. The first tier
-    // consumes it; the tiers after it are already starting from a DUT this sweep configured.
+    // One DUT reset per invocation, never per tier: resets churn the DUT's USB port.
     let mut pending_reset = !args.no_dut_reset;
-    let result = (|| -> Result<()> {
-        for &baud in &bauds {
-            if interrupt::triggered() {
-                bail!("interrupted before the {baud} baud tier");
-            }
-            let tier = run_tier(
-                &selector,
-                profile,
-                args,
-                baud,
-                depth,
-                std::mem::take(&mut pending_reset),
-            )?;
-            if !args.json {
-                println!("{}", report::render(&tier));
-                for note in report::notes(&tier) {
-                    println!("{note}");
-                }
-            }
-            rows.push(tier);
-        }
-        Ok(())
-    })();
+    let (rows, result) = sweep_tiers(&bauds, args.json, |baud| {
+        run_tier(
+            &selector,
+            profile,
+            args,
+            baud,
+            depth,
+            std::mem::take(&mut pending_reset),
+        )
+    });
     guard.disarm();
 
-    // Always leave the DUT quiet, whether the sweep finished or aborted. A DUT left streaming
-    // poses as a dead one to the next session, so a failed stop fails the run.
+    // Always leave the DUT quiet; a failed stop fails the run.
     let teardown = setup_dut(&selector, profile, args.dut_elf.as_deref(), None, false)
         .context("stopping the DUT stream failed; the DUT may still be streaming");
-    if let Err(e) = result {
-        if let Err(t) = teardown {
-            eprintln!("error: {t:#}");
-        }
-        return Err(e);
-    }
+    // Tiers completed before a failure are evidence: they are emitted with the error beside them.
+    let error = result.as_ref().err().map(|e| format!("{e:#}"));
+    let teardown_error = teardown.as_ref().err().map(|e| format!("{e:#}"));
 
     if args.json {
         let ctx = report::Context {
@@ -627,6 +649,8 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
             probe_product: identity.product,
             probe_serial: identity.serial,
             firmware_version: identity.firmware_version,
+            firmware_row_source: identity.firmware_row.source.key(),
+            firmware_row: identity.firmware_row.row,
             packet_size: identity.packet_size,
             packet_count: identity.packet_count,
             trace_buffer_bytes: identity.trace_buffer_bytes,
@@ -637,20 +661,68 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
             swd_load: args.swd_load,
             dut_reset: !args.no_dut_reset,
             bauds: &bauds,
+            error: error.as_deref(),
+            teardown_error: teardown_error.as_deref(),
         };
         print!("{}", report::to_json(&ctx, &rows));
     } else {
         println!();
         println!(
-            "{} tier(s) in {:.1} s; {} clean",
-            rows.len(),
-            started.elapsed().as_secs_f64(),
-            rows.iter()
-                .filter(|r| r.verdict == report::Verdict::Clean)
-                .count()
+            "{}",
+            report::summary(&rows, bauds.len(), started.elapsed(), error.is_some())
         );
     }
-    teardown
+    if let Err(e) = result {
+        if let Err(t) = teardown {
+            eprintln!("error: {t:#}");
+        }
+        return Err(e);
+    }
+    teardown?;
+
+    // An UNRATED tier fails the sweep; GAPS and MISFRAMED are results and exit zero.
+    let unrated: Vec<String> = rows
+        .iter()
+        .filter(|r| r.verdict == report::Verdict::Unrated)
+        .map(|r| r.requested_baud.to_string())
+        .collect();
+    if !unrated.is_empty() {
+        bail!(
+            "{} tier(s) captured no bytes at all and are unrated: {} baud",
+            unrated.len(),
+            unrated.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Run each tier in order, stopping at the first that fails; the tiers completed are kept.
+fn sweep_tiers(
+    bauds: &[u32],
+    json: bool,
+    mut run: impl FnMut(u32) -> Result<report::Tier>,
+) -> (Vec<report::Tier>, Result<()>) {
+    let mut rows = Vec::with_capacity(bauds.len());
+    for &baud in bauds {
+        if interrupt::triggered() {
+            return (
+                rows,
+                Err(anyhow!("interrupted before the {baud} baud tier")),
+            );
+        }
+        let tier = match run(baud) {
+            Ok(tier) => tier,
+            Err(e) => return (rows, Err(e)),
+        };
+        if !json {
+            println!("{}", report::render(&tier));
+            for note in report::notes(&tier) {
+                println!("{note}");
+            }
+        }
+        rows.push(tier);
+    }
+    (rows, Ok(()))
 }
 
 /// Seconds since the Unix epoch, for the JSON run timestamp.
@@ -663,6 +735,53 @@ fn unix_time_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tier as `run_tier` would return it, distinguishable by its requested rate.
+    fn fake_tier(baud: u32) -> report::Tier {
+        let profile = target::lookup("stm32f401").unwrap();
+        let captured = capture::Capture {
+            actual_baud: baud,
+            bytes: vec![0; 64],
+            elapsed: Duration::from_millis(5_000),
+            polls: 1,
+            full_polls: 0,
+            inactive_polls: 0,
+            drain_polls: 0,
+            swd_words: 0,
+            swd_mismatches: 0,
+            swd_errors: 0,
+            swd_failures: Vec::new(),
+            final_status: None,
+        };
+        tier_from(profile, baud, Some(baud), &captured, false, None)
+    }
+
+    #[test]
+    fn a_failed_tier_ends_the_sweep_and_keeps_every_tier_before_it() {
+        let mut visited = Vec::new();
+        let (rows, result) =
+            sweep_tiers(&[115_200, 1_000_000, 2_000_000, 4_000_000], true, |baud| {
+                visited.push(baud);
+                if baud == 2_000_000 {
+                    bail!("capturing at {baud} baud failed")
+                }
+                Ok(fake_tier(baud))
+            });
+        assert_eq!(visited, [115_200, 1_000_000, 2_000_000]);
+        let kept: Vec<u32> = rows.iter().map(|t| t.requested_baud).collect();
+        assert_eq!(kept, [115_200, 1_000_000]);
+        assert_eq!(
+            format!("{:#}", result.unwrap_err()),
+            "capturing at 2000000 baud failed"
+        );
+    }
+
+    #[test]
+    fn a_sweep_whose_tiers_all_ran_has_no_error() {
+        let (rows, result) = sweep_tiers(&[1_000_000, 2_000_000], true, |baud| Ok(fake_tier(baud)));
+        assert_eq!(rows.len(), 2);
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn parse_baud_accepts_suffixes_and_plain_integers() {

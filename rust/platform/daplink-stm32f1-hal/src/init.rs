@@ -1,7 +1,9 @@
 //! Probe bring-up for the original ST-Link/V2 wiring.
 
 use daplink_rs::daplink_core::SCAN_CHAIN_SLOTS;
-use daplink_rs::{LateJtagDeps, ScanChainStorage};
+use daplink_rs::{
+    wired_swd_deps, InputOutputPin, LateJtagDeps, NoSwo, ScanChainStorage, SwdOnlyDeps,
+};
 use daplink_usb_device::UsbBusAllocator;
 use static_cell::StaticCell;
 use stm32f1xx_hal::gpio::gpioa::PA9;
@@ -18,33 +20,75 @@ use crate::DynCycleDelay;
 /// The wired SWD+JTAG bit-bang dependencies the DAP engine is assembled from.
 pub type ProbeDeps = LateJtagDeps<IoPin, DynCycleDelay>;
 
-/// The activity LED: PA9 (`LED_STLINK`), push-pull, **active low** (its die sits between PA9 and
-/// +3V3). PA9 is USART1_TX, free because this image takes USART1's RX alone and composes no VCOM.
+/// PA9 activity LED, push-pull and active low.
 pub type LedPin = PA9<Output<PushPull>>;
 
 /// The built probe pieces for the original ST-Link/V2 layout.
-pub struct ProbeParts {
-    /// The wired bit-bang dependencies.
-    pub deps: ProbeDeps,
-    /// USB serial string derived from the die's unique id.
+pub struct ProbeParts<D = ProbeDeps, S = Usart1Swo> {
+    pub deps: D,
     pub serial: &'static str,
-    /// The `usb-device` bus allocator, ready for `DapUsb::new`.
+    /// The `usb-device` bus allocator.
     pub usb_alloc: &'static UsbBusAllocator<UsbBus<Peripheral>>,
-    /// The USART1-RX SWO capture slot (PA10, DMA1 CH5), assembled into the DAP engine.
-    pub swo: Usart1Swo,
-    /// The PA9 activity LED pin, off (high), for `StatusLed::new_active_low`.
+    /// SWO capture or an inert replacement.
+    pub swo: S,
+    /// The PA9 activity LED pin, off (high).
     pub led: LedPin,
 }
 
-/// Bring the probe up in the original ST-Link/V2 wiring (SWCLK=PB13, SWDIO=PB14, nRESET=PB0,
-/// TDI=PA7, TDO=PA6, SWO=PA10, LED=PA9); call once per image.
-///
-/// PA15 (`USB_RENUMn`) is left alone: its reset state already enables the D+ pull-up, and driving
-/// the net has kept this board off the bus. Re-enumeration is the PA12 D+ pulse instead.
+/// Original ST-Link/V2 wiring; call once per image, leaving PA15 USB_RENUMn untouched.
 ///
 /// # Panics
-/// Panics if the clock configuration fails (fixed and valid, so that is a hardware fault).
+/// Panics if the clock configuration fails.
 pub fn probe_parts_stlinkv2(dp: pac::Peripherals, delay: DynCycleDelay) -> ProbeParts {
+    parts(
+        dp,
+        || {
+            static SCAN: ScanChainStorage<SCAN_CHAIN_SLOTS> = ScanChainStorage::new();
+            LateJtagDeps::wired(
+                IoPin::open_drain(Port::B, 0),
+                IoPin::new(Port::A, 7),
+                IoPin::new(Port::B, 14),
+                IoPin::new(Port::B, 13),
+                IoPin::new(Port::A, 6),
+                delay,
+                &SCAN,
+            )
+        },
+        |usart, clock| {
+            IoPin::new(Port::A, 10).set_as_input();
+            usart1_swo(usart, clock)
+        },
+    )
+}
+
+/// SWD-only composition leaves PA6, PA7 and PA10 entirely to the caller.
+pub fn probe_parts_stlinkv2_swd(
+    dp: pac::Peripherals,
+    delay: DynCycleDelay,
+) -> ProbeParts<SwdOnlyDeps<IoPin, DynCycleDelay>, NoSwo> {
+    parts(
+        dp,
+        || {
+            static SCAN: ScanChainStorage<SCAN_CHAIN_SLOTS> = ScanChainStorage::new();
+            wired_swd_deps(
+                IoPin::open_drain(Port::B, 0),
+                IoPin::nc(),
+                IoPin::new(Port::B, 14),
+                IoPin::new(Port::B, 13),
+                IoPin::nc(),
+                delay,
+                &SCAN,
+            )
+        },
+        |_, _| NoSwo,
+    )
+}
+
+fn parts<D, S>(
+    dp: pac::Peripherals,
+    deps: impl FnOnce() -> D,
+    swo: impl FnOnce(pac::USART1, u32) -> S,
+) -> ProbeParts<D, S> {
     let mut flash = dp.FLASH.constrain();
     let mut rcc = clocks(&mut flash, dp.RCC);
     let mut gpioa = dp.GPIOA.split(&mut rcc);
@@ -52,26 +96,12 @@ pub fn probe_parts_stlinkv2(dp: pac::Peripherals, delay: DynCycleDelay) -> Probe
     // D+ pulse before the peripheral takes the pin, so a warm reflash reads as a fresh attach.
     let usb_dp = usb_renum(gpioa.pa12, &mut gpioa.crh, rcc.clocks.sysclk().raw());
 
-    // LED off (high) until the engine drives it.
     let led = gpioa
         .pa9
         .into_push_pull_output_with_state(&mut gpioa.crh, PinState::High);
 
-    // nRESET is open-drain: a wired-AND net shared with the target's reset supervisor.
-    static SCAN: ScanChainStorage<SCAN_CHAIN_SLOTS> = ScanChainStorage::new();
-    let deps = LateJtagDeps::wired(
-        IoPin::open_drain(Port::B, 0), // nRESET
-        IoPin::new(Port::A, 7),        // TDI
-        IoPin::new(Port::B, 14),       // SWDIO / TMS
-        IoPin::new(Port::B, 13),       // SWCLK / TCK
-        IoPin::new(Port::A, 6),        // TDO
-        delay,
-        &SCAN,
-    );
-
-    // PA10 parks pulled up to the line's idle mark; a receive-only pad needs no AF selection.
-    let _pa10 = gpioa.pa10.into_pull_up_input(&mut gpioa.crh);
-    let swo = usart1_swo(dp.USART1, rcc.clocks.pclk2().raw());
+    let deps = deps();
+    let swo = swo(dp.USART1, rcc.clocks.pclk2().raw());
 
     let usb = Peripheral {
         usb: dp.USB,

@@ -1,0 +1,84 @@
+{
+  "schema_version": 6,
+  "timestamp_utc": "2026-01-02T03:04:05Z",
+  "probe": {
+    "vendor": "vendor\"\\\n\t\u0001",
+    "product": null,
+    "serial": "serial\rnumber",
+    "firmware_version": null,
+    "firmware_row": "firmware/mculink",
+    "firmware_row_source": "image",
+    "packet_size": null,
+    "packet_count": 4
+  },
+  "protocol": "swd",
+  "target": "target\"name",
+  "window_ms": 500,
+  "chunk_bytes": 4096,
+  "repeats": 5,
+  "clocks_hz": [1000000, 2000000],
+  "depths": [1, 4],
+  "host_policy": {
+    "tar": "per-chunk",
+    "shape": "block",
+    "submit": "lockstep",
+    "out_burst": false,
+    "refill": "after-history",
+    "commands_per_chunk": {
+      "read": 144,
+      "write": 152
+    }
+  },
+  "error": "write at 2000000 Hz, depth 1: all 2 repeats aborted (halt 2); first: \"x\"",
+  "rows": [
+    {
+      "direction": "read",
+      "clock_hz": 1000000,
+      "depth": 1,
+      "repeats": 5,
+      "samples": 2,
+      "aborts": 3,
+      "abort_classes": {"attach": 1, "halt": 0, "guard": 1, "transfer": 1},
+      "kib_per_s": {
+        "median": null,
+        "min": 100,
+        "max": 100
+      },
+      "samples_kib_per_s": [100, null],
+      "median_iterations": 1,
+      "median_elapsed_ms": 100
+    },
+    {
+      "direction": "write",
+      "clock_hz": 2000000,
+      "depth": 1,
+      "repeats": 2,
+      "samples": 0,
+      "aborts": 2,
+      "abort_classes": {"attach": 0, "halt": 2, "guard": 0, "transfer": 0},
+      "kib_per_s": {
+        "median": null,
+        "min": null,
+        "max": null
+      },
+      "samples_kib_per_s": [],
+      "median_iterations": null,
+      "median_elapsed_ms": null
+    }
+  ],
+  "fit": [
+    {
+      "direction": "read",
+      "depth": 4,
+      "block_words": 15,
+      "intercept_us": null,
+      "slope": null,
+      "ideal_slope": 690,
+      "r_squared": 0.75,
+      "top_clock_hz": 2000000,
+      "effective_clock_hz_top": null,
+      "wire_us_top": 1.25,
+      "plateau_ceiling_hz": null
+    }
+  ]
+}

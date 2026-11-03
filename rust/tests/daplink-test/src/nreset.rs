@@ -1,12 +1,13 @@
 //! The nreset case: the reset line the probe ships but nothing else exercises.
 
+use std::time::Instant;
+
 use daplink_test_protocol as proto;
 
 use crate::util::chain;
 use crate::{Ctx, Failure};
 
-/// Stamp the DUT's RAM, pulse nRESET over raw bulk, and require a fresh boot event and the
-/// stamp back at zero; a dead pin fails, losing the setup is fatal.
+/// Stamp RAM, pulse nRESET over raw bulk, and require a fresh boot with the stamp cleared.
 pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
     let dut_elf = cx.dut_elf.clone();
     // Pre-pulse: set the stamp and confirm it through the protocol.
@@ -21,15 +22,26 @@ pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
             .map_err(Failure::Fatal)?;
         let id =
             crate::rtt::exchange(&mut rtt, &mut core, b"ID\n", "OK ID").map_err(Failure::Fatal)?;
-        if last_stamp(&id) != Some(42) {
+        if crate::dutid::last_stamp(&id) != Some(42) {
             return Err(Failure::Fatal(format!("stamp not confirmed (saw {id:?})")));
         }
     }
 
     // The raw pulse claims the USB interface, so the probe-rs session goes first.
     cx.session = None;
-    crate::dap::pulse_nreset(&cx.selector).map_err(Failure::Fatal)?;
-    crate::connect::run(cx, full_run)?;
+    if let Err(e) = crate::dap::pulse_nreset(&cx.selector) {
+        if !is_transport_error(&e) {
+            return Err(Failure::Fatal(e));
+        }
+        // USB churn during the pulse itself: try to reattach anyway, same as a reattach failure.
+        return recover_reattach(cx, full_run, e, Instant::now());
+    }
+    let reattach_started = Instant::now();
+    match crate::connect::run(cx, full_run) {
+        Ok(()) => {}
+        Err(Failure::Fatal(e)) => return recover_reattach(cx, full_run, e, reattach_started),
+        Err(other) => return Err(other),
+    }
     let session = cx
         .session
         .as_mut()
@@ -41,7 +53,7 @@ pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
     crate::rtt::expect(&mut rtt, &mut core, proto::EVT_BOOT)
         .map_err(|e| Failure::Failed(format!("no reboot: {e}")))?;
     let id = crate::rtt::exchange(&mut rtt, &mut core, b"ID\n", "OK ID").map_err(Failure::Fatal)?;
-    match last_stamp(&id) {
+    match crate::dutid::last_stamp(&id) {
         Some(0) => Ok(()),
         other => Err(Failure::Failed(format!(
             "stamp survived the pulse (stamp={other:?}), the target did not reset"
@@ -49,7 +61,61 @@ pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
     }
 }
 
-/// The `stamp=` field of the last `ID` reply in `text`; shared with the reset case.
-pub(crate) fn last_stamp(text: &str) -> Option<u32> {
-    text.lines().rev().find_map(proto::id_stamp)
+/// Reattach once more so later cases keep a session; the case still fails.
+fn recover_reattach(
+    cx: &mut Ctx,
+    full_run: bool,
+    first_err: String,
+    since_pulse: Instant,
+) -> Result<(), Failure> {
+    let ms = since_pulse.elapsed().as_millis();
+    match crate::connect::run(cx, full_run) {
+        Ok(()) => Err(Failure::Failed(format!(
+            "reattach failed ({ms}ms after pulse): {first_err}"
+        ))),
+        Err(Failure::Fatal(second_err)) => Err(Failure::Failed(format!(
+            "reattach failed twice, first {ms}ms after pulse: {first_err}; retry: {second_err}"
+        ))),
+        Err(other) => Err(other),
+    }
+}
+
+/// Whether a raw-bulk error looks like USB/host-controller churn rather than a dead reset pin.
+fn is_transport_error(msg: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "bulk write failed",
+        "bulk read failed",
+        "probe not found on the bus",
+        "no vendor bulk interface",
+        "no such device",
+        "input/output error",
+        "broken pipe",
+        "disconnected",
+        "resource busy",
+        "timed out",
+    ];
+    let lower = msg.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transport_error;
+
+    #[test]
+    fn transport_error_matches_known_markers() {
+        assert!(is_transport_error("bulk write failed: pipe error"));
+        assert!(is_transport_error("bulk read failed: timeout"));
+        assert!(is_transport_error("probe not found on the bus"));
+        assert!(is_transport_error("No such device (os error 19)"));
+        assert!(is_transport_error("Device disconnected"));
+    }
+
+    #[test]
+    fn transport_error_ignores_unrelated_text() {
+        assert!(!is_transport_error(
+            "stamp not confirmed (saw \"OK ID stamp=1\")"
+        ));
+        assert!(!is_transport_error("SWD ack was FAULT"));
+    }
 }

@@ -17,71 +17,41 @@ const RING_LEN: usize = 8192;
 // BNDT is 16 bits of bytes, so the whole ring must fit one block.
 const _: () = assert!(RING_LEN <= 0xFFFF);
 
-/// GPIO ports sit `0x400` apart on every STM32.
 const PORT_STRIDE: usize = 0x400;
 
-/// Placeholder divisor; the host programs the real capture rate with `DAP_SWO_Baudrate`.
+/// Placeholder baud until the host sets one with `DAP_SWO_Baudrate`.
 const INIT_BAUD: u32 = 115_200;
 
-/// Smallest programmable divisor: below 16 the oversampling-by-16 receiver cannot sample.
+/// Smallest divisor the oversampling-by-16 receiver can sample at.
 const BRR_MIN: u32 = 16;
-/// Largest programmable divisor: `BRR` is 16 bits.
 const BRR_MAX: u32 = 0xFFFF;
 
-/// Bound on the suspend handshake spin, so a wedged channel cannot hang the DAP loop.
-const SUSPEND_SPINS: u32 = 10_000;
-
-/// Suspends whose bound expired with the channel still busy, so the reset landed on running
-/// hardware; the trace the seam hands out across one is not evidence.
+/// Suspends whose bound expired with the channel still busy.
 static DMA_FAULTS: AtomicU32 = AtomicU32::new(0);
 
-/// Trace-DMA faults the capture channel recovered from; a diagnostic reads it over SWD, the
-/// `0x9D` reply having no slot for it.
+/// Trace-DMA faults the capture channel recovered from.
 pub fn dma_faults() -> u32 {
     DMA_FAULTS.load(Ordering::Relaxed)
 }
 
-/// Suspend `ch` and wait for it to let go, charging a fault when the bound expires; the caller
-/// resets the channel either way, so an expired bound is recorded rather than passed over.
-fn suspend(ch: pac::gpdma::Channel) {
-    if !ch.cr().read().en() {
-        return;
-    }
-    // Reset is only valid on a suspended or idle channel.
-    ch.cr().modify(|w| w.set_susp(true));
-    let mut spins = 0;
-    while spins < SUSPEND_SPINS {
-        let sr = ch.sr().read();
-        if sr.suspf() || sr.idlef() {
-            return;
-        }
-        spins += 1;
-    }
-    DMA_FAULTS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Bound on the `prepare` FIFO drain: the RX FIFO holds 8 bytes plus the shift register.
+/// Bound on the `prepare` drain: the 8-byte RX FIFO plus the shift register.
 const FIFO_DRAIN_BOUND: u32 = 16;
 
 /// The STM32 SWO slot: the raw USART-RX mechanism paired with its GPDMA ring.
 pub type UartSwo = RingSwo<UartSwoHw, DmaSwoRx>;
 
-/// Linked-list item closing the ring: `CDAR` then `CLLR`, in fetch order. 8-byte aligned so it
-/// cannot straddle the 64 KiB window `CLBAR` addresses.
+/// Linked-list item closing the ring: `CDAR` then `CLLR`; aligned so it never straddles 64 KiB.
 #[repr(C, align(8))]
 struct Lli([u32; 2]);
 
-/// The GPDMA channel that fills the capture ring.
 #[derive(Clone, Copy)]
 pub struct DmaCapture {
     dma: pac::gpdma::Gpdma,
     ch: usize,
-    /// Hardware request line for the capture USART's RX.
     request: u8,
     base: u32,
-    /// The USART receive data register the channel reads.
     src: u32,
-    /// Address of the linked-list item, written once at bring-up.
+    /// Written once at bring-up.
     lli: u32,
 }
 
@@ -94,10 +64,9 @@ impl DmaCapture {
         self.regs().cr().read().en()
     }
 
-    /// Arm the transfer at the ring's base, looped through the linked-list item.
     fn start(&self) {
         let ch = self.regs();
-        ch.cr().write(|w| w.set_reset(true));
+        crate::gpdma::halt(ch, &DMA_FAULTS);
         ch.fcr().write(|w| {
             w.set_dtef(true);
             w.set_htf(true);
@@ -125,19 +94,15 @@ impl DmaCapture {
         ch.sar().write_value(self.src);
         ch.dar().write_value(self.base);
         ch.llr().write_value(llr_value(self.lli));
-        // The linked-list item and the configuration must be visible before the enable.
+        // The linked-list item and configuration must be visible before the enable.
         fence(Ordering::SeqCst);
-        // A whole-register write: no interrupt enables, so the masked NVIC line stays silent.
+        // No interrupt enables: the masked NVIC line stays silent.
         ch.cr().write(|w| w.set_en(true));
     }
 
-    /// Stop the transfer and release the channel, leaving the ring memory alone.
+    /// Stop and release the channel, leaving the ring memory alone.
     fn halt(&self) {
-        let ch = self.regs();
-        suspend(ch);
-        ch.cr().write(|w| w.set_reset(true));
-        // The DMA's ring writes must be visible before the CPU reads the backlog out.
-        fence(Ordering::SeqCst);
+        crate::gpdma::halt(self.regs(), &DMA_FAULTS);
     }
 }
 
@@ -152,7 +117,7 @@ fn llr_value(lli: u32) -> pac::gpdma::regs::ChLlr {
 
 impl DmaRxChannel for DmaCapture {
     fn remaining(&self) -> usize {
-        // Bytes left in the current lap; at the wrap, 0 and the reload both fold to the base.
+        // At the wrap, 0 and the reload both fold to the base.
         self.regs().br1().read().bndt() as usize
     }
 
@@ -166,22 +131,22 @@ impl DmaRxChannel for DmaCapture {
     }
 }
 
-/// Raw USART SWO mechanism: divisor programming, plus arming and halting the capture channel.
+/// Raw USART SWO mechanism.
 pub struct UartSwoHw {
     uart: pac::usart::Usart,
-    /// The USART kernel-clock rate the divisors are computed against, sampled at construction.
+    /// USART kernel clock, sampled at construction.
     kernel_hz: u32,
     cap: DmaCapture,
 }
 
 impl SwoBackend for UartSwoHw {
     fn set_baudrate(&mut self, baud: u32) -> u32 {
-        // Round-to-nearest for OVER16; a rate outside the programmable range reports 0.
+        // Round-to-nearest for OVER16; an unrepresentable rate reports 0.
         let brr = (self.kernel_hz + baud / 2) / baud;
         if !(BRR_MIN..=BRR_MAX).contains(&brr) {
             return 0;
         }
-        // `BRR` is writable only while the USART is disabled; `RE` rides along in `CR1`.
+        // `BRR` is writable only while the USART is disabled.
         self.uart.cr1().modify(|w| w.set_ue(false));
         self.uart.brr().write(|w| w.set_brr(brr as u16));
         self.uart.cr1().modify(|w| w.set_ue(true));
@@ -189,7 +154,7 @@ impl SwoBackend for UartSwoHw {
     }
 
     fn prepare(&mut self) {
-        // Stop first, then drain: the other order refills from bytes that predate the session.
+        // Stop before draining, or the channel refills with stale bytes.
         self.cap.halt();
         let mut drained = 0;
         while drained < FIFO_DRAIN_BOUND && self.uart.isr().read().rxne() {
@@ -199,7 +164,7 @@ impl SwoBackend for UartSwoHw {
     }
 
     fn arm(&mut self) {
-        // The source re-based its cursor between `prepare` and here; this reload pairs with it.
+        // Pairs with the cursor re-base in `clear`.
         self.cap.start();
     }
 
@@ -208,13 +173,11 @@ impl SwoBackend for UartSwoHw {
     }
 }
 
-/// Consumer half of the capture ring: cursor arithmetic over the buffer the controller fills.
+/// Consumer half of the capture ring.
 pub struct DmaSwoRx {
-    /// Cursor and lap detection over the capture channel.
     ring: RefCell<DmaRxRing<DmaCapture>>,
-    /// The buffer the controller fills; read volatile, never written here.
+    /// Read volatile, never written here.
     mem: &'static [u8],
-    /// Sticky overrun, set by a lap.
     overrun: Cell<bool>,
 }
 
@@ -240,7 +203,7 @@ impl SwoSource for DmaSwoRx {
     }
 
     fn clear(&mut self) {
-        // Halted by `prepare` and re-armed by `arm`, so the re-base is paired with a reload.
+        // Pairs with the counter reload in `arm`.
         self.ring.borrow_mut().reset_cursor();
         self.overrun.set(false);
     }
@@ -250,9 +213,7 @@ impl SwoSource for DmaSwoRx {
     }
 }
 
-/// Bring a USART up (raw) as an RX-only SWO capture, permanently routing `rx` to it. The caller
-/// enables both peripheral clocks and supplies the kernel-clock rate, the pad's AF, and the
-/// channel's controller, index and request line. Call once per image.
+/// Bring a USART up as RX-only SWO capture on `rx`; the caller enables both clocks. Call once.
 #[allow(clippy::too_many_arguments)]
 pub fn uart_swo(
     uart: pac::usart::Usart,
@@ -264,7 +225,7 @@ pub fn uart_swo(
     request: u8,
     channel: Peri<'static, impl ChannelInstance>,
 ) -> UartSwo {
-    // AF before the mode switch, so the pad never presents a stale function; pull-up idles at mark.
+    // AF before the mode switch, so the pad never presents a stale function.
     let port = unsafe {
         // SAFETY: the PAC's own GPIOA block plus the fixed stride, for a port the caller owns.
         pac::gpio::Gpio::from_ptr(
@@ -276,7 +237,7 @@ pub fn uart_swo(
     port.pupdr().modify(|w| w.set_pupdr(pin, Pupdr::PULL_UP));
     port.moder().modify(|w| w.set_moder(pin, Moder::ALTERNATE));
 
-    // No USART condition may raise an interrupt; `OVRDIS` disables overrun detection here.
+    // No USART condition may raise an interrupt.
     uart.cr1().write(|_w| {});
     uart.presc().write(|_w| {});
     uart.brr()
@@ -297,17 +258,17 @@ pub fn uart_swo(
     let base = mem.as_ptr() as u32;
     let mem: &'static [u8] = &*mem;
 
-    // Constant for the life of the image; only the controller ever reads it back.
+    // Constant for the image's life; only the controller reads it.
     static LLI: ConstStaticCell<Lli> = ConstStaticCell::new(Lli([0; 2]));
     let lli = LLI.take();
     let lli_addr = lli as *const Lli as u32;
-    // SAFETY: `lli` is exclusively owned here; the words are `CDAR` then `CLLR`, the fetch order.
+    // SAFETY: `lli` is exclusively owned here.
     unsafe {
         core::ptr::write_volatile(&mut lli.0[0], base);
         core::ptr::write_volatile(&mut lli.0[1], llr_value(lli_addr).0);
     }
 
-    // The channel peripheral is claimed for ownership; the registers go through `dma`/`ch_index`.
+    // Claimed for ownership; registers go through `dma`/`ch_index`.
     let _ = channel;
     let cap = DmaCapture {
         dma,
@@ -317,7 +278,7 @@ pub fn uart_swo(
         src: uart.rdr().as_ptr() as u32,
         lli: lli_addr,
     };
-    // Left stopped: the host arms capture with DAP_SWO_Control(Start).
+    // Left stopped until `DAP_SWO_Control(Start)`.
     cap.halt();
 
     RingSwo::new(
@@ -332,4 +293,55 @@ pub fn uart_swo(
             overrun: Cell::new(false),
         },
     )
+}
+
+#[cfg(test)]
+pub(crate) fn stop_test() {
+    extern crate std;
+    use crate::gpdma::tests::{registers, reset_count, script, trapped, uart};
+    use daplink_rs::dap_rs::swo::{Swo, SwoControl};
+    let dma = registers();
+    let uart = uart();
+    let cap = DmaCapture {
+        dma,
+        ch: 0,
+        request: 1,
+        base: 0x2000_0100,
+        src: 0x4000_0000,
+        lli: 0x2000_1000,
+    };
+    let mem = std::boxed::Box::leak(std::boxed::Box::new([0u8; RING_LEN]));
+    let mut swo = RingSwo::new(
+        UartSwoHw {
+            uart,
+            kernel_hz: 100_000_000,
+            cap,
+        },
+        DmaSwoRx {
+            ring: RefCell::new(DmaRxRing::new(cap, RING_LEN)),
+            mem,
+            overrun: Cell::new(false),
+        },
+    );
+    assert_eq!(swo.set_baudrate(1_000_000), 1_000_000);
+    script(cap.regs(), (true, false, true), None, false);
+    trapped(|| {
+        swo.set_control(SwoControl::Start);
+    });
+    assert!(!swo.is_active());
+    assert_eq!(reset_count(cap.regs()), 0);
+    assert_eq!(cap.regs().dar().read(), 0);
+    script(cap.regs(), (false, true, false), None, false);
+    assert!(swo.set_control(SwoControl::Start));
+    assert!(swo.is_active());
+    let dar = cap.regs().dar().read();
+    script(cap.regs(), (true, false, false), None, false);
+    trapped(|| {
+        swo.set_control(SwoControl::Stop);
+    });
+    assert!(swo.is_active());
+    assert_eq!(cap.regs().dar().read(), dar);
+    script(cap.regs(), (true, true, true), None, false);
+    assert!(swo.set_control(SwoControl::Stop));
+    assert!(!swo.is_active());
 }

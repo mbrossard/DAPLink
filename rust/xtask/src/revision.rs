@@ -1,18 +1,28 @@
-//! The source revision handed to a firmware build, so its version stamp is fresh without
-//! `daplink-core`'s build script having to watch the tree for every image in the fleet.
+//! The source revision handed to firmware builds, so `daplink-core` need not watch the tree.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// The variable `daplink-core`'s build script reads in place of asking git itself.
 const VAR: &str = "DAPLINK_FW_REVISION";
+const ROW_VAR: &str = "DAPLINK_FW_ROW";
 
-/// Hand `cmd` the revision of the `rust/` tree, computed once per invocation. Host workspaces
-/// are deliberately left out: they are also built by plain `cargo`, and a variable that appears
-/// and disappears between the two would rebuild the crate each time it flipped.
+/// Name `row` in the image; only a build of a registry row can.
+pub fn stamp_row(cmd: &mut Command, row: &str) {
+    cmd.env(ROW_VAR, row);
+}
+
+/// Hand `cmd` the `rust/` revision; host workspaces skip it so plain `cargo` does not rebuild.
 pub fn stamp(cmd: &mut Command, rust_root: &Path) {
-    if let Some(rev) = current(rust_root) {
+    stamp_from(cmd, std::env::var_os(VAR), rust_root);
+}
+
+/// A non-empty inherited revision passes through unchanged; only its absence consults git.
+fn stamp_from(cmd: &mut Command, inherited: Option<OsString>, rust_root: &Path) {
+    if let Some(rev) = inherited.filter(|v| !v.is_empty()) {
+        cmd.env(VAR, rev);
+    } else if let Some(rev) = current(rust_root) {
         cmd.env(VAR, rev);
     }
 }
@@ -72,20 +82,33 @@ mod tests {
         assert_eq!(format("0123456789ab", true), "g0123456789ab-dirty");
     }
 
-    /// `stamp` hands the build script this tree's revision, or leaves the variable unset for it
-    /// to resolve; what it must never do is pass an empty or malformed one.
+    /// `stamp` passes this tree's revision or nothing, never an empty or malformed one.
     #[test]
     fn stamp_passes_this_trees_revision_or_nothing() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let mut cmd = Command::new("cargo");
-        stamp(&mut cmd, root);
-        let passed = cmd
-            .get_envs()
-            .find(|(k, _)| *k == VAR)
-            .map(|(_, v)| v.expect("a set variable").to_string_lossy().into_owned());
-        assert_eq!(passed, current(root).map(str::to_string));
-        if let Some(rev) = passed {
+        let root = &crate::root();
+        let stamped = passed(None, root);
+        assert_eq!(stamped, current(root).map(str::to_string));
+        assert_eq!(passed(Some(""), root), stamped);
+        if let Some(rev) = stamped {
             assert!(rev.starts_with('g') && rev.len() > 1, "{rev}");
         }
+    }
+
+    /// A caller's `DAPLINK_FW_REVISION` wins over git, so a pinned identity build stays pinned.
+    #[test]
+    fn stamp_passes_an_inherited_revision_through() {
+        let root = &crate::root();
+        assert_eq!(
+            passed(Some("gpinned0000"), root).as_deref(),
+            Some("gpinned0000")
+        );
+    }
+
+    fn passed(inherited: Option<&str>, root: &Path) -> Option<String> {
+        let mut cmd = Command::new("cargo");
+        stamp_from(&mut cmd, inherited.map(OsString::from), root);
+        cmd.get_envs()
+            .find(|(k, _)| *k == VAR)
+            .map(|(_, v)| v.expect("a set variable").to_string_lossy().into_owned())
     }
 }

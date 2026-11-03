@@ -1,20 +1,14 @@
-//! Minimal CMSIS-DAP v2 debug probe for the Raspberry Pi Pico 2 (RP2350) on embassy.
+//! CMSIS-DAP v2 probe for the Raspberry Pi Pico 2 (RP2350) on embassy.
 
 #![no_std]
 #![no_main]
 
-use core::cell::{Cell, RefCell};
-
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
-use embassy_futures::select::select;
 use embassy_rp::bind_interrupts;
+#[cfg(not(feature = "flash"))]
 use embassy_rp::gpio::Output;
-use embassy_rp::peripherals::{UART1, USB};
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::signal::Signal;
 use static_cell::ConstStaticCell;
 
 // A flash build latches the fault into `RESET_STAMP` and resets; every other build halts.
@@ -26,63 +20,67 @@ use panic_halt as _;
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
-use daplink_embassy_usb::{session_ended, session_epoch, DapV2Class};
+#[cfg(not(feature = "accel"))]
+use daplink_rp_embassy::IoPin;
+#[cfg(not(feature = "flash"))]
+use daplink_rp_embassy::Uart0Swo;
+#[cfg(feature = "flash")]
+use daplink_rp_embassy::UsbDrv;
 use daplink_rp_embassy::{
-    init as init_rp, reboot_watch, status_led, usb_task, vcom_baud_state, vcom_task, CycleDelay,
-    IoPin, RpUsbBoot, RpVcom, Uart0Swo, UsbDrv, VcomDmaInterruptHandler,
+    dap_sessions, init as init_rp, spawn_probe_services, status_led, vcom_baud_state, ClockProfile,
+    CycleDelay, RpUsbBoot, RpUsbDriver, VcomDmaInterruptHandler,
 };
 #[cfg(not(feature = "flash"))]
 use daplink_rs::daplink_core::DAP_FW_VERSION;
 use daplink_rs::daplink_core::{
-    product_string, DapConfig, DapQueue, QueueError, Submit, DAP_PACKET_SIZE, DEFAULT_VCOM_BAUD,
+    product_string, DapConfig, DapQueue, EndpointSize, PacketSize, DAP_PACKET_SIZE,
 };
-use daplink_rs::{Activity, RebootVendor, StatusLed, VcomBaudVendor, VcomStatsVendor, VendorChain};
-
-// One wire engine per image: `bitbang` wins where both are on.
-#[cfg(not(any(feature = "accel", feature = "bitbang")))]
-compile_error!("enable `accel` (the default wire engine) or `bitbang`");
+#[cfg(not(feature = "flash"))]
+use daplink_rs::StatusLed;
+use daplink_rs::{Activity, RebootVendor, VcomBaudVendor, VcomStatsVendor};
 
 #[cfg(feature = "carrier-leds")]
 use daplink_rp_embassy::{carrier_leds, CarrierBankLed};
 
-#[cfg(not(rp_accel))]
+// `--no-default-features` bit-bangs; default `accel` adds PIO1 complete-transfer SWD and JTAG.
+#[cfg(not(feature = "accel"))]
 use daplink_rp_embassy::probe_parts_pico2;
-#[cfg(all(not(rp_accel), not(feature = "flash")))]
+#[cfg(all(not(feature = "accel"), not(feature = "flash")))]
 use daplink_rs::BitbangDap;
 
-#[cfg(rp_accel)]
+#[cfg(feature = "accel")]
 use daplink_rp_embassy::probe_parts_pico2_accel;
-#[cfg(all(rp_accel, not(feature = "flash")))]
-use daplink_rp_pio::PioSwdJtagDap;
-#[cfg(rp_accel)]
-use daplink_rp_pio::{pio_swd_deps, PioBlock, PioSm, PioSwdPins};
-#[cfg(rp_accel)]
-use daplink_rs::ComposedJtagDeps;
-#[cfg(any(rp_accel, feature = "flash"))]
+#[cfg(all(feature = "accel", not(feature = "flash")))]
+use daplink_rp_pio::PioTransferDap;
+#[cfg(feature = "accel")]
+use daplink_rp_pio::{
+    pio_transfer_deps, PioJtagPins, PioSm, PioSwdPins, RpPioTransferEngine, RpPioTransferFence,
+};
+#[cfg(all(feature = "accel", feature = "flash"))]
+use daplink_rp_pio::{PioTransferDeps, PioTransferJtag, PioTransferSwd};
+#[cfg(any(feature = "accel", feature = "flash"))]
 use daplink_rs::ScanChainStorage;
 
-// The mass-storage drive and the vendor flash commands, both over the flash-wins mux.
 #[cfg(feature = "flash")]
 use daplink_embassy_usb::msc::MscEndpoints;
 #[cfg(feature = "flash")]
 use daplink_rp_embassy::RpUsbReconnect;
-#[cfg(all(feature = "flash", rp_accel))]
-use daplink_rp_pio::{PioSwdDeps, PioSwdDrv};
 #[cfg(feature = "flash")]
-use daplink_rs::flash_mux::{
-    role_build_flash_backend, role_mux_dap_engine_with_vendor, RoleMuxDapEngine,
-    RoleMuxFlashBackend,
-};
+use daplink_rs::flash_mux::{mux_dap_engine, mux_flash_backend, MuxFlashBackend};
+#[cfg(all(feature = "flash", feature = "accel"))]
+use daplink_rs::FencedFlashBackend;
 #[cfg(feature = "flash")]
 use daplink_rs::SwdMux;
-#[cfg(all(feature = "flash", rp_accel))]
-use daplink_rs::{ComposedJtagDrv, ComposedJtagSwd};
-#[cfg(all(feature = "flash", not(rp_accel)))]
+#[cfg(all(feature = "flash", not(feature = "accel")))]
 use daplink_rs::{LateJtag, LateJtagDeps, LateSwdDrv};
+#[cfg(feature = "flash-nrf52833")]
+use daplink_targets::targets::nrf52833::NRF52833;
+#[cfg(feature = "flash-nrf52840")]
+use daplink_targets::targets::nrf52840::NRF52840;
 #[cfg(feature = "flash-rp2040")]
 use daplink_targets::targets::rp2040::RP2040;
 #[cfg(feature = "flash-rp2350")]
-use daplink_targets::targets::rp235x::RP235x;
+use daplink_targets::targets::rp2350::RP2350;
 #[cfg(feature = "flash-stm32f401")]
 use daplink_targets::targets::stm32f401ce::STM32F401CE;
 #[cfg(feature = "flash")]
@@ -91,284 +89,199 @@ use daplink_vfs::{AllDecoders, FlashSink, FlashVolume, VendorFlash, VolumeStorag
 // embassy-rp owns __pre_init (SIO reset); interpose and tail-call the real one.
 daplink_rs::ram_text_pre_init!(wrapping);
 
-// The registry the flash spine selects from, derived from the rows below.
+#[cfg(feature = "flash-rp2040")]
+type PrimaryTarget = RP2040;
+#[cfg(feature = "flash-rp2040")]
+static PRIMARY: &PrimaryTarget = &RP2040;
+#[cfg(all(not(feature = "flash-rp2040"), feature = "flash-stm32f401"))]
+type PrimaryTarget = STM32F401CE;
+#[cfg(all(not(feature = "flash-rp2040"), feature = "flash-stm32f401"))]
+static PRIMARY: &PrimaryTarget = &STM32F401CE;
+#[cfg(all(
+    not(feature = "flash-rp2040"),
+    not(feature = "flash-stm32f401"),
+    feature = "flash-rp2350"
+))]
+type PrimaryTarget = RP2350;
+#[cfg(all(
+    not(feature = "flash-rp2040"),
+    not(feature = "flash-stm32f401"),
+    feature = "flash-rp2350"
+))]
+static PRIMARY: &PrimaryTarget = &RP2350;
+#[cfg(all(
+    feature = "flash-nrf52840",
+    not(any(
+        feature = "flash-rp2040",
+        feature = "flash-stm32f401",
+        feature = "flash-rp2350"
+    ))
+))]
+type PrimaryTarget = NRF52840;
+#[cfg(all(
+    feature = "flash-nrf52840",
+    not(any(
+        feature = "flash-rp2040",
+        feature = "flash-stm32f401",
+        feature = "flash-rp2350"
+    ))
+))]
+static PRIMARY: &PrimaryTarget = &NRF52840;
+#[cfg(all(
+    feature = "flash-nrf52833",
+    not(any(
+        feature = "flash-rp2040",
+        feature = "flash-stm32f401",
+        feature = "flash-rp2350",
+        feature = "flash-nrf52840"
+    ))
+))]
+type PrimaryTarget = NRF52833;
+#[cfg(all(
+    feature = "flash-nrf52833",
+    not(any(
+        feature = "flash-rp2040",
+        feature = "flash-stm32f401",
+        feature = "flash-rp2350",
+        feature = "flash-nrf52840"
+    ))
+))]
+static PRIMARY: &PrimaryTarget = &NRF52833;
+
 #[cfg(feature = "flash")]
 daplink_targets::target_table! {
     umbrella = "flash",
     count = TARGET_COUNT,
-    primary = PrimaryTarget,
     selector = Selector,
     scratch = SCRATCH,
-    primary_ref = PRIMARY,
     table = flash_table,
     buffer = flash_scratch,
     rows = [
         ("flash-rp2040", RP2040, daplink_targets::targets::rp2040::PROGRAM_BUFFER_SIZE),
         ("flash-stm32f401", STM32F401CE, daplink_targets::targets::stm32f401ce::PROGRAM_BUFFER_SIZE),
-        ("flash-rp2350", RP235x, daplink_targets::targets::rp235x::PROGRAM_BUFFER_SIZE),
+        ("flash-rp2350", RP2350, daplink_targets::targets::rp2350::PROGRAM_BUFFER_SIZE),
+        ("flash-nrf52840", NRF52840, daplink_targets::targets::nrf52840::PROGRAM_BUFFER_SIZE),
+        ("flash-nrf52833", NRF52833, daplink_targets::targets::nrf52833::PROGRAM_BUFFER_SIZE),
     ],
 }
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
-    UART1_IRQ => BufferedInterruptHandler<UART1>;
     DMA_IRQ_1 => VcomDmaInterruptHandler;
 });
 
 #[cfg(not(feature = "overclock-200mhz"))]
-const _: () = assert!(daplink_rp_embassy::CPU_HZ == 150_000_000);
+const CLOCK_PROFILE: ClockProfile = ClockProfile::DEFAULT;
 #[cfg(feature = "overclock-200mhz")]
-const _: () = assert!(daplink_rp_embassy::CPU_HZ == 200_000_000);
+const CLOCK_PROFILE: ClockProfile = ClockProfile::MHZ_200;
+#[cfg(feature = "accel")]
+const CPU_HZ: u32 = daplink_rp_pio::PioClock::expect(CLOCK_PROFILE.cpu_hz()).sys_hz();
 
-#[cfg(all(rp_accel, not(feature = "overclock-200mhz")))]
-const _: () = assert!(daplink_rp_pio::CYCLES_PER_BIT == 4);
-#[cfg(all(rp_accel, feature = "overclock-200mhz"))]
-const _: () = assert!(daplink_rp_pio::CYCLES_PER_BIT == 5);
+/// Pipelined CMSIS-DAP command-queue depth and advertised packet count.
+const DAP_PACKET_COUNT: u8 = 8;
+/// The DAP packet size the command queue holds.
+#[cfg(not(feature = "dap-packet-512"))]
+const DAP_PACKET_BYTES: u16 = DAP_PACKET_SIZE;
+#[cfg(feature = "dap-packet-512")]
+const DAP_PACKET_BYTES: u16 = 512;
+const DAP_QUEUE_DEPTH: usize = DAP_PACKET_COUNT as usize;
+const DAP_QUEUE_SLOT: usize = DAP_PACKET_BYTES as usize;
+type AppState = daplink_rp_embassy::AppState<DAP_QUEUE_DEPTH, DAP_QUEUE_SLOT>;
 
-/// The onboard status LED's concrete `DapLeds` type: GP25, active-high.
+const DAP_PACKET: PacketSize =
+    DapQueue::<DAP_QUEUE_DEPTH, DAP_QUEUE_SLOT>::packet_size::<DAP_PACKET_BYTES>();
+const DAP_ENDPOINT: EndpointSize =
+    DapQueue::<DAP_QUEUE_DEPTH, DAP_QUEUE_SLOT>::endpoint_size::<DAP_PACKET_SIZE>();
+
+/// The onboard status LED: GP25, active-high.
+#[cfg(not(feature = "flash"))]
 type StatusLedType = StatusLed<Output<'static>>;
 
-/// The reboot-to-bootloader vendor handler; a non-flash build has no session to gate it behind.
 #[cfg(not(feature = "flash"))]
-type RebootOnly =
-    VendorChain<RebootVendor<RpUsbBoot>, VendorChain<VcomBaudVendor, VcomStatsVendor>>;
+type RebootOnly = (RebootVendor<RpUsbBoot>, VcomBaudVendor, VcomStatsVendor);
 
-/// The bit-bang SWD+JTAG engine: UART0-RX SWO capture, status LED, reboot in the vendor slot.
-#[cfg(all(not(rp_accel), not(feature = "flash")))]
+#[cfg(all(not(feature = "accel"), not(feature = "flash")))]
 type Engine = BitbangDap<'static, IoPin, CycleDelay, Uart0Swo, RebootOnly, StatusLedType>;
 
-/// The accelerated engine: PIO SWD with fused CPU JTAG over the pad loan, same slots as above.
-#[cfg(all(rp_accel, not(feature = "flash")))]
-type Engine = PioSwdJtagDap<'static, PioSm, IoPin, CycleDelay, Uart0Swo, RebootOnly, StatusLedType>;
-
-/// The dap-rs dependency role of the one adapter the flash build arbitrates.
-#[cfg(all(feature = "flash", not(rp_accel)))]
-type MuxDeps = LateJtagDeps<IoPin, CycleDelay>;
-/// The SWD driver role of [`MuxDeps`].
-#[cfg(all(feature = "flash", not(rp_accel)))]
-type MuxSwd = LateSwdDrv<IoPin, CycleDelay>;
-/// The JTAG driver role of [`MuxDeps`].
-#[cfg(all(feature = "flash", not(rp_accel)))]
-type MuxJtag = LateJtag<IoPin, CycleDelay>;
-
-/// The accelerated spelling of [`MuxDeps`]: PIO SWD with fused CPU JTAG composed on.
-#[cfg(all(feature = "flash", rp_accel))]
-type MuxDeps = ComposedJtagDeps<PioSwdDeps<PioSm>, IoPin, CycleDelay>;
-/// The SWD driver role of [`MuxDeps`].
-#[cfg(all(feature = "flash", rp_accel))]
-type MuxSwd = ComposedJtagSwd<PioSwdDrv<PioSm>, IoPin, CycleDelay>;
-/// The JTAG driver role of [`MuxDeps`].
-#[cfg(all(feature = "flash", rp_accel))]
-type MuxJtag = ComposedJtagDrv<PioSwdDeps<PioSm>, IoPin, CycleDelay>;
-
-/// The flash-wins arbiter owning the one physical adapter.
-#[cfg(feature = "flash")]
-type Mux = SwdMux<MuxDeps, MuxSwd, MuxJtag>;
-/// The flash-algorithm runtime over an ungated flash-side handle on the mux.
-#[cfg(feature = "flash")]
-type Backend = RoleMuxFlashBackend<MuxDeps, MuxSwd, MuxJtag, CycleDelay, PrimaryTarget, Selector>;
-/// The image-fragment sink one flash front-end owns.
-#[cfg(feature = "flash")]
-type Sink = FlashSink<Backend>;
-/// The vendor slot's flash-busy gate: the mux's own live-session flag.
-#[cfg(feature = "flash")]
-type RebootBusy = &'static Mux;
-/// The reboot command, declined with `STATUS_BUSY` while [`RebootBusy`] reports a live flash
-/// session, chained ahead of the vendor flash-stream commands.
-#[cfg(feature = "flash")]
-type Vendor = VendorChain<
-    RebootVendor<RpUsbBoot, RebootBusy>,
-    VendorChain<VendorFlash<AllDecoders, Sink>, VendorChain<VcomBaudVendor, VcomStatsVendor>>,
->;
-/// The flash build's engine: gated by the mux, with the vendor flash commands composed in.
-#[cfg(feature = "flash")]
-type Engine = RoleMuxDapEngine<
+#[cfg(all(not(feature = "flash"), feature = "accel"))]
+type Engine = PioTransferDap<
     'static,
-    MuxDeps,
-    MuxSwd,
-    MuxJtag,
+    PioSm,
+    RpPioTransferEngine,
     CycleDelay,
     Uart0Swo,
-    Vendor,
+    RebootOnly,
     StatusLedType,
+    RpPioTransferFence,
 >;
 
-/// The one physical adapter's dependency value, inlined at its single use site in each build.
-#[cfg(not(rp_accel))]
+#[cfg(all(feature = "flash", not(feature = "accel")))]
+type MuxDeps = LateJtagDeps<IoPin, CycleDelay>;
+#[cfg(all(feature = "flash", not(feature = "accel")))]
+type MuxSwd = LateSwdDrv<IoPin, CycleDelay>;
+#[cfg(all(feature = "flash", not(feature = "accel")))]
+type MuxJtag = LateJtag<IoPin, CycleDelay>;
+
+#[cfg(all(feature = "flash", feature = "accel"))]
+type MuxDeps = PioTransferDeps<PioSm, RpPioTransferEngine>;
+#[cfg(all(feature = "flash", feature = "accel"))]
+type MuxSwd = PioTransferSwd<PioSm, RpPioTransferEngine>;
+#[cfg(all(feature = "flash", feature = "accel"))]
+type MuxJtag = PioTransferJtag<PioSm, RpPioTransferEngine>;
+
+#[cfg(feature = "flash")]
+type Mux = SwdMux<MuxDeps, MuxSwd, MuxJtag>;
+#[cfg(feature = "flash")]
+type RawBackend = MuxFlashBackend<MuxDeps, MuxSwd, MuxJtag, CycleDelay, PrimaryTarget, Selector>;
+#[cfg(all(feature = "flash", not(feature = "accel")))]
+type Backend = RawBackend;
+#[cfg(all(feature = "flash", feature = "accel"))]
+type Backend = FencedFlashBackend<RawBackend, &'static RpPioTransferFence>;
+#[cfg(feature = "flash")]
+type Sink = FlashSink<Backend>;
+#[cfg(feature = "flash")]
+type RebootBusy = &'static Mux;
+/// Reboot, declined with `STATUS_BUSY` during a live flash session.
+#[cfg(feature = "flash")]
+type Vendor = (
+    RebootVendor<RpUsbBoot, RebootBusy>,
+    VendorFlash<AllDecoders, Sink>,
+    VcomBaudVendor,
+    VcomStatsVendor,
+);
+#[cfg(not(feature = "accel"))]
 macro_rules! probe_deps {
-    ($parts:expr, $delay:expr) => {
+    ($parts:expr) => {
         $parts.deps
     };
 }
 
-/// The accelerated spelling of [`probe_deps`]: PIO0 on SWCLK/SWDIO, fused CPU JTAG over the loan.
-#[cfg(rp_accel)]
+#[cfg(feature = "accel")]
 macro_rules! probe_deps {
-    ($parts:expr, $delay:expr) => {{
+    ($parts:expr) => {{
         static SCAN: ScanChainStorage<{ daplink_rs::daplink_core::SCAN_CHAIN_SLOTS }> =
             ScanChainStorage::new();
         let pins = PioSwdPins {
             swclk: $parts.swclk,
             swdio_out: $parts.swdio,
-            // One bidirectional wire and no level shifter, so no separate readback or OE pad.
             swdio_in: None,
             oen: None,
             nreset: Some($parts.nreset),
         };
-        // SAFETY: the bring-up above hands over PIO0 and these pads, and this runs once.
-        let deps = unsafe { pio_swd_deps(PioBlock::Pio0, pins, daplink_rp_embassy::CPU_HZ, &SCAN) };
-        ComposedJtagDeps::new(deps, $parts.jtag_lines, $delay)
+        let jtag = PioJtagPins {
+            tck: $parts.swclk,
+            tms: $parts.swdio,
+            tdi: $parts.tdi,
+            tdo: $parts.tdo,
+        };
+        // SAFETY: bring-up reserved both PIO blocks and these pads; this is PIO1's sole owner.
+        unsafe { pio_transfer_deps(pins, jtag, CPU_HZ, &SCAN) }
     }};
 }
 
-/// Pipelined CMSIS-DAP command-queue depth, also the advertised `DAP_PACKET_COUNT`.
-const DAP_QUEUE_DEPTH: usize = 8;
-
-/// Per-slot byte capacity of the command queue: one full-speed DAP v2 bulk packet.
-const DAP_QUEUE_SLOT: usize = DAP_PACKET_SIZE as usize;
-
-/// This image's command queue: the depth the host is told about and the storage behind it.
-type Queue = DapQueue<DAP_QUEUE_DEPTH, DAP_QUEUE_SLOT>;
-
-/// The `DAP_Info(MaxPacketCount)` this image advertises; fed to the engine below.
-const DAP_PACKET_COUNT: u8 = 8;
-
-// Advertised count, ring depth and slot size are one fact; widening one alone fails the build.
-const _: () = {
-    assert!(Queue::new().depth() == DAP_PACKET_COUNT as usize);
-    assert!(Queue::new().packet_capacity() == DAP_PACKET_SIZE as usize);
-};
-
-/// Pipelined CMSIS-DAP loop: a reader fills the queue, an executor runs and answers the oldest.
-/// `dap_led` pulses once per command; `flash_led` tracks whether the flash mux holds the wire.
-async fn dap_loop_pipelined<D: Activity, F: Activity>(
-    class: &mut DapV2Class<UsbDrv>,
-    dap: &mut Engine,
-    queue: &RefCell<Queue>,
-    mut dap_led: D,
-    mut flash_led: F,
-    #[cfg(feature = "flash")] flash_mux: &'static Mux,
-) -> ! {
-    loop {
-        class.wait_connection().await;
-        // Snapshot after the connection is up, so this session's own boundary cannot end it.
-        let session = session_epoch();
-        // Start clean: drop anything a prior session left queued, and clear a stale abort.
-        queue.borrow_mut().reset();
-
-        // Edge-triggered coordination, fresh per connection; one task, so `NoopRawMutex`.
-        let request_available: Signal<NoopRawMutex, ()> = Signal::new();
-        let slot_freed: Signal<NoopRawMutex, ()> = Signal::new();
-        // Set by whichever future first sees the host leave, so the other stops and the join ends.
-        let disconnected: Cell<bool> = Cell::new(false);
-        // Commands run this connection; a one-line summary at disconnect, not a line per packet.
-        #[cfg(feature = "defmt")]
-        let processed: Cell<u32> = Cell::new(0);
-
-        let (mut reader, mut writer) = class.split();
-        let dap = &mut *dap;
-        let (dap_led, flash_led) = (&mut dap_led, &mut flash_led);
-
-        // Reader: pull OUT packets into the request ring; no borrow is held across an await.
-        let reader_fut = async {
-            let mut req = [0u8; DAP_QUEUE_SLOT];
-            loop {
-                let Ok(n) = reader.read_command(&mut req).await else {
-                    disconnected.set(true);
-                    request_available.signal(());
-                    return;
-                };
-                loop {
-                    let outcome = queue.borrow_mut().submit(&req[..n]);
-                    match outcome {
-                        Ok(Submit::Enqueued) => {
-                            request_available.signal(());
-                            break;
-                        }
-                        // Neither enqueues, so neither wakes the executor.
-                        Ok(Submit::AbortIntercepted | Submit::Dropped) => break,
-                        // Ring full: wait for a freed slot, unless the executor has stopped.
-                        Err(QueueError::Full) => {
-                            if disconnected.get() {
-                                return;
-                            }
-                            slot_freed.wait().await;
-                        }
-                        // Unreachable: the slot capacity is the endpoint packet size.
-                        Err(QueueError::Oversized) => break,
-                    }
-                }
-            }
-        };
-
-        // Executor: run the oldest queued command, then drain every ready response to the host.
-        let executor_fut = async {
-            let mut cmd = [0u8; DAP_QUEUE_SLOT];
-            let mut resp = [0u8; DAP_QUEUE_SLOT];
-            loop {
-                let taken = queue.borrow_mut().take_request(&mut cmd);
-                let Some(n) = taken else {
-                    // Nothing to run: stop if the host is gone, else park until a request lands.
-                    if disconnected.get() {
-                        return;
-                    }
-                    request_available.wait().await;
-                    continue;
-                };
-                // A request slot just opened; let a backpressured reader proceed.
-                slot_freed.signal(());
-
-                let len = dap.process_command(&cmd[..n], &mut resp);
-                #[cfg(feature = "defmt")]
-                processed.set(processed.get() + 1);
-                dap_led.pulse();
-                #[cfg(feature = "flash")]
-                let flashing = flash_mux.is_flashing();
-                #[cfg(not(feature = "flash"))]
-                let flashing = false;
-                flash_led.level(flashing);
-
-                if queue.borrow_mut().post_response(&resp[..len]).is_err() {
-                    // The drain below empties the ring before the next command is taken.
-                    debug_assert!(false, "response ring full after a single command");
-                    #[cfg(feature = "defmt")]
-                    defmt::warn!("dap: response ring full, response dropped");
-                }
-                // Retire under the peek's generation, never the next session's packet.
-                loop {
-                    let peeked = {
-                        let q = queue.borrow();
-                        (q.generation(), q.peek_response(&mut resp))
-                    };
-                    let (generation, Some(l)) = peeked else { break };
-                    if writer.write_response(&resp[..l]).await.is_err() {
-                        disconnected.set(true);
-                        // Release a reader parked on a full ring, so the join can complete.
-                        slot_freed.signal(());
-                        return;
-                    }
-                    if !queue.borrow_mut().discard_response_for(generation) {
-                        break;
-                    }
-                }
-            }
-        };
-
-        // The boundary must be the first arm, so a write parked on a dead session is dropped.
-        select(session_ended(session), join(reader_fut, executor_fut)).await;
-        #[cfg(feature = "defmt")]
-        defmt::info!("dap session: {=u32} commands processed", processed.get());
-
-        // Host gone: release the wire so protocol state cannot leak into the next session.
-        dap.suspend();
-    }
-}
-
-/// Carrier heartbeat period: the one "firmware is alive" signal independent of host traffic.
 #[cfg(feature = "carrier-leds")]
 const HEARTBEAT_PERIOD_MS: u64 = 500;
 
-/// Periodic heartbeat blink, spawned once when the carrier debug bank is wired.
 #[cfg(feature = "carrier-leds")]
 #[embassy_executor::task]
 async fn heartbeat_task(mut led: CarrierBankLed) -> ! {
@@ -378,7 +291,6 @@ async fn heartbeat_task(mut led: CarrierBankLed) -> ! {
     }
 }
 
-/// Mass-storage bulk transport: the CBW/CSW cycle, bouncing D+ on each post-transfer remount.
 #[cfg(feature = "flash")]
 #[embassy_executor::task]
 async fn msc_task(
@@ -388,39 +300,80 @@ async fn msc_task(
     daplink_embassy_usb::msc::msc_task_with_reconnect(&mut msc, vfs, RpUsbReconnect).await
 }
 
-/// Reset-surviving probe state (boot counter, last transfer status) in `.uninit` RAM; on this
-/// part only a power cycle clears it.
 #[cfg(feature = "flash")]
-#[link_section = ".uninit.RESET_STAMP"]
-static mut RESET_STAMP: core::mem::MaybeUninit<daplink_vfs::ResetStamp> =
-    core::mem::MaybeUninit::uninit();
+daplink_vfs::retained_stamp!();
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    // Boot the stamp first: it arms the fault latch, and everything below can panic.
-    // SAFETY: `RESET_STAMP` is only touched here, once, before anything concurrent runs.
+#[cfg(feature = "flash")]
+type Engine = daplink_rs::flash_mux::MuxDapEngine<
+    'static,
+    MuxDeps,
+    MuxSwd,
+    MuxJtag,
+    CycleDelay,
+    daplink_rp_embassy::Uart0Swo,
+    Vendor,
+    daplink_rs::StatusLed<embassy_rp::gpio::Output<'static>>,
+    EngineFence,
+>;
+#[cfg(all(feature = "flash", feature = "accel"))]
+type EngineFence = &'static RpPioTransferFence;
+#[cfg(all(feature = "flash", not(feature = "accel")))]
+type EngineFence = daplink_rs::NoCommandFence;
+
+#[cfg(feature = "carrier-leds")]
+type FlowLed = CarrierBankLed;
+#[cfg(not(feature = "carrier-leds"))]
+type FlowLed = ();
+
+/// What the DAP loop keeps from the boot-time composition.
+struct Composed {
+    engine: &'static mut Engine,
+    class: daplink_embassy_usb::DapV2Class<daplink_rp_embassy::UsbDrv>,
     #[cfg(feature = "flash")]
-    let stamp = daplink_vfs::ResetStamp::boot_in_place(unsafe {
-        &mut *core::ptr::addr_of_mut!(RESET_STAMP)
-    });
+    mux: &'static Mux,
+    dap_led: FlowLed,
+    flash_led: FlowLed,
+}
+
+/// Boot-time composition, kept out of the main future so its temporaries leave the poll frame.
+#[inline(never)]
+fn setup(spawner: Spawner) -> Composed {
+    #[cfg(feature = "flash")]
+    let stamp = unsafe {
+        // SAFETY: dedicated NOLOAD SRAM is readable at entry; no DMA or other core accesses it.
+        daplink_vfs::stamp::boot_retained(core::ptr::addr_of_mut!(__daplink_retained_stamp).cast())
+    };
+    #[cfg(all(feature = "flash", not(feature = "defmt")))]
+    // SAFETY: only this core runs terminal, non-returning fault handlers.
+    unsafe {
+        daplink_vfs::stamp::arm_terminal_faults(stamp.fault)
+    };
 
     #[cfg(feature = "defmt")]
     defmt::info!("rp2350-pico2-embassy: boot");
 
-    let p = init_rp();
-    let delay = CycleDelay::new();
-    #[cfg(not(rp_accel))]
+    let p = init_rp(CLOCK_PROFILE);
+    let delay = CycleDelay::new(CLOCK_PROFILE);
+    #[cfg(not(feature = "accel"))]
     let parts = probe_parts_pico2(p, delay);
-    #[cfg(rp_accel)]
+    #[cfg(feature = "accel")]
     let parts = probe_parts_pico2_accel(p);
-    let cfg = DapConfig::daplink(parts.serial).with_product(product_string!("rp2350"));
+    let cfg = DapConfig::daplink(parts.serial, DAP_ENDPOINT)
+        .with_product(product_string!("rp2350-pico2"));
+    let identity = daplink_rs::daplink_core::Identity {
+        vendor: cfg.manufacturer,
+        product: cfg.product,
+        serial: cfg.serial,
+        board_vendor: "daplink-rs",
+        board_name: "rp2350-pico2",
+    };
     #[cfg(feature = "defmt")]
     defmt::info!("rp2350-pico2-embassy: serial {=str}", parts.serial);
     let status_led = status_led(parts.status_pin);
     #[cfg(feature = "carrier-leds")]
     let carrier = carrier_leds(parts.carrier_pins);
 
-    // SWO capture: the DMA ring fills from UART0 RX, halted until DAP_SWO_Control(Start).
+    // SWO: the UART0 RX DMA ring stays halted until DAP_SWO_Control(Start).
     #[cfg(not(feature = "carrier-leds"))]
     let swo = parts.swo;
     #[cfg(feature = "carrier-leds")]
@@ -435,65 +388,77 @@ async fn main(spawner: Spawner) {
     spawner.spawn(heartbeat_task(carrier.heartbeat).expect("heartbeat_task spawns once"));
 
     #[cfg(not(feature = "flash"))]
-    let mut engine: Engine = Engine::with_vendor(
-        probe_deps!(parts, delay),
-        status_led,
-        delay,
-        swo,
-        DAP_FW_VERSION,
-        cfg.max_packet_size,
-        VendorChain::new(
-            RebootVendor::new(RpUsbBoot),
-            VendorChain::new(
+    let engine: Engine = {
+        #[cfg(not(feature = "accel"))]
+        let deps = probe_deps!(parts);
+        #[cfg(feature = "accel")]
+        let (deps, fence) = probe_deps!(parts);
+        let engine = daplink_rs::DapProbe::with_vendor(
+            deps,
+            status_led,
+            delay,
+            swo,
+            DAP_FW_VERSION,
+            DAP_PACKET,
+            (
+                RebootVendor::new(RpUsbBoot),
                 VcomBaudVendor::new(vcom_baud_state),
                 VcomStatsVendor::new(daplink_embassy_usb::vcom_counters),
             ),
-        ),
-    )
-    .with_packet_count(DAP_PACKET_COUNT);
+        );
+        #[cfg(feature = "accel")]
+        let engine = engine.with_command_fence(fence);
+        engine
+            .with_packet_count(DAP_PACKET_COUNT)
+            .with_identity(identity)
+    };
     #[cfg(feature = "flash")]
-    let (mut engine, vfs, mux) = {
+    let (engine, vfs, mux) = {
         static MUX: static_cell::StaticCell<Mux> = static_cell::StaticCell::new();
         static MUX_SCAN: ScanChainStorage<{ daplink_rs::daplink_core::SCAN_CHAIN_SLOTS }> =
             ScanChainStorage::new();
-        // Two front-ends, two backends; the mux grants one session and refuses the other.
         static VENDOR_SCRATCH: ConstStaticCell<[u8; SCRATCH]> = ConstStaticCell::new([0; SCRATCH]);
         static VOLUME: VolumeStorage<Sink> = VolumeStorage::new();
 
-        let mux: &'static Mux = MUX.init(SwdMux::new(probe_deps!(parts, delay)));
+        #[cfg(not(feature = "accel"))]
+        let deps = probe_deps!(parts);
+        #[cfg(feature = "accel")]
+        let (deps, fence) = probe_deps!(parts);
+        #[cfg(feature = "accel")]
+        let fence: &'static RpPioTransferFence = {
+            static FENCE: static_cell::StaticCell<RpPioTransferFence> =
+                static_cell::StaticCell::new();
+            FENCE.init(fence)
+        };
+        let mux: &'static Mux = MUX.init(SwdMux::new(deps));
         let table = flash_table();
-        let vendor_backend: Backend =
-            role_build_flash_backend(mux, delay, PRIMARY, table, VENDOR_SCRATCH.take());
-        let engine = role_mux_dap_engine_with_vendor(
-            mux,
-            delay,
-            swo,
-            cfg.max_packet_size,
-            &MUX_SCAN,
-            VendorChain::new(
-                RebootVendor::with_busy_check(RpUsbBoot, mux),
-                VendorChain::new(
-                    VendorFlash::new(FlashSink::new(vendor_backend)),
-                    VendorChain::new(
-                        VcomBaudVendor::new(vcom_baud_state),
-                        VcomStatsVendor::new(daplink_embassy_usb::vcom_counters),
-                    ),
-                ),
-            ),
-            status_led,
-        )
-        .with_packet_count(DAP_PACKET_COUNT);
-        let vfs_backend: Backend =
-            role_build_flash_backend(mux, delay, PRIMARY, table, flash_scratch());
+        let vendor_backend = mux_flash_backend(mux, delay, PRIMARY, table, VENDOR_SCRATCH.take());
+        #[cfg(feature = "accel")]
+        let vendor_backend = FencedFlashBackend::new(vendor_backend, fence);
+        let vendor: Vendor = (
+            RebootVendor::with_busy_check(RpUsbBoot, mux),
+            VendorFlash::new(FlashSink::new(vendor_backend)),
+            VcomBaudVendor::new(vcom_baud_state),
+            VcomStatsVendor::new(daplink_embassy_usb::vcom_counters),
+        );
+        let engine = mux_dap_engine(mux, delay, swo, DAP_PACKET, &MUX_SCAN, vendor, status_led);
+        #[cfg(feature = "accel")]
+        let engine = engine.with_command_fence(fence);
+        let engine = engine
+            .with_packet_count(DAP_PACKET_COUNT)
+            .with_identity(identity);
+        let vfs_backend = mux_flash_backend(mux, delay, PRIMARY, table, flash_scratch());
+        #[cfg(feature = "accel")]
+        let vfs_backend = FencedFlashBackend::new(vfs_backend, fence);
         let vfs = daplink_vfs::assemble_info(
             &VOLUME,
             FlashSink::new(vfs_backend),
             daplink_vfs::DeviceInfo {
                 version: env!("CARGO_PKG_VERSION"),
                 serial: parts.serial,
-                reset_count: stamp.reset_count(),
+                reset_count: stamp.snapshot.reset_count(),
             },
-            Some(stamp),
+            Some((stamp.snapshot, stamp.status, stamp.steady)),
             "DAPLINK",
         );
         (engine, vfs, mux)
@@ -509,32 +474,20 @@ async fn main(spawner: Spawner) {
         .modify(|w| w.set_phy_iso(false));
     embassy_rp::pac::USB.inte().write(|_w| {});
 
+    let (usb_io, vcom_io) = parts.io.split();
+    let driver = RpUsbDriver::new(Driver::new(usb_io, Irqs));
+    // `Driver::new` zeroes `LINESTATE_TUNING`; the datasheet says to keep its reset value.
+    embassy_rp::pac::USB
+        .linestate_tuning()
+        .write_value(embassy_rp::pac::usb::regs::LinestateTuning(0x0f8));
     #[cfg(not(feature = "flash"))]
-    let (usb, mut class, cdc_tx, cdc_rx, control) =
-        daplink_embassy_usb::usb_device(Driver::new(parts.io.usb, Irqs), &cfg);
+    let (usb, class, cdc_tx, cdc_rx, control) = daplink_embassy_usb::usb_device(driver, &cfg);
     #[cfg(feature = "flash")]
-    let (usb, mut class, cdc_tx, cdc_rx, control, msc) =
-        daplink_embassy_usb::usb_device_msc(Driver::new(parts.io.usb, Irqs), &cfg);
-    spawner.spawn(usb_task(usb).expect("usb_task spawns once"));
-    spawner.spawn(reboot_watch().expect("reboot_watch spawns once"));
+    let (usb, class, cdc_tx, cdc_rx, control, msc) =
+        daplink_embassy_usb::usb_device_msc(driver, &cfg);
     #[cfg(feature = "flash")]
     spawner.spawn(msc_task(msc, vfs).expect("msc_task spawns once"));
 
-    // VCOM UART1: TX=GP4, RX=GP5, wired to the target's serial port on the carrier.
-    let mut uart_cfg = UartConfig::default();
-    uart_cfg.baudrate = DEFAULT_VCOM_BAUD;
-    // RX ring covers 22 ms at the top baud, so a service gap that long costs no byte.
-    static TX_BUF: ConstStaticCell<[u8; 128]> = ConstStaticCell::new([0; 128]);
-    static RX_BUF: ConstStaticCell<[u8; 2048]> = ConstStaticCell::new([0; 2048]);
-    let uart = BufferedUart::new(
-        parts.io.uart,
-        parts.io.uart_tx,
-        parts.io.uart_rx,
-        Irqs,
-        TX_BUF.take(),
-        RX_BUF.take(),
-        uart_cfg,
-    );
     #[cfg(feature = "carrier-leds")]
     let vcom_led: &'static mut dyn Activity = {
         static VCOM_LED: static_cell::StaticCell<CarrierBankLed> = static_cell::StaticCell::new();
@@ -542,43 +495,54 @@ async fn main(spawner: Spawner) {
     };
     #[cfg(not(feature = "carrier-leds"))]
     let vcom_led: &'static mut dyn Activity = daplink_rs::noop_activity();
-    spawner.spawn(
-        vcom_task(
-            cdc_tx,
-            cdc_rx,
-            control,
-            RpVcom::new(
-                uart,
-                parts.io.vcom_rx_dma,
-                parts.io.vcom_chain_dma,
-                parts.io.vcom_tx_dma,
-            ),
-            DEFAULT_VCOM_BAUD,
-            vcom_led,
-        )
-        .expect("vcom_task spawns once"),
-    );
-
-    // Composition finished, so this boot is not a reset loop: forgive the fault streak.
-    #[cfg(feature = "flash")]
-    daplink_vfs::stamp::clear_fault_streak();
+    spawn_probe_services(spawner, usb, cdc_tx, cdc_rx, control, vcom_io, vcom_led);
 
     #[cfg(feature = "carrier-leds")]
     let (dap_led, flash_led) = (carrier.dap, carrier.flash);
     #[cfg(not(feature = "carrier-leds"))]
     let (dap_led, flash_led) = ((), ());
 
-    // Caller-owned queue storage; `DAP_PACKET_COUNT` above names the same depth.
-    static DAP_QUEUE: ConstStaticCell<RefCell<Queue>> =
-        ConstStaticCell::new(RefCell::new(Queue::new()));
-    let queue = DAP_QUEUE.take();
+    static ENGINE: static_cell::StaticCell<Engine> = static_cell::StaticCell::new();
+    Composed {
+        engine: ENGINE.init(engine),
+        class,
+        #[cfg(feature = "flash")]
+        mux,
+        dap_led,
+        flash_led,
+    }
+}
 
-    #[cfg(feature = "flash")]
-    {
-        dap_loop_pipelined(&mut class, &mut engine, queue, dap_led, flash_led, mux).await
-    }
-    #[cfg(not(feature = "flash"))]
-    {
-        dap_loop_pipelined(&mut class, &mut engine, queue, dap_led, flash_led).await
-    }
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let Composed {
+        engine,
+        class,
+        #[cfg(feature = "flash")]
+        mux,
+        mut dap_led,
+        mut flash_led,
+    } = setup(spawner);
+    static APP_STATE: ConstStaticCell<AppState> = ConstStaticCell::new(AppState::new());
+    dap_sessions::<{ cfg!(feature = "defmt") }, _, _, _, _, _, _>(
+        class,
+        APP_STATE.take(),
+        engine,
+        |dap, request, response| {
+            let len = dap.process_command(request, response);
+            dap_led.pulse();
+            #[cfg(feature = "flash")]
+            let flashing = mux.is_flashing();
+            #[cfg(not(feature = "flash"))]
+            let flashing = false;
+            flash_led.level(flashing);
+            len
+        },
+        |dap| dap.suspend(),
+        |_dap, _processed| {
+            #[cfg(feature = "defmt")]
+            defmt::info!("dap session: {=u32} commands processed", _processed);
+        },
+    )
+    .await
 }

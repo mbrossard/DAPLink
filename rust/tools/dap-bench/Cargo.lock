@@ -144,8 +144,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dap-conformance",
+ "firmware-row",
  "nusb",
 ]
+
+[[package]]
+name = "dap-conformance"
+version = "0.1.0"
 
 [[package]]
 name = "errno"
@@ -156,6 +162,10 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "firmware-row"
+version = "0.1.0"
 
 [[package]]
 name = "futures-core"

@@ -1,5 +1,4 @@
-//! Streams the encoder never produced, judged against ground truth carried by the mutation
-//! itself, so the classifier's verdicts are checked for soundness rather than self-consistency.
+//! Mutated streams judged against ground truth the mutation carries, checking verdict soundness.
 
 use daplink_test_protocol::v1::{
     Direction, Encoder, Frame, FrameKind, RxCounters, Verifier, FRAME_LEN, MAGIC,
@@ -50,7 +49,6 @@ impl Case {
         }
     }
 
-    /// The clean wire image of the whole run.
     fn wire(&self) -> Vec<u8> {
         let mut encoder = Encoder::new(Direction::DutToHost, self.seed, self.interval, self.budget);
         let mut out = vec![0u8; 4 * self.budget as usize + 512];
@@ -147,8 +145,7 @@ fn a_spliced_gap_is_charged_to_the_sender_at_exactly_its_size() {
         let geom = Case::draw(&mut rng);
         let clean = geom.wire();
         let d = rng.range(1, u64::from(geom.interval)) as usize;
-        // The gap must end before the payload run the end-of-stream frame closes: a gap in
-        // that tail leaves no later frame to anchor on, and only reconciliation can see it.
+        // The gap must end before the tail run, which has no later frame to anchor on.
         let period = geom.interval as usize + FRAME_LEN;
         let full = (geom.budget / u64::from(geom.interval)) as usize;
         let limit = if !geom.budget.is_multiple_of(u64::from(geom.interval)) {
@@ -157,8 +154,7 @@ fn a_spliced_gap_is_charged_to_the_sender_at_exactly_its_size() {
             (full - 1) * period
         };
         let at = rng.below((limit - d + 1) as u64) as usize;
-        // From the gap's span, slot plus frame buffer must still fit before the end-of-stream
-        // frame, or the verifier consumes it blind and only reconciliation sees the loss.
+        // Slot plus frame buffer must fit before the end-of-stream frame, or only reconciliation sees the loss.
         if clean.len() - (at / period) * period - d < geom.interval as usize + FRAME_LEN {
             continue;
         }
@@ -316,8 +312,7 @@ fn marker_bait_inside_a_resync_window_does_not_bend_the_ledger() {
         let period = geom.interval as usize + FRAME_LEN;
         let interval = geom.interval as usize;
         let spans = (geom.budget / u64::from(geom.interval)) as usize;
-        // Bait span s+1's payload with a bare magic, then open the window over it by deleting
-        // `d` bytes out of span s's payload; both spans land inside the one resync window.
+        // Bait span s+1 with a bare magic, then open one resync window over both spans by deleting from span s.
         let s = rng.below(spans as u64 - 1) as usize;
         let bait = (s + 1) * period + rng.below(interval as u64 - 7) as usize;
         clean[bait..bait + 4].copy_from_slice(&MAGIC);

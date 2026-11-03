@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use daplink_test_protocol as proto;
 
+use crate::load::DapLoad;
 use crate::{rtt, util, Ctx, Failure};
 
 /// Bauds exercised, low to high; the top one is the DUT clock's own stretch.
@@ -16,8 +17,24 @@ const PAYLOAD_LEN: usize = 64;
 /// How far the DUT's realized baud may sit from the requested rate.
 const BAUD_TOLERANCE_PCT: u32 = 2;
 
+/// The one rate the loaded variant runs: the top of the sweep.
+const LOAD_BAUD: u32 = 921_600;
+
+/// Reads the loaded variant requires of its DAP loop before the echo result counts as loaded.
+const MIN_LOAD_READS: u64 = 16;
+
 /// Run each baud in turn: a mismatch or timeout is a failure; a lost probe/session is fatal.
 pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
+    inner(cx, false)
+}
+
+/// The same echo at one rate, with a `read_32` loop running; both must hold.
+pub(crate) fn run_loaded(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
+    inner(cx, true)
+}
+
+fn inner(cx: &mut Ctx, loaded: bool) -> Result<(), Failure> {
+    let read_addr = cx.read_addr;
     let name = port_name(cx).map_err(Failure::Failed)?;
     let dut_elf = cx.dut_elf.clone();
     let session = cx
@@ -33,7 +50,12 @@ pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
 
     // Fixed seed: the payload is synthetic but reproducible run to run.
     let payload = util::Rng::new(0x5641_434f_4d31).payload(PAYLOAD_LEN);
-    for &baud in BAUDS {
+    let mut load = DapLoad::new(read_addr);
+    let bauds: &[u32] = if loaded { &[LOAD_BAUD] } else { BAUDS };
+    // A v1 run left armed feeds received bytes to its verifier instead of echoing them.
+    rtt::exchange(&mut rtt, &mut core, b"V1 RESET\n", proto::v1::OK_V1_RESET)
+        .map_err(|e| Failure::Failed(format!("disarm the DUT's v1 run: {e}")))?;
+    for &baud in bauds {
         let seen = rtt::exchange(
             &mut rtt,
             &mut core,
@@ -73,6 +95,9 @@ pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut buf = [0u8; PAYLOAD_LEN];
         while got.len() < payload.len() && Instant::now() < deadline {
+            if loaded {
+                load.tick(&mut core);
+            }
             match port.read(&mut buf) {
                 Ok(n) => got.extend_from_slice(&buf[..n]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
@@ -86,6 +111,13 @@ pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
                 util::hex(&got)
             )));
         }
+        // A short echo can finish before the loop has run enough; keep it going to the floor.
+        while loaded && load.needs_more(MIN_LOAD_READS) {
+            load.tick(&mut core);
+        }
+    }
+    if loaded {
+        load.progress(MIN_LOAD_READS).map_err(Failure::Failed)?;
     }
     Ok(())
 }

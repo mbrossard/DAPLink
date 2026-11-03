@@ -231,6 +231,7 @@ name = "daplink-spi-swd"
 version = "0.1.0"
 dependencies = [
  "dap-rs",
+ "daplink-core",
 ]
 
 [[package]]
@@ -241,10 +242,19 @@ dependencies = [
  "critical-section",
  "daplink-embassy-usb",
  "daplink-rs",
- "daplink-spi-swd",
  "embassy-stm32",
  "embassy-time",
+ "embassy-usb-driver",
  "static_cell",
+]
+
+[[package]]
+name = "daplink-stm32f1-spi-swd"
+version = "0.1.0"
+dependencies = [
+ "daplink-rs",
+ "daplink-spi-swd",
+ "stm32f1",
 ]
 
 [[package]]
@@ -261,6 +271,7 @@ dependencies = [
  "critical-section",
  "daplink-core",
  "daplink-decoder",
+ "defmt 1.1.1",
  "heapless 0.8.0",
  "portable-atomic",
  "static_cell",
@@ -1146,6 +1157,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "stm32f1"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f2b32d5afdbd179dbfa05ad835e4623fb3790c187c2a8d6301eff1507b2c6c9"
+dependencies = [
+ "cortex-m",
+ "vcell",
+]
+
+[[package]]
 name = "stm32f103-embassy"
 version = "0.1.0"
 dependencies = [
@@ -1155,6 +1176,7 @@ dependencies = [
  "daplink-rs",
  "daplink-spi-swd",
  "daplink-stm32f1-embassy",
+ "daplink-stm32f1-spi-swd",
  "daplink-targets",
  "daplink-vfs",
  "defmt 1.1.1",
@@ -1162,7 +1184,6 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-stm32",
- "embassy-sync",
  "embassy-time",
  "embassy-usb",
  "panic-halt",

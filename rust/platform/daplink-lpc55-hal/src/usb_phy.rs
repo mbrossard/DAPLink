@@ -1,5 +1,4 @@
-//! Self-verifying bring-up of the LPC55 high-speed USB PHY: the APB block can come out of the
-//! HAL's bring-up wedged, and [`verify_and_recover`] detects that and re-runs the PHY program.
+//! High-speed USB PHY bring-up with bounded register verification and recovery attempts.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -31,8 +30,7 @@ const PLL_LOCK_POLL_LIMIT: u32 = 100_000;
 /// Recovery attempts before giving up.
 const RETRY_LIMIT: u32 = 3;
 
-/// Bring-up status word, readable over SWD by name. Bits 31:28 phase, 27:24 attempt (0 = the
-/// HAL's own sequence), 23:20 the evidence bits, 15:0 the top half of `USBPHY_CTRL`.
+/// Bring-up status word, read over SWD: bits 31:28 phase, 27:24 attempt, 23:20 evidence, 15:0 CTRL.
 #[no_mangle]
 pub static USB_PHY_STATUS: AtomicU32 = AtomicU32::new(STATUS_START);
 
@@ -56,15 +54,12 @@ pub const STATUS_PHY_UNGATED: u32 = 1 << 21;
 /// [`USB_PHY_STATUS`] bit 20: `USBPHY_PWD` was zero, so the transceivers are powered.
 pub const STATUS_PHY_POWERED: u32 = 1 << 20;
 
-/// What "the PHY came up" means here. The `PWD` term is not redundant: it is what puts the pull-up
-/// on the wire, so without it the other three hold on a probe the host cannot see.
+/// What "the PHY came up" means; `PWD` is what puts the pull-up on the wire.
 const GOOD: u32 = STATUS_PHY_ALIVE | STATUS_PLL_LOCK | STATUS_PHY_UNGATED | STATUS_PHY_POWERED;
 
-/// Verify the PHY the HAL just brought up and recover it where wedged; call once, right after
-/// `enabled_as_device`.
+/// Verify the PHY the HAL brought up and recover it if wedged; call once after `enabled_as_device`.
 pub(crate) fn verify_and_recover() {
-    // SAFETY: a fixed peripheral block reached through the PAC pointer; runs single-threaded
-    // during bring-up, before the USB bus exists.
+    // SAFETY: a fixed peripheral block, used single-threaded during bring-up.
     let phy = unsafe { &*hal::raw::USBPHY::PTR };
 
     USB_PHY_STATUS.store(STATUS_VERIFY, Ordering::Relaxed);
@@ -99,8 +94,7 @@ fn recover(phy: &hal::raw::usbphy::RegisterBlock, mut ev: u32) {
     );
 }
 
-/// Snapshot the PHY as the evidence bits plus the top half of `USBPHY_CTRL`. `PWD` and `CTRL`
-/// differ on a live block, so reading them equal marks it wedged.
+/// Snapshot the evidence bits and top half of `USBPHY_CTRL`; `PWD` equal to `CTRL` means wedged.
 fn evidence(phy: &hal::raw::usbphy::RegisterBlock) -> u32 {
     let ctrl = phy.ctrl.read().bits();
     let pwd = phy.pwd.read().bits();
@@ -116,8 +110,7 @@ fn evidence(phy: &hal::raw::usbphy::RegisterBlock) -> u32 {
     alive | lock | ungated | powered | (ctrl >> 16)
 }
 
-/// One recovery attempt: reset the APB registers, re-run the manual's register program in its
-/// order, wait for lock, and return the resulting [`evidence`].
+/// One recovery attempt: reset, re-program in the manual's order, wait for lock.
 #[inline(never)]
 fn reset_and_program(
     phy: &hal::raw::usbphy::RegisterBlock,
@@ -152,8 +145,7 @@ fn reset_and_program(
     evidence(phy)
 }
 
-/// Poll, boundedly, for `PLL_SIC.PLL_LOCK`; the bound turns a lock that never arrives into a
-/// report rather than a hang.
+/// Poll, bounded, for `PLL_SIC.PLL_LOCK`, so a missing lock reports rather than hangs.
 fn wait_for_pll_lock(phy: &hal::raw::usbphy::RegisterBlock) {
     let mut budget = PLL_LOCK_POLL_LIMIT;
     while budget > 0 && phy.pll_sic.read().bits() & PLL_SIC_LOCK == 0 {

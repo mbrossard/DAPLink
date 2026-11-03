@@ -6,16 +6,17 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use daplink_flash::{DefaultCallbacks, EraseMode, FlashManager, Target, TargetFlash};
+use daplink_flash::{Error as FlashError, FlashInterface};
 use daplink_probe_rs::{ProbeRsSwd, RawDapAccess};
 use daplink_targets::targets::{rp2040::RP2040, stm32f401ce::STM32F401CE};
 use embedded_hal::delay::DelayNs;
+use probe_rs::architecture::arm::ArmError;
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::{DebugProbeSelector, Probe, WireProtocol};
 
 use cli::{Args, TargetKind};
 
-/// Self-test pattern size and verify granularity: a multiple of four, and within every
-/// supported target's program buffer.
+/// Self-test pattern size: a multiple of four, within every target's program buffer.
 const CHUNK: usize = 256;
 
 /// A blocking [`DelayNs`] backed by the host thread's sleep clock.
@@ -28,7 +29,6 @@ impl DelayNs for StdDelay {
 }
 
 fn main() {
-    // `daplink-flash` and this tool at debug, the probe-rs/nusb layers at warn.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new("warn,flash_probe_rs=info,daplink_flash=debug")
     });
@@ -40,7 +40,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args = Args::from_env()?;
+    let Some(args) = Args::from_env()? else {
+        println!("{}", cli::USAGE);
+        return Ok(());
+    };
 
     let image = match &args.image {
         Some(path) => {
@@ -56,20 +59,16 @@ fn run() -> Result<()> {
     let dap = probe
         .try_as_dap_probe()
         .ok_or_else(|| anyhow!("probe does not expose a CMSIS-DAP interface"))?;
-    // A `DapProbe` is a `RawDapAccess`; upcast to the raw surface the SWD shim consumes.
     let raw: &mut dyn RawDapAccess = dap;
 
-    let base = args.target.flash_base();
     let erase_mode = args.erase_mode;
     match args.target {
-        TargetKind::Stm32f401 => {
-            flash_target(raw, &STM32F401CE, base, image.as_deref(), erase_mode)
-        }
-        TargetKind::Rp2040 => flash_target(raw, &RP2040, base, image.as_deref(), erase_mode),
+        TargetKind::Stm32f401 => flash_target(raw, &STM32F401CE, image.as_deref(), erase_mode),
+        TargetKind::Rp2040 => flash_target(raw, &RP2040, image.as_deref(), erase_mode),
     }
 }
 
-/// Open the probe named by `--probe` (or the first one), select SWD, and set the speed.
+/// Open the selected or sole available probe, select SWD, and set the speed.
 fn open_probe(args: &Args) -> Result<Probe> {
     let lister = Lister::new();
 
@@ -84,10 +83,9 @@ fn open_probe(args: &Args) -> Result<Probe> {
         }
         None => {
             let all = lister.list_all();
-            let info = all
-                .first()
-                .ok_or_else(|| anyhow!("no debug probes found"))?;
-            info.open().context("opening the first available probe")?
+            sole_probe(&all)?
+                .open()
+                .context("opening the sole available probe")?
         }
     };
 
@@ -107,56 +105,120 @@ fn open_probe(args: &Args) -> Result<Probe> {
     Ok(probe)
 }
 
+fn sole_probe<T>(probes: &[T]) -> Result<&T> {
+    match probes {
+        [probe] => Ok(probe),
+        [] => Err(anyhow!("no debug probes found")),
+        _ => Err(anyhow!(
+            "multiple debug probes found; pass --probe <selector>"
+        )),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SelfTestError {
+    primary: FlashError,
+    teardown: Option<FlashError>,
+}
+
+fn self_test(flash: &mut impl FlashInterface, base: u32) -> Result<(), SelfTestError> {
+    flash.init().map_err(|primary| SelfTestError {
+        primary,
+        teardown: None,
+    })?;
+    let pattern = self_test_pattern();
+    let operation = (|| {
+        flash.erase_sector(base)?;
+        flash.program_page(base, &pattern)?;
+        flash.verify(base, &pattern)
+    })();
+    let teardown = flash.uninit();
+    match (operation, teardown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), cleanup) => Err(SelfTestError {
+            primary,
+            teardown: cleanup.err(),
+        }),
+        (Ok(()), Err(primary)) => Err(SelfTestError {
+            primary,
+            teardown: None,
+        }),
+    }
+}
+
 /// One target's flash session: a self-test with no image, else program-then-verify.
 fn flash_target<T: Target>(
     raw: &mut dyn RawDapAccess,
     target: &T,
-    base: u32,
     image: Option<&[u8]>,
     erase_mode: EraseMode,
 ) -> Result<()> {
+    let regions = target.flash_regions();
+    let base = regions
+        .iter()
+        .find(|r| r.is_default)
+        .or_else(|| regions.first())
+        .ok_or_else(|| anyhow!("{} has no flash region", target.name()))?
+        .start;
     let swd = ProbeRsSwd::new(raw);
     let mut flash = TargetFlash::new(swd, StdDelay, target, DefaultCallbacks);
-    // RP2040's generic reset sequence drops the multidrop DP and wedges the verify reads that
-    // follow, so the run stays on the live halted core.
+    // RP2040's generic reset drops the multidrop DP and wedges the verify reads.
     flash.set_post_flash_reset(false);
 
-    match image {
+    let mut buffer = [0u8; 512];
+    let (result, flash) = match image {
         None => {
-            let pattern = self_test_pattern();
             tracing::info!(
                 "self-test at {base:#010x}: erase, program and verify {} bytes",
-                pattern.len()
+                CHUNK
             );
-            // Single-sector erase whatever `--erase-mode` says: the self-test bypasses
-            // `FlashManager` and smoke-tests init/reset/halt at one location.
-            flash.init().map_err(flash_err)?;
-            flash.erase_sector(base).map_err(flash_err)?;
-            flash.program_page(base, &pattern).map_err(flash_err)?;
-            flash.verify(base, &pattern).map_err(flash_err)?;
-            flash.uninit().map_err(flash_err)?;
-            tracing::info!("self-test passed");
+            // The self-test bypasses `FlashManager`, so it always erases a single sector.
+            (self_test(&mut flash, base), flash)
         }
         Some(data) => {
             tracing::info!("programming {} bytes at {base:#010x}", data.len());
-            // One MSC sector at a time, the most the on-probe path ever holds of the file.
-            let mut buffer = [0u8; 512];
-            let mut manager = FlashManager::new(flash, &mut buffer).map_err(flash_err)?;
+            let mut manager =
+                FlashManager::new(flash, &mut buffer).map_err(|err| flash_err(err, None))?;
             manager.set_erase_mode(erase_mode);
-            // Per-page verify, because the on-probe path cannot retain the image to verify at
-            // the end.
+            // Per-page verify: the on-probe path cannot retain the image to verify at the end.
             manager.set_verify(true);
-            manager.write(base, data).map_err(flash_err)?;
-            // `finish` flushes and verifies the final page under the same no-reset policy.
-            let (result, _parts) = manager.finish(false);
-            result.map_err(flash_err)?;
-            tracing::info!("program and verify complete");
+            let (result, (flash, _)) = match manager.write(base, data) {
+                Ok(()) => manager.finish(false),
+                Err(err) => (Err(err), manager.abort()),
+            };
+            (
+                result.map_err(|primary| SelfTestError {
+                    primary,
+                    teardown: None,
+                }),
+                flash,
+            )
         }
+    };
+    let (mut swd, _) = flash.into_parts();
+    result.map_err(|err| {
+        let cause = swd.take_transport_error();
+        match err.teardown {
+            Some(teardown) => {
+                let primary = flash_err(err.primary, None)
+                    .context(format!("teardown also failed: {teardown:?}"));
+                match cause {
+                    Some(cause) => primary.context(format!(
+                        "last transport failure during operation or teardown: {cause:?}"
+                    )),
+                    None => primary,
+                }
+            }
+            None => flash_err(err.primary, cause),
+        }
+    })?;
+    match image {
+        Some(_) => tracing::info!("program and verify complete"),
+        None => tracing::info!("self-test passed"),
     }
     Ok(())
 }
 
-/// A word-aligned alternating `0xAA`/`0x55` pattern for the self-test.
 fn self_test_pattern() -> [u8; CHUNK] {
     let mut pattern = [0u8; CHUNK];
     for (i, byte) in pattern.iter_mut().enumerate() {
@@ -165,7 +227,147 @@ fn self_test_pattern() -> [u8; CHUNK] {
     pattern
 }
 
-/// Wrap a flash-stack error (which carries no `std::error::Error` impl) as an [`anyhow::Error`].
-fn flash_err(err: daplink_flash::Error) -> anyhow::Error {
-    anyhow!("flash operation failed: {err:?}")
+/// Wrap a flash-stack error (which has no `std::error::Error` impl) over its probe-rs cause, if any.
+fn flash_err(err: daplink_flash::Error, cause: Option<ArmError>) -> anyhow::Error {
+    let context = format!("flash operation failed: {err:?}");
+    match cause {
+        Some(cause) => anyhow::Error::new(cause).context(context),
+        None => anyhow!(context),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_requires_exactly_one_probe() {
+        assert!(sole_probe::<u8>(&[]).is_err());
+        assert_eq!(*sole_probe(&[7]).unwrap(), 7);
+        assert!(sole_probe(&[7, 8]).is_err());
+    }
+
+    #[derive(Default)]
+    struct Flash {
+        calls: Vec<&'static str>,
+        fail_at: Option<&'static str>,
+        fail_teardown: bool,
+    }
+
+    impl Flash {
+        fn step(&mut self, name: &'static str, error: FlashError) -> Result<(), FlashError> {
+            self.calls.push(name);
+            if self.fail_at == Some(name) {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl FlashInterface for Flash {
+        fn init(&mut self) -> Result<(), FlashError> {
+            self.step("init", FlashError::InitFailed)
+        }
+        fn uninit(&mut self) -> Result<(), FlashError> {
+            self.calls.push("uninit");
+            if self.fail_teardown {
+                Err(FlashError::UninitFailed)
+            } else {
+                Ok(())
+            }
+        }
+        fn erase_sector(&mut self, _: u32) -> Result<(), FlashError> {
+            self.step("erase", FlashError::EraseFailed)
+        }
+        fn program_page(&mut self, _: u32, data: &[u8]) -> Result<(), FlashError> {
+            assert_eq!(data, self_test_pattern());
+            self.step("program", FlashError::WriteFailed)
+        }
+        fn verify(&mut self, addr: u32, data: &[u8]) -> Result<(), FlashError> {
+            assert_eq!(data, self_test_pattern());
+            self.step("verify", FlashError::VerifyFailed { addr })
+        }
+        fn set_post_flash_reset(&mut self, _: bool) {}
+        fn erase_chip(&mut self) -> Result<(), FlashError> {
+            unreachable!()
+        }
+        fn program_page_min_size(&self, _: u32) -> u32 {
+            unreachable!()
+        }
+        fn erase_sector_size(&self, _: u32) -> Option<u32> {
+            unreachable!()
+        }
+        fn erase_sector_base(&self, _: u32) -> Option<u32> {
+            unreachable!()
+        }
+        fn supports_chip_erase(&self) -> bool {
+            unreachable!()
+        }
+        fn supports_sector_erase(&self) -> bool {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn self_test_tears_down_once_after_every_operation_outcome() {
+        for (step, error, expected) in [
+            (
+                None,
+                None,
+                vec!["init", "erase", "program", "verify", "uninit"],
+            ),
+            (
+                Some("erase"),
+                Some(FlashError::EraseFailed),
+                vec!["init", "erase", "uninit"],
+            ),
+            (
+                Some("program"),
+                Some(FlashError::WriteFailed),
+                vec!["init", "erase", "program", "uninit"],
+            ),
+            (
+                Some("verify"),
+                Some(FlashError::VerifyFailed { addr: 0 }),
+                vec!["init", "erase", "program", "verify", "uninit"],
+            ),
+        ] {
+            for fail_teardown in [false, true] {
+                let mut flash = Flash {
+                    fail_at: step,
+                    fail_teardown,
+                    ..Flash::default()
+                };
+                let result = self_test(&mut flash, 0);
+                assert_eq!(flash.calls, expected);
+                let primary = error.or(fail_teardown.then_some(FlashError::UninitFailed));
+                assert_eq!(
+                    result,
+                    primary.map_or(Ok(()), |primary| Err(SelfTestError {
+                        primary,
+                        teardown: (error.is_some() && fail_teardown)
+                            .then_some(FlashError::UninitFailed),
+                    }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_init_does_not_start_operations_or_teardown() {
+        let mut flash = Flash {
+            fail_at: Some("init"),
+            fail_teardown: true,
+            ..Flash::default()
+        };
+        assert_eq!(
+            self_test(&mut flash, 0),
+            Err(SelfTestError {
+                primary: FlashError::InitFailed,
+                teardown: None
+            })
+        );
+        assert_eq!(flash.calls, ["init"]);
+    }
 }

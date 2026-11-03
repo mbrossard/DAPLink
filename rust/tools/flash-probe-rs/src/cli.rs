@@ -3,24 +3,15 @@
 use anyhow::{anyhow, bail, Result};
 use daplink_flash::EraseMode;
 
-/// The supported flash targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetKind {
-    /// STMicroelectronics STM32F401CE (512 KiB flash based at `0x0800_0000`).
+    /// STMicroelectronics STM32F401CE.
     Stm32f401,
-    /// Raspberry Pi RP2040 (external QSPI flash based at `0x1000_0000`).
+    /// Raspberry Pi RP2040.
     Rp2040,
 }
 
 impl TargetKind {
-    /// The flash base address programmed and verified by this tool for the target.
-    pub fn flash_base(self) -> u32 {
-        match self {
-            TargetKind::Stm32f401 => 0x0800_0000,
-            TargetKind::Rp2040 => 0x1000_0000,
-        }
-    }
-
     fn parse(s: &str) -> Result<Self> {
         match s {
             "stm32f401" => Ok(Self::Stm32f401),
@@ -33,7 +24,6 @@ impl TargetKind {
 /// Default SWD clock in kHz when `--speed` is not given.
 const DEFAULT_SPEED_KHZ: u32 = 1000;
 
-/// Parse the `--erase-mode` value.
 fn parse_erase_mode(s: &str) -> Result<EraseMode> {
     match s {
         "chip" => Ok(EraseMode::Chip),
@@ -42,34 +32,32 @@ fn parse_erase_mode(s: &str) -> Result<EraseMode> {
     }
 }
 
-/// One-line usage summary shown on argument errors.
+/// Usage summary shown on argument errors.
 pub const USAGE: &str = "usage: flash-probe-rs --target <stm32f401|rp2040> \
-[--image <file>] [--probe <selector>] [--speed <khz>] [--erase-mode <chip|sector>]";
+[--image <file>] [--probe <selector>] [--speed <khz>] [--erase-mode <chip|sector>]
+Erases and programs target flash; without --image, a one-sector self-test at the flash base.
+The target is left halted, not reset.";
 
-/// Parsed command-line arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
-    /// Which target to flash.
     pub target: TargetKind,
     /// Image to program; absent runs an erase/program/verify self-test at the flash base.
     pub image: Option<String>,
-    /// Probe selector (`VID:PID[:serial]`); the first probe is used when absent.
+    /// Probe selector (`VID:PID[:serial]`); omission requires exactly one available probe.
     pub probe: Option<String>,
     /// SWD clock in kHz.
     pub speed_khz: u32,
-    /// `chip` erases the whole chip up front (falling back to sector erase where unsupported),
-    /// `sector` erases lazily before each sector's first program. The self-test ignores it.
+    /// `chip` erases up front (sector erase where unsupported), `sector` before each first program.
     pub erase_mode: EraseMode,
 }
 
 impl Args {
     /// Parse from the process arguments (skipping the program name).
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Option<Self>> {
         Self::parse(std::env::args().skip(1))
     }
 
-    /// Parse from an iterator of argument strings.
-    pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Self> {
+    pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Option<Self>> {
         let mut target = None;
         let mut image = None;
         let mut probe = None;
@@ -91,23 +79,22 @@ impl Args {
                 "--erase-mode" => {
                     erase_mode = parse_erase_mode(&take_value(&mut it, "--erase-mode")?)?;
                 }
-                "-h" | "--help" => bail!("{USAGE}"),
+                "-h" | "--help" => return Ok(None),
                 other => bail!("unexpected argument '{other}'\n{USAGE}"),
             }
         }
 
         let target = target.ok_or_else(|| anyhow!("--target is required\n{USAGE}"))?;
-        Ok(Self {
+        Ok(Some(Self {
             target,
             image,
             probe,
             speed_khz,
             erase_mode,
-        })
+        }))
     }
 }
 
-/// Consume the value that must follow a flag, or error naming the flag.
 fn take_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> Result<String> {
     it.next().ok_or_else(|| anyhow!("{flag} expects a value"))
 }
@@ -117,7 +104,14 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Args> {
-        Args::parse(args.iter().map(|s| s.to_string()))
+        Args::parse(args.iter().map(|s| s.to_string()))?.ok_or_else(|| anyhow!("help"))
+    }
+
+    #[test]
+    fn help_needs_no_target() {
+        for flag in ["-h", "--help"] {
+            assert_eq!(Args::parse([flag.to_string()]).unwrap(), None);
+        }
     }
 
     #[test]
@@ -161,12 +155,6 @@ mod tests {
     #[test]
     fn unknown_erase_mode_is_rejected() {
         assert!(parse(&["--target", "rp2040", "--erase-mode", "bogus"]).is_err());
-    }
-
-    #[test]
-    fn flash_base_matches_target() {
-        assert_eq!(TargetKind::Stm32f401.flash_base(), 0x0800_0000);
-        assert_eq!(TargetKind::Rp2040.flash_base(), 0x1000_0000);
     }
 
     #[test]

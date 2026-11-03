@@ -1,0 +1,15 @@
+[package]
+name = "dap-conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host-only model of SWD, JTAG and CMSIS-DAP, with dap-rs as the differential reference"
+
+[workspace]
+
+[features]
+differential = ["dep:dap-rs"]
+
+[dependencies]
+# The reference engine and the traits both sides implement; same revision as the tree.
+dap-rs = { git = "https://github.com/probe-rs/dap-rs.git", rev = "a867ca7b41547b24aaad52b913528575685a5df5", optional = true }

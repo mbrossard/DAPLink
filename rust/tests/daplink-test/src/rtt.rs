@@ -9,16 +9,17 @@ use probe_rs::Core;
 use crate::util::chain;
 use crate::{Ctx, Failure};
 
-pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
-    inner(cx, full_run).map_err(Failure::Fatal)
+pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
+    // The DUT cases that follow talk over this channel.
+    inner(cx).map_err(Failure::Fatal)
 }
 
-fn inner(cx: &mut Ctx, full_run: bool) -> Result<(), String> {
+fn inner(cx: &mut Ctx) -> Result<(), String> {
     let session = cx.session.as_mut().ok_or("needs a successful connect")?;
     let mut core = session.core(0).map_err(chain)?;
 
-    // In a full run the flash case just reset the target; standalone, regenerate the marker.
-    if !full_run {
+    // Unless the previous case reset the target and left its boot event, regenerate the marker.
+    if !std::mem::take(&mut cx.boot_pending) {
         crate::reset(&mut core)?;
     }
 
@@ -34,16 +35,18 @@ fn inner(cx: &mut Ctx, full_run: bool) -> Result<(), String> {
 /// Read the up channel until `marker` appears, returning everything seen. Shared with nreset.
 pub(crate) fn expect(rtt: &mut Rtt, core: &mut Core, marker: &str) -> Result<String, String> {
     let channel = rtt.up_channel(0).ok_or("no RTT up channel")?;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    accumulate_until_marker(deadline, Duration::from_millis(50), marker, || {
-        let mut buf = [0u8; 256];
-        let n = channel.read(core, &mut buf).map_err(chain)?;
-        Ok(buf[..n].to_vec())
+    let budget = Duration::from_secs(3);
+    crate::wait::timed("rtt.expect", budget, || {
+        let deadline = Instant::now() + budget;
+        accumulate_until_marker(deadline, Duration::from_millis(50), marker, || {
+            let mut buf = [0u8; 256];
+            let n = channel.read(core, &mut buf).map_err(chain)?;
+            Ok(buf[..n].to_vec())
+        })
     })
 }
 
-/// Poll `read_more` until the accumulated text contains `marker` or `deadline` elapses; an error
-/// ends the loop rather than being retried.
+/// Wait for `marker`, rejecting complete DMA-abort errors before accepting success.
 fn accumulate_until_marker(
     deadline: Instant,
     interval: Duration,
@@ -54,6 +57,17 @@ fn accumulate_until_marker(
     while Instant::now() < deadline {
         seen.extend_from_slice(&read_more()?);
         let text = String::from_utf8_lossy(&seen);
+        if let Some(end) = text.rfind('\n') {
+            if text[..=end]
+                .lines()
+                .any(|line| line == proto::ERR_DMA_ABORT_TIMEOUT)
+            {
+                return Err(format!(
+                    "DUT rejected `{marker}`: {}; transfer ownership is unresolved",
+                    proto::ERR_DMA_ABORT_TIMEOUT
+                ));
+            }
+        }
         if text.contains(marker) {
             return Ok(text.into_owned());
         }
@@ -74,8 +88,7 @@ pub(crate) fn exchange(
 ) -> Result<String, String> {
     let down = rtt.down_channel(0).ok_or("no RTT down channel")?;
     let written = down.write(core, line).map_err(chain)?;
-    // probe-rs writes only what the ring has room for, and the DUT answers a truncated command
-    // with `ERR unimplemented`, which reads as a DUT fault rather than a host one.
+    // A truncated RTT write must not be mistaken for a DUT command rejection.
     full_write(written, line.len())?;
     expect(rtt, core, marker)
 }
@@ -90,28 +103,35 @@ fn full_write(written: usize, len: usize) -> Result<(), String> {
     ))
 }
 
-/// Attach RTT at the ELF's `_SEGGER_RTT` symbol when a DUT image is at hand, since a full
-/// target-RAM scan takes seconds on a slow wire.
+/// Attach RTT at the ELF's `_SEGGER_RTT` symbol when a DUT image is at hand, avoiding a RAM scan.
 pub(crate) fn attach(core: &mut Core, dut_elf: Option<&str>) -> Result<Rtt, String> {
+    attach_within(core, dut_elf, Duration::from_secs(15))
+}
+
+/// [`attach`] with a caller-bounded wait.
+pub(crate) fn attach_within(
+    core: &mut Core,
+    dut_elf: Option<&str>,
+    within: Duration,
+) -> Result<Rtt, String> {
     let region = dut_elf
-        .and_then(rtt_symbol)
+        .and_then(|elf| rtt_symbol(elf).ok())
         .map_or(ScanRegion::default(), ScanRegion::Exact);
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + within;
     poll_until_deadline(deadline, Duration::from_millis(100), || {
         Rtt::attach_region(core, &region)
     })
     .map_err(|e| format!("RTT attach failed: {}", chain(e)))
 }
 
-/// Attach RTT for a one-way up-channel stream, waiting for up[0] itself to be published: a
-/// defmt control block declares no down channel, so [`attach`]'s check is not enough.
+/// Attach for an up-only stream, waiting for `up[0]` itself: a defmt control block has no down channel.
 pub(crate) fn attach_up_only(
     core: &mut Core,
     dut_elf: Option<&str>,
     deadline: Duration,
 ) -> Result<Rtt, String> {
     let region = dut_elf
-        .and_then(rtt_symbol)
+        .and_then(|elf| rtt_symbol(elf).ok())
         .map_or(ScanRegion::default(), ScanRegion::Exact);
     let bound = Instant::now() + deadline;
     poll_until_deadline(bound, Duration::from_millis(50), || {
@@ -125,8 +145,7 @@ pub(crate) fn attach_up_only(
     .map_err(|e| format!("RTT attach failed: {e}"))
 }
 
-/// Retry `attempt` until it succeeds or `deadline` elapses, sleeping `interval` between tries;
-/// every error is retried alike and then returned as-is.
+/// Retry `attempt` until success or `deadline`, returning the last error as-is.
 fn poll_until_deadline<T, E>(
     deadline: Instant,
     interval: Duration,
@@ -144,14 +163,15 @@ fn poll_until_deadline<T, E>(
     }
 }
 
-/// The `_SEGGER_RTT` control-block address in `elf`, if it can be read.
-fn rtt_symbol(elf: &str) -> Option<u64> {
+/// The `_SEGGER_RTT` control-block address in the ELF at `path`.
+pub(crate) fn rtt_symbol(path: &str) -> Result<u64, String> {
     use object::{Object, ObjectSymbol};
-    let bytes = std::fs::read(elf).ok()?;
-    let file = object::File::parse(&*bytes).ok()?;
-    file.symbols()
-        .find(|s| s.name() == Ok("_SEGGER_RTT"))
-        .map(|s| s.address())
+    let bytes = std::fs::read(path).map_err(|e| format!("read ELF {path}: {e}"))?;
+    let elf = object::File::parse(bytes.as_slice()).map_err(chain)?;
+    elf.symbols()
+        .find(|symbol| symbol.name() == Ok("_SEGGER_RTT"))
+        .map(|symbol| symbol.address())
+        .ok_or_else(|| format!("ELF {path} has no _SEGGER_RTT symbol"))
 }
 
 #[cfg(test)]
@@ -161,8 +181,6 @@ mod tests {
     /// Short bound + fast poll so the timeout-shaped tests below cost milliseconds.
     const TEST_DEADLINE: Duration = Duration::from_millis(60);
     const TEST_INTERVAL: Duration = Duration::from_millis(1);
-
-    // -- poll_until_deadline: the retry/timeout shape behind `attach` --
 
     #[test]
     fn poll_until_deadline_returns_the_first_success_after_transient_errors() {
@@ -212,8 +230,6 @@ mod tests {
         assert_eq!(got, Ok(errors.len()));
     }
 
-    // -- accumulate_until_marker: the retry/timeout shape behind `expect` --
-
     #[test]
     fn accumulate_until_marker_finds_a_marker_split_across_reads() {
         // Reads are unaligned to line boundaries, so a marker routinely lands split across calls.
@@ -226,6 +242,38 @@ mod tests {
         )
         .expect("the marker spans two reads but is still present");
         assert_eq!(got, "EVT BOOT rp2040\n");
+    }
+
+    #[test]
+    fn accumulate_until_marker_rejects_fragmented_dma_error_before_success_or_another_read() {
+        let mut chunks = [b"ERR dma_abort_timeout".as_slice(), b"\nOK BAUD 115200\n"].into_iter();
+        let mut reads = 0;
+        let error = accumulate_until_marker(
+            Instant::now() + TEST_DEADLINE,
+            Duration::ZERO,
+            "OK BAUD",
+            || {
+                reads += 1;
+                Ok(chunks.next().expect("no read after rejection").to_vec())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(reads, 2);
+        assert!(error.contains("ERR dma_abort_timeout"));
+        assert!(error.contains("ownership is unresolved"));
+        assert!(!error.contains("within the window"));
+    }
+
+    #[test]
+    fn accumulate_until_marker_does_not_reinterpret_other_text_as_dma_rejection() {
+        let reply = b"note ERR dma_abort_timeout\nOK PONG\n";
+        assert!(accumulate_until_marker(
+            Instant::now() + TEST_DEADLINE,
+            Duration::ZERO,
+            "OK PONG",
+            || Ok(reply.to_vec()),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -262,8 +310,6 @@ mod tests {
         assert_eq!(calls, 1, "the read error was retried instead of propagated");
     }
 
-    // -- full_write: the down-channel short-write check behind `exchange` --
-
     #[test]
     fn full_write_accepts_only_a_write_the_ring_took_whole() {
         assert_eq!(full_write(53, 53), Ok(()));
@@ -274,19 +320,18 @@ mod tests {
         assert!(err.contains("64 of 70"), "got {err:?}");
     }
 
-    // -- rtt_symbol: the ELF lookup behind `attach`'s exact-address fast path --
-
     #[test]
-    fn rtt_symbol_is_none_for_bytes_that_are_not_an_object_file() {
+    fn rtt_symbol_fails_for_bytes_that_are_not_an_object_file() {
         let path = std::env::temp_dir().join("daplink-test-rtt-symbol-not-an-elf.bin");
         std::fs::write(&path, b"not an object file").expect("scratch file write");
         let got = rtt_symbol(path.to_str().expect("utf8 scratch path"));
         let _ = std::fs::remove_file(&path);
-        assert_eq!(got, None);
+        assert!(got.is_err(), "got {got:?}");
     }
 
     #[test]
-    fn rtt_symbol_is_none_for_a_missing_file() {
-        assert_eq!(rtt_symbol("/nonexistent/daplink-test-rtt-symbol.elf"), None);
+    fn rtt_symbol_fails_for_a_missing_file() {
+        let err = rtt_symbol("/nonexistent/daplink-test-rtt-symbol.elf").expect_err("no file");
+        assert!(err.starts_with("read ELF"), "got {err:?}");
     }
 }

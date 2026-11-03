@@ -1,7 +1,5 @@
 //! Composition macros for a firmware's flash-target registry table.
 
-/// The larger of two `usize` values, in const context (a plain `if a > b` over two consts trips a
-/// folded-comparison lint, so this is factored out for the generated scratch computation).
 #[doc(hidden)]
 pub const fn __max_usize(a: usize, b: usize) -> usize {
     if a > b {
@@ -11,37 +9,46 @@ pub const fn __max_usize(a: usize, b: usize) -> usize {
     }
 }
 
-/// Emit a firmware's flash-target table from one to five `(feature, Target, program-buffer-size)`
-/// rows; `umbrella` is the target-less flash spine feature, and the invoker needs `static-cell`.
-// rustfmt is non-idempotent over `#[cfg(..)]` nested in macro arms, so arm bodies are hand-formatted.
+#[doc(hidden)]
+pub const fn __min_usize(a: usize, b: usize) -> usize {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Emit the enabled target table and maximum scratch size; firmware chooses its primary separately.
+/// `table` and `buffer` may each run once, the caller needs `static_cell`, and its features select rows.
+/// An optional `cap` of at least 512 bytes bounds the scratch; the flash manager chunks larger pages.
+///
+/// ```compile_fail,E0080
+/// daplink_targets::target_table! {
+///     umbrella = "absent", count = N, selector = S, scratch = SCRATCH, table = t, buffer = b,
+///     cap = 256,
+///     rows = [("absent", Absent, 0)],
+/// }
+/// ```
 #[rustfmt::skip]
 #[macro_export]
 macro_rules! target_table {
-    // ---- one row ----
     (
         umbrella = $umbrella:literal,
         count = $count:ident,
-        primary = $primary:ident,
         selector = $selector:ident,
         scratch = $scratch:ident,
-        primary_ref = $primary_ref:ident,
         table = $table:ident,
         buffer = $buffer:ident,
-        rows = [
-            ($f0:literal, $t0:path, $b0:expr) $(,)?
-        ] $(,)?
+        $(cap = $cap:expr,)?
+        rows = [ $(($feature:literal, $target:path, $size:expr)),+ $(,)? ] $(,)?
     ) => {
-        #[cfg(all(feature = $umbrella, not(feature = $f0)))]
-        compile_error!(concat!(
-            "the bare `", $umbrella, "` feature is the target-less spine; enable a target \
-             with `", $f0, "`"
-        ));
+        $(const _: () = assert!($cap >= 512, "target_table! cap must be at least 512 bytes");)?
+
+        #[cfg(all(feature = $umbrella, not(any($(feature = $feature),+))))]
+        compile_error!(concat!("the bare `", $umbrella, "` feature needs a target feature"));
 
         #[cfg(feature = $umbrella)]
-        const $count: usize = cfg!(feature = $f0) as usize;
-
-        #[cfg(feature = $f0)]
-        type $primary = $t0;
+        const $count: usize = 0 $(+ cfg!(feature = $feature) as usize)+;
 
         #[cfg(feature = $umbrella)]
         type $selector = $crate::FixedTarget;
@@ -49,393 +56,19 @@ macro_rules! target_table {
         #[cfg(feature = $umbrella)]
         const $scratch: usize = {
             let mut m: usize = 0;
-            #[cfg(feature = $f0)] { m = $crate::table::__max_usize(m, $b0); }
+            $(#[cfg(feature = $feature)] { m = $crate::table::__max_usize(m, $size); })+
+            $(m = $crate::table::__min_usize(m, $cap);)?
             m
         };
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static __DAPLINK_T0: $t0 = $t0;
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static $primary_ref: &$primary = &__DAPLINK_T0;
 
         #[cfg(feature = $umbrella)]
         fn $table() -> &'static [&'static dyn $crate::Target] {
             static CELL: ::static_cell::StaticCell<[&'static dyn $crate::Target; $count]> =
                 ::static_cell::StaticCell::new();
-            CELL.init([
-                #[cfg(feature = $f0)]
-                &__DAPLINK_T0,
-            ])
+            CELL.init([ $(#[cfg(feature = $feature)] &$target,)+ ])
         }
 
-        // `ConstStaticCell`, never `StaticCell`: `init` moves its value through the caller's frame.
-        #[cfg(feature = $umbrella)]
-        fn $buffer() -> &'static mut [u8; $scratch] {
-            static CELL: ::static_cell::ConstStaticCell<[u8; $scratch]> =
-                ::static_cell::ConstStaticCell::new([0u8; $scratch]);
-            CELL.take()
-        }
-    };
-
-    // ---- two rows ----
-    (
-        umbrella = $umbrella:literal,
-        count = $count:ident,
-        primary = $primary:ident,
-        selector = $selector:ident,
-        scratch = $scratch:ident,
-        primary_ref = $primary_ref:ident,
-        table = $table:ident,
-        buffer = $buffer:ident,
-        rows = [
-            ($f0:literal, $t0:path, $b0:expr),
-            ($f1:literal, $t1:path, $b1:expr) $(,)?
-        ] $(,)?
-    ) => {
-        #[cfg(all(feature = $umbrella, not(feature = $f0), not(feature = $f1)))]
-        compile_error!(concat!(
-            "the bare `", $umbrella, "` feature is the target-less spine; enable a target \
-             with `", $f0, "` or `", $f1, "`"
-        ));
-
-        #[cfg(feature = $umbrella)]
-        const $count: usize = cfg!(feature = $f0) as usize + cfg!(feature = $f1) as usize;
-
-        #[cfg(feature = $f0)]
-        type $primary = $t0;
-        #[cfg(all(feature = $f1, not(feature = $f0)))]
-        type $primary = $t1;
-
-        #[cfg(feature = $umbrella)]
-        type $selector = $crate::FixedTarget;
-
-        #[cfg(feature = $umbrella)]
-        const $scratch: usize = {
-            let mut m: usize = 0;
-            #[cfg(feature = $f0)] { m = $crate::table::__max_usize(m, $b0); }
-            #[cfg(feature = $f1)] { m = $crate::table::__max_usize(m, $b1); }
-            m
-        };
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static __DAPLINK_T0: $t0 = $t0;
-        #[cfg(all(feature = $umbrella, feature = $f1))]
-        static __DAPLINK_T1: $t1 = $t1;
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static $primary_ref: &$primary = &__DAPLINK_T0;
-        #[cfg(all(feature = $umbrella, feature = $f1, not(feature = $f0)))]
-        static $primary_ref: &$primary = &__DAPLINK_T1;
-
-        #[cfg(feature = $umbrella)]
-        fn $table() -> &'static [&'static dyn $crate::Target] {
-            static CELL: ::static_cell::StaticCell<[&'static dyn $crate::Target; $count]> =
-                ::static_cell::StaticCell::new();
-            CELL.init([
-                #[cfg(feature = $f0)]
-                &__DAPLINK_T0,
-                #[cfg(feature = $f1)]
-                &__DAPLINK_T1,
-            ])
-        }
-
-        // `ConstStaticCell`, never `StaticCell`: `init` moves its value through the caller's frame.
-        #[cfg(feature = $umbrella)]
-        fn $buffer() -> &'static mut [u8; $scratch] {
-            static CELL: ::static_cell::ConstStaticCell<[u8; $scratch]> =
-                ::static_cell::ConstStaticCell::new([0u8; $scratch]);
-            CELL.take()
-        }
-    };
-
-    // ---- three rows ----
-    (
-        umbrella = $umbrella:literal,
-        count = $count:ident,
-        primary = $primary:ident,
-        selector = $selector:ident,
-        scratch = $scratch:ident,
-        primary_ref = $primary_ref:ident,
-        table = $table:ident,
-        buffer = $buffer:ident,
-        rows = [
-            ($f0:literal, $t0:path, $b0:expr),
-            ($f1:literal, $t1:path, $b1:expr),
-            ($f2:literal, $t2:path, $b2:expr) $(,)?
-        ] $(,)?
-    ) => {
-        #[cfg(all(feature = $umbrella,
-                  not(feature = $f0), not(feature = $f1), not(feature = $f2)))]
-        compile_error!(concat!(
-            "the bare `", $umbrella, "` feature is the target-less spine; enable a target \
-             with `", $f0, "`, `", $f1, "` or `", $f2, "`"
-        ));
-
-        #[cfg(feature = $umbrella)]
-        const $count: usize = cfg!(feature = $f0) as usize
-            + cfg!(feature = $f1) as usize
-            + cfg!(feature = $f2) as usize;
-
-        #[cfg(feature = $f0)]
-        type $primary = $t0;
-        #[cfg(all(feature = $f1, not(feature = $f0)))]
-        type $primary = $t1;
-        #[cfg(all(feature = $f2, not(feature = $f0), not(feature = $f1)))]
-        type $primary = $t2;
-
-        #[cfg(feature = $umbrella)]
-        type $selector = $crate::FixedTarget;
-
-        #[cfg(feature = $umbrella)]
-        const $scratch: usize = {
-            let mut m: usize = 0;
-            #[cfg(feature = $f0)] { m = $crate::table::__max_usize(m, $b0); }
-            #[cfg(feature = $f1)] { m = $crate::table::__max_usize(m, $b1); }
-            #[cfg(feature = $f2)] { m = $crate::table::__max_usize(m, $b2); }
-            m
-        };
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static __DAPLINK_T0: $t0 = $t0;
-        #[cfg(all(feature = $umbrella, feature = $f1))]
-        static __DAPLINK_T1: $t1 = $t1;
-        #[cfg(all(feature = $umbrella, feature = $f2))]
-        static __DAPLINK_T2: $t2 = $t2;
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static $primary_ref: &$primary = &__DAPLINK_T0;
-        #[cfg(all(feature = $umbrella, feature = $f1, not(feature = $f0)))]
-        static $primary_ref: &$primary = &__DAPLINK_T1;
-        #[cfg(all(feature = $umbrella, feature = $f2,
-                  not(feature = $f0), not(feature = $f1)))]
-        static $primary_ref: &$primary = &__DAPLINK_T2;
-
-        #[cfg(feature = $umbrella)]
-        fn $table() -> &'static [&'static dyn $crate::Target] {
-            static CELL: ::static_cell::StaticCell<[&'static dyn $crate::Target; $count]> =
-                ::static_cell::StaticCell::new();
-            CELL.init([
-                #[cfg(feature = $f0)]
-                &__DAPLINK_T0,
-                #[cfg(feature = $f1)]
-                &__DAPLINK_T1,
-                #[cfg(feature = $f2)]
-                &__DAPLINK_T2,
-            ])
-        }
-
-        // `ConstStaticCell`, never `StaticCell`: `init` moves its value through the caller's frame.
-        #[cfg(feature = $umbrella)]
-        fn $buffer() -> &'static mut [u8; $scratch] {
-            static CELL: ::static_cell::ConstStaticCell<[u8; $scratch]> =
-                ::static_cell::ConstStaticCell::new([0u8; $scratch]);
-            CELL.take()
-        }
-    };
-
-    // ---- four rows ----
-    (
-        umbrella = $umbrella:literal,
-        count = $count:ident,
-        primary = $primary:ident,
-        selector = $selector:ident,
-        scratch = $scratch:ident,
-        primary_ref = $primary_ref:ident,
-        table = $table:ident,
-        buffer = $buffer:ident,
-        rows = [
-            ($f0:literal, $t0:path, $b0:expr),
-            ($f1:literal, $t1:path, $b1:expr),
-            ($f2:literal, $t2:path, $b2:expr),
-            ($f3:literal, $t3:path, $b3:expr) $(,)?
-        ] $(,)?
-    ) => {
-        #[cfg(all(feature = $umbrella,
-                  not(feature = $f0), not(feature = $f1),
-                  not(feature = $f2), not(feature = $f3)))]
-        compile_error!(concat!(
-            "the bare `", $umbrella, "` feature is the target-less spine; enable a target \
-             with `", $f0, "`, `", $f1, "`, `", $f2, "` or `", $f3, "`"
-        ));
-
-        #[cfg(feature = $umbrella)]
-        const $count: usize = cfg!(feature = $f0) as usize
-            + cfg!(feature = $f1) as usize
-            + cfg!(feature = $f2) as usize
-            + cfg!(feature = $f3) as usize;
-
-        #[cfg(feature = $f0)]
-        type $primary = $t0;
-        #[cfg(all(feature = $f1, not(feature = $f0)))]
-        type $primary = $t1;
-        #[cfg(all(feature = $f2, not(feature = $f0), not(feature = $f1)))]
-        type $primary = $t2;
-        #[cfg(all(feature = $f3, not(feature = $f0), not(feature = $f1), not(feature = $f2)))]
-        type $primary = $t3;
-
-        #[cfg(feature = $umbrella)]
-        type $selector = $crate::FixedTarget;
-
-        #[cfg(feature = $umbrella)]
-        const $scratch: usize = {
-            let mut m: usize = 0;
-            #[cfg(feature = $f0)] { m = $crate::table::__max_usize(m, $b0); }
-            #[cfg(feature = $f1)] { m = $crate::table::__max_usize(m, $b1); }
-            #[cfg(feature = $f2)] { m = $crate::table::__max_usize(m, $b2); }
-            #[cfg(feature = $f3)] { m = $crate::table::__max_usize(m, $b3); }
-            m
-        };
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static __DAPLINK_T0: $t0 = $t0;
-        #[cfg(all(feature = $umbrella, feature = $f1))]
-        static __DAPLINK_T1: $t1 = $t1;
-        #[cfg(all(feature = $umbrella, feature = $f2))]
-        static __DAPLINK_T2: $t2 = $t2;
-        #[cfg(all(feature = $umbrella, feature = $f3))]
-        static __DAPLINK_T3: $t3 = $t3;
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static $primary_ref: &$primary = &__DAPLINK_T0;
-        #[cfg(all(feature = $umbrella, feature = $f1, not(feature = $f0)))]
-        static $primary_ref: &$primary = &__DAPLINK_T1;
-        #[cfg(all(feature = $umbrella, feature = $f2,
-                  not(feature = $f0), not(feature = $f1)))]
-        static $primary_ref: &$primary = &__DAPLINK_T2;
-        #[cfg(all(feature = $umbrella, feature = $f3,
-                  not(feature = $f0), not(feature = $f1), not(feature = $f2)))]
-        static $primary_ref: &$primary = &__DAPLINK_T3;
-
-        #[cfg(feature = $umbrella)]
-        fn $table() -> &'static [&'static dyn $crate::Target] {
-            static CELL: ::static_cell::StaticCell<[&'static dyn $crate::Target; $count]> =
-                ::static_cell::StaticCell::new();
-            CELL.init([
-                #[cfg(feature = $f0)]
-                &__DAPLINK_T0,
-                #[cfg(feature = $f1)]
-                &__DAPLINK_T1,
-                #[cfg(feature = $f2)]
-                &__DAPLINK_T2,
-                #[cfg(feature = $f3)]
-                &__DAPLINK_T3,
-            ])
-        }
-
-        // `ConstStaticCell`, never `StaticCell`: `init` moves its value through the caller's frame.
-        #[cfg(feature = $umbrella)]
-        fn $buffer() -> &'static mut [u8; $scratch] {
-            static CELL: ::static_cell::ConstStaticCell<[u8; $scratch]> =
-                ::static_cell::ConstStaticCell::new([0u8; $scratch]);
-            CELL.take()
-        }
-    };
-
-    // ---- five rows ----
-    (
-        umbrella = $umbrella:literal,
-        count = $count:ident,
-        primary = $primary:ident,
-        selector = $selector:ident,
-        scratch = $scratch:ident,
-        primary_ref = $primary_ref:ident,
-        table = $table:ident,
-        buffer = $buffer:ident,
-        rows = [
-            ($f0:literal, $t0:path, $b0:expr),
-            ($f1:literal, $t1:path, $b1:expr),
-            ($f2:literal, $t2:path, $b2:expr),
-            ($f3:literal, $t3:path, $b3:expr),
-            ($f4:literal, $t4:path, $b4:expr) $(,)?
-        ] $(,)?
-    ) => {
-        #[cfg(all(feature = $umbrella,
-                  not(feature = $f0), not(feature = $f1),
-                  not(feature = $f2), not(feature = $f3), not(feature = $f4)))]
-        compile_error!(concat!(
-            "the bare `", $umbrella, "` feature is the target-less spine; enable a target \
-             with `", $f0, "`, `", $f1, "`, `", $f2, "`, `", $f3, "` or `", $f4, "`"
-        ));
-
-        #[cfg(feature = $umbrella)]
-        const $count: usize = cfg!(feature = $f0) as usize
-            + cfg!(feature = $f1) as usize
-            + cfg!(feature = $f2) as usize
-            + cfg!(feature = $f3) as usize
-            + cfg!(feature = $f4) as usize;
-
-        #[cfg(feature = $f0)]
-        type $primary = $t0;
-        #[cfg(all(feature = $f1, not(feature = $f0)))]
-        type $primary = $t1;
-        #[cfg(all(feature = $f2, not(feature = $f0), not(feature = $f1)))]
-        type $primary = $t2;
-        #[cfg(all(feature = $f3, not(feature = $f0), not(feature = $f1), not(feature = $f2)))]
-        type $primary = $t3;
-        #[cfg(all(feature = $f4, not(feature = $f0), not(feature = $f1),
-                  not(feature = $f2), not(feature = $f3)))]
-        type $primary = $t4;
-
-        #[cfg(feature = $umbrella)]
-        type $selector = $crate::FixedTarget;
-
-        #[cfg(feature = $umbrella)]
-        const $scratch: usize = {
-            let mut m: usize = 0;
-            #[cfg(feature = $f0)] { m = $crate::table::__max_usize(m, $b0); }
-            #[cfg(feature = $f1)] { m = $crate::table::__max_usize(m, $b1); }
-            #[cfg(feature = $f2)] { m = $crate::table::__max_usize(m, $b2); }
-            #[cfg(feature = $f3)] { m = $crate::table::__max_usize(m, $b3); }
-            #[cfg(feature = $f4)] { m = $crate::table::__max_usize(m, $b4); }
-            m
-        };
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static __DAPLINK_T0: $t0 = $t0;
-        #[cfg(all(feature = $umbrella, feature = $f1))]
-        static __DAPLINK_T1: $t1 = $t1;
-        #[cfg(all(feature = $umbrella, feature = $f2))]
-        static __DAPLINK_T2: $t2 = $t2;
-        #[cfg(all(feature = $umbrella, feature = $f3))]
-        static __DAPLINK_T3: $t3 = $t3;
-        #[cfg(all(feature = $umbrella, feature = $f4))]
-        static __DAPLINK_T4: $t4 = $t4;
-
-        #[cfg(all(feature = $umbrella, feature = $f0))]
-        static $primary_ref: &$primary = &__DAPLINK_T0;
-        #[cfg(all(feature = $umbrella, feature = $f1, not(feature = $f0)))]
-        static $primary_ref: &$primary = &__DAPLINK_T1;
-        #[cfg(all(feature = $umbrella, feature = $f2,
-                  not(feature = $f0), not(feature = $f1)))]
-        static $primary_ref: &$primary = &__DAPLINK_T2;
-        #[cfg(all(feature = $umbrella, feature = $f3,
-                  not(feature = $f0), not(feature = $f1), not(feature = $f2)))]
-        static $primary_ref: &$primary = &__DAPLINK_T3;
-        #[cfg(all(feature = $umbrella, feature = $f4,
-                  not(feature = $f0), not(feature = $f1),
-                  not(feature = $f2), not(feature = $f3)))]
-        static $primary_ref: &$primary = &__DAPLINK_T4;
-
-        #[cfg(feature = $umbrella)]
-        fn $table() -> &'static [&'static dyn $crate::Target] {
-            static CELL: ::static_cell::StaticCell<[&'static dyn $crate::Target; $count]> =
-                ::static_cell::StaticCell::new();
-            CELL.init([
-                #[cfg(feature = $f0)]
-                &__DAPLINK_T0,
-                #[cfg(feature = $f1)]
-                &__DAPLINK_T1,
-                #[cfg(feature = $f2)]
-                &__DAPLINK_T2,
-                #[cfg(feature = $f3)]
-                &__DAPLINK_T3,
-                #[cfg(feature = $f4)]
-                &__DAPLINK_T4,
-            ])
-        }
-
-        // `ConstStaticCell`, never `StaticCell`: `init` moves its value through the caller's frame.
+        // ConstStaticCell avoids moving the buffer through the caller's stack.
         #[cfg(feature = $umbrella)]
         fn $buffer() -> &'static mut [u8; $scratch] {
             static CELL: ::static_cell::ConstStaticCell<[u8; $scratch]> =
@@ -448,16 +81,13 @@ macro_rules! target_table {
 // Expansion coverage for the emitted registry, over the two kept rows.
 #[cfg(all(test, feature = "rp2040", feature = "stm32f401ce"))]
 mod tests {
-    use crate::targets::rp2040::RP2040;
 
     // `umbrella` reuses the first row's feature so single-feature test runs stay guard-free.
     target_table! {
         umbrella = "rp2040",
         count = TARGET_COUNT,
-        primary = PrimaryTarget,
         selector = Selector,
         scratch = SCRATCH,
-        primary_ref = PRIMARY,
         table = flash_table,
         buffer = scratch_buffer,
         rows = [
@@ -484,16 +114,9 @@ mod tests {
     }
 
     #[test]
-    fn emitted_registry_is_row_ordered_with_first_enabled_primary() {
+    fn emitted_registry_preserves_row_order() {
         let table = flash_table();
         assert_eq!(table.len(), TARGET_COUNT);
-        // The primary reference is the first row's instance, and the table preserves row order.
-        let primary: &'static PrimaryTarget = PRIMARY;
-        assert!(core::ptr::eq(
-            table[0] as *const dyn crate::Target as *const (),
-            primary as *const PrimaryTarget as *const ()
-        ));
-        let _: &RP2040 = PRIMARY;
         assert_eq!(table[0].name(), "RP2040");
         assert_eq!(table[1].name(), "STM32F401CE");
     }
@@ -509,15 +132,12 @@ mod tests {
 // The single-row arm, in its own module because every arm emits the same hidden statics.
 #[cfg(all(test, feature = "stm32f401ce"))]
 mod single_row_tests {
-    use crate::targets::stm32f401ce::STM32F401CE;
 
     target_table! {
         umbrella = "stm32f401ce",
         count = TARGET_COUNT,
-        primary = PrimaryTarget,
         selector = Selector,
         scratch = SCRATCH,
-        primary_ref = PRIMARY,
         table = flash_table,
         buffer = scratch_buffer,
         rows = [
@@ -530,14 +150,106 @@ mod single_row_tests {
     }
 
     #[test]
-    fn the_one_row_is_count_primary_and_table() {
+    fn the_one_row_is_count_and_table() {
         assert_eq!(TARGET_COUNT, 1);
         assert_eq!(SCRATCH, crate::targets::stm32f401ce::PROGRAM_BUFFER_SIZE);
         let _: Selector = crate::FixedTarget;
-        let _: &STM32F401CE = PRIMARY;
         let table = flash_table();
         assert_eq!(table.len(), 1);
         assert_eq!(table[0].name(), "STM32F401CE");
         assert_eq!(scratch_buffer().len(), SCRATCH);
+    }
+}
+
+// Two rows sharing one algorithm, told apart only by their UF2 families.
+#[cfg(all(test, feature = "nrf52840", feature = "nrf52833"))]
+mod nrf52_rows_tests {
+    use crate::{ImageHint, SelectError, TargetSelector};
+
+    target_table! {
+        umbrella = "nrf52840",
+        count = TARGET_COUNT,
+        selector = Selector,
+        scratch = SCRATCH,
+        table = flash_table,
+        buffer = scratch_buffer,
+        rows = [
+            (
+                "nrf52840",
+                crate::targets::nrf52840::NRF52840,
+                crate::targets::nrf52840::PROGRAM_BUFFER_SIZE
+            ),
+            (
+                "nrf52833",
+                crate::targets::nrf52833::NRF52833,
+                crate::targets::nrf52833::PROGRAM_BUFFER_SIZE
+            ),
+        ],
+    }
+
+    #[test]
+    fn the_uf2_family_picks_the_row() {
+        assert_eq!(TARGET_COUNT, 2);
+        assert_eq!(SCRATCH, 0x1000);
+        assert_eq!(scratch_buffer().len(), SCRATCH);
+        let table = flash_table();
+        let mut selector = Selector::default();
+        let pick = |s: &mut Selector, hint| s.select(hint, table).map(|t| t.name());
+        assert_eq!(
+            pick(&mut selector, ImageHint::uf2(0xADA5_2840)),
+            Ok("nRF52840")
+        );
+        assert_eq!(
+            pick(&mut selector, ImageHint::uf2(0x621E_937A)),
+            Ok("nRF52833")
+        );
+        // The generic "Nordic NRF52" family names neither part.
+        assert_eq!(
+            pick(&mut selector, ImageHint::uf2(0x1B57_745F)),
+            Err(SelectError::ImageMismatch)
+        );
+        assert_eq!(
+            pick(&mut selector, ImageHint::NONE),
+            Err(SelectError::ImageMismatch)
+        );
+    }
+}
+
+// A firmware cap below the widest row's page bounds the scratch, not the rows.
+#[cfg(all(test, feature = "nrf52840", feature = "stm32f401ce"))]
+mod capped_tests {
+
+    target_table! {
+        umbrella = "nrf52840",
+        count = TARGET_COUNT,
+        selector = Selector,
+        scratch = SCRATCH,
+        table = flash_table,
+        buffer = scratch_buffer,
+        cap = 0x400,
+        rows = [
+            (
+                "stm32f401ce",
+                crate::targets::stm32f401ce::STM32F401CE,
+                crate::targets::stm32f401ce::PROGRAM_BUFFER_SIZE
+            ),
+            (
+                "nrf52840",
+                crate::targets::nrf52840::NRF52840,
+                crate::targets::nrf52840::PROGRAM_BUFFER_SIZE
+            ),
+        ],
+    }
+
+    #[test]
+    fn the_cap_bounds_the_scratch_and_keeps_the_rows() {
+        assert_eq!(crate::targets::nrf52840::PROGRAM_BUFFER_SIZE, 0x1000);
+        assert_eq!(SCRATCH, 0x400);
+        assert_eq!(scratch_buffer().len(), SCRATCH);
+        let table = flash_table();
+        assert_eq!(TARGET_COUNT, 2);
+        assert_eq!(table[0].name(), "STM32F401CE");
+        assert_eq!(table[1].name(), "nRF52840");
+        let _: Selector = crate::FixedTarget;
     }
 }

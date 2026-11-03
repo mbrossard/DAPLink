@@ -15,13 +15,15 @@ Pinout for the `rp2350-pico2-embassy` probe firmware.
 | GND | -- | 3 |
 
 Against the `test-rp2040` device-under-test image on a Pico, VCOM cross-connects TX to the DUT's
-GP1 and RX to the DUT's GP0 (the DUT echoes on UART0), with a common ground.
+GP5 and RX to the DUT's GP4 (the DUT echoes on UART1), with a common ground.
 
-The probe defaults to PIO SWD and fused CPU JTAG; its `-bitbang` xtask row selects the generic CPU
-wire engine for comparison.
+The probe defaults to the PIO engines: generic PIO0 for sequences and fallbacks, PIO1 for
+complete SWD and JTAG transfers; `-bitbang` selects the CPU wire engine.
 
-The opt-in `-overclock-200mhz` xtask row runs the system at 200 MHz and uses a five-cycle PIO SWD
-cell. It is not a default and exceeds the RP2350's specified maximum system frequency.
+The opt-in `-overclock-200mhz` xtask row runs the system at 200 MHz, with the PIO cells in its
+[clock profile](../design/rp-pio-engines.md#clock-profiles). It is not a default and exceeds the
+RP2350's specified maximum system frequency. It also
+enables `dap-packet-512`, which advertises a 512-byte DAP packet.
 
 To install without a second probe, build from `rust/` with
 `cargo xtask build firmware/rp2350-pico2-embassy`, which writes a `.uf2` beside the ELF under

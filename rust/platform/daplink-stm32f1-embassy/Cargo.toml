@@ -5,28 +5,21 @@ edition = "2021"
 license = "Apache-2.0"
 description = "embassy-stm32 platform support for STM32F1 daplink-rs probes"
 
-# Own workspace: pulls an embedded HAL, so it resolves independently of any root.
 [workspace]
 
-[features]
-# The F1 register seam for the SPI-session SWD engine; a firmware composing the accel backend
-# enables this and supplies the per-board half through `SpiSwdBoard`.
-spi-swd = ["dep:daplink-spi-swd"]
-
-# F1-family only (gpio_v1/bdma registers); the firmware supplies the embassy-stm32 chip feature.
+# F1-family only; the firmware supplies the embassy-stm32 chip feature.
 [dependencies]
-# The SPI-session SWD engine, pulled in only by the `spi-swd` seam feature.
-daplink-spi-swd = { path = "../../crates/daplink-spi-swd", optional = true }
 embassy-stm32 = { version = "0.6.0", default-features = false, features = ["unstable-pac"] }
-# An empty VCOM receive ring parks on a timer; the time driver stays the firmware's to install.
+# The firmware installs the time driver.
 embassy-time = "0.5"
+embassy-usb-driver = "0.2"
 cortex-m = "0.7"
 static_cell = "2"
-# The USB serial string is cached in a static behind a critical section.
+# Guards the cached USB serial.
 critical-section = "1"
 daplink-rs = { path = "../../crates/daplink-rs" }
 daplink-embassy-usb = { path = "../daplink-embassy-usb" }
 
-# A chip feature only so the crate still builds and lints on its own; dependents ignore this.
+# A chip feature only so the crate builds on its own.
 [dev-dependencies]
 embassy-stm32 = { version = "0.6.0", features = ["stm32f103cb"] }

@@ -12,7 +12,8 @@ cargo install probe-rs-tools --locked
 ```
 
 The `probe-rs` executable is used by `cargo xtask flash` and `cargo xtask hil`, but is not needed
-for compilation. Linux hosts also need the probe-rs udev rules for unprivileged USB access.
+for compilation. Linux hosts also need a udev rule for unprivileged access to the probe
+([Linux host setup](linux-udev.md)).
 
 Run registered builds from `rust/`:
 
@@ -34,7 +35,7 @@ To build, install, and exercise a probe on a wired HIL rig:
 
 ```text
 cargo xtask hil <firmware-name> --via <transport-probe> \
-    --probe <probe-under-test> --target <target-name>
+    --put <probe-under-test> --target <target-name>
 ```
 
 Selectors are full `vid:pid:serial` values. `--via` identifies the transport probe used to flash

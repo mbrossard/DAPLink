@@ -1,7 +1,7 @@
 //! Host tests for the registry and target-selection seam (require the `synthetic` feature).
 
 use crate::algorithms::synthetic::SYNTHETIC_ALGO;
-use crate::selector::{FixedTarget, ImageHint, TargetSelector};
+use crate::selector::{FixedTarget, ImageHint, SelectError, TargetSelector};
 use crate::targets::synthetic::{SyntheticTarget, SYNTHETIC_UF2_FAMILY};
 use crate::{check_identity, FlashRegion, RamRegion, SectorInfo, Target};
 
@@ -9,6 +9,9 @@ use crate::{check_identity, FlashRegion, RamRegion, SectorInfo, Target};
 struct DummyTarget;
 
 impl Target for DummyTarget {
+    fn name(&self) -> &'static str {
+        "dummy"
+    }
     fn flash_regions(&self) -> &[FlashRegion<'_>] {
         &[]
     }
@@ -20,26 +23,33 @@ impl Target for DummyTarget {
     }
 }
 
-#[test]
-fn fixed_target_selects_first() {
-    let first = DummyTarget;
-    let second = DummyTarget;
-    let table: [&dyn Target; 2] = [&first, &second];
-
-    let selected = FixedTarget.select(ImageHint::NONE, &table);
-    assert!(selected.is_ok());
-    // The first entry is chosen (identity via pointer equality).
-    let chosen = selected.expect("a target was selected");
-    assert!(core::ptr::eq(
-        chosen as *const dyn Target as *const (),
-        &first as &dyn Target as *const dyn Target as *const ()
-    ));
-}
+/// A selector case: the table, the hint, and the index or error expected.
+type Case<'t> = (&'t [&'t dyn Target], ImageHint, Result<usize, SelectError>);
 
 #[test]
-fn fixed_target_empty_table_none() {
-    let table: [&dyn Target; 0] = [];
-    assert!(FixedTarget.select(ImageHint::NONE, &table).is_err());
+fn fixed_target_selection_cases() {
+    let (dummy, synthetic) = (DummyTarget, SyntheticTarget);
+    let (d, s): (&dyn Target, &dyn Target) = (&dummy, &synthetic);
+    let other = ImageHint::uf2(0x1234);
+    let family = ImageHint::uf2(SYNTHETIC_UF2_FAMILY);
+    let cases: [Case; 9] = [
+        (&[], ImageHint::NONE, Err(SelectError::NoTarget)),
+        (&[], family, Err(SelectError::NoTarget)),
+        (&[d], ImageHint::NONE, Ok(0)),
+        (&[s], family, Ok(0)),
+        (&[s], other, Err(SelectError::ImageMismatch)),
+        (&[d, s], ImageHint::NONE, Err(SelectError::ImageMismatch)),
+        (&[d, s], family, Ok(1)),
+        (&[d, s], other, Err(SelectError::ImageMismatch)),
+        (&[s, s], family, Err(SelectError::ImageMismatch)),
+    ];
+    for (i, (table, hint, want)) in cases.into_iter().enumerate() {
+        let got = FixedTarget.select(hint, table).map(|t| {
+            let at = |c: &&dyn Target| c.name() == t.name();
+            table.iter().position(at).expect("selected from the table")
+        });
+        assert_eq!(got, want, "case {i}");
+    }
 }
 
 #[test]
@@ -50,12 +60,9 @@ fn synthetic_algo_invariants() {
         end: 0x2000_2000,
     };
 
-    // Stack pointer within RAM.
     assert!(ram.contains(algo.syscall.stack_pointer));
-    // Static base within RAM.
     assert!(ram.contains(algo.syscall.static_base));
 
-    // Program buffer within RAM, including its full extent.
     assert!(ram.contains(algo.program_buffer));
     let pb_end = algo.program_buffer + algo.program_buffer_size;
     assert!(pb_end <= ram.end);
@@ -66,7 +73,6 @@ fn synthetic_algo_invariants() {
     let blob_end = algo.algo_start + algo.algo_blob.len() as u32;
     assert!(algo.program_buffer >= blob_end || pb_end <= blob_start);
 
-    // Entry offsets fall within the blob.
     let blob_len = algo.algo_blob.len() as u32;
     for &offset in &[
         algo.init,

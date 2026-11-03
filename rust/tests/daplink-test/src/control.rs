@@ -1,11 +1,9 @@
-//! Control-transfer path: device-recipient requests and BOS walking, for descriptor-level
-//! assertions the harness's bulk paths cannot reach.
+//! Control-transfer path: device-recipient requests and BOS walking.
 
 use std::time::Duration;
 
 use nusb::transfer::{ControlIn, ControlType, Recipient};
 use nusb::{Device, MaybeFuture};
-use probe_rs::probe::DebugProbeSelector;
 
 /// Every request here is answered from a constant blob, so a slow answer is a fault, not load.
 const TIMEOUT: Duration = Duration::from_secs(1);
@@ -17,27 +15,6 @@ const DESC_DEVICE_CAPABILITY: u8 = 0x10;
 /// `bDevCapabilityType` of a platform capability, the form both vendor capabilities take.
 pub(crate) const CAP_PLATFORM: u8 = 0x05;
 
-/// Open the probe named by `selector`; claims no interface, so this does not disturb a case
-/// that later opens the probe for bulk transfers.
-pub(crate) fn open(selector: &DebugProbeSelector) -> Result<Device, String> {
-    nusb::list_devices()
-        .wait()
-        .map_err(|e| e.to_string())?
-        .find(|d| {
-            d.vendor_id() == selector.vendor_id
-                && d.product_id() == selector.product_id
-                && selector
-                    .serial_number
-                    .as_deref()
-                    .is_none_or(|s| d.serial_number() == Some(s))
-        })
-        .ok_or_else(|| "probe not found on the bus".to_string())?
-        .open()
-        .wait()
-        .map_err(|e| e.to_string())
-}
-
-/// Read the device's BOS descriptor.
 pub(crate) fn bos(device: &Device) -> Result<Vec<u8>, String> {
     device
         .get_descriptor(DESC_BOS, 0, 0, TIMEOUT)
@@ -45,8 +22,7 @@ pub(crate) fn bos(device: &Device) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// A vendor IN request at `recipient`; the recipient is a parameter because a device-recipient
-/// request answered at another recipient is a defect a happy-path read cannot see.
+/// A vendor IN request at `recipient`, so a wrongly accepted recipient is observable.
 pub(crate) fn vendor_in(
     device: &Device,
     recipient: Recipient,
@@ -79,16 +55,13 @@ pub(crate) struct Capability<'a> {
 }
 
 impl Capability<'_> {
-    /// The UUID of a platform capability, whose payload is `bReserved`, a 16-byte UUID, then
-    /// capability-specific data.
+    /// The UUID of a platform capability: `bReserved`, a 16-byte UUID, then capability data.
     pub(crate) fn platform_uuid(&self) -> Option<&[u8]> {
         (self.ty == CAP_PLATFORM && self.payload.len() >= 17).then(|| &self.payload[1..17])
     }
 }
 
-/// Walk a BOS into its capabilities, checking that the header's length and capability count
-/// agree with what is actually there -- a host walks by those fields, so a disagreement is a
-/// silent truncation rather than a parse error.
+/// Walk a BOS into capabilities, checking the header's length and count match its contents.
 pub(crate) fn capabilities(bos: &[u8]) -> Result<Vec<Capability<'_>>, String> {
     if bos.len() < 5 {
         return Err(format!(

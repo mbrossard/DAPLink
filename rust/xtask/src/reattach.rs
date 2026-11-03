@@ -1,39 +1,29 @@
-//! Making an RP probe re-enumerate after a reflash, through the device's own soft-disconnect.
-//!
-//! `probe-rs download` plus a reset does not produce a USB re-attach on an RP part: its D+
-//! pull-up drops for a few milliseconds at boot, far under the hub's disconnect debounce, so the
-//! host keeps serving the *pre-flash* descriptors. An interface the new image composes is then
-//! simply absent, and a capability case reads that as firmware that does not compose it.
-//! Toggling `SIE_CTRL.PULLUP_EN` over the transport holds the disconnect long enough to be seen.
+//! Forces an RP probe to re-enumerate after a reflash; its boot-time D+ drop is under hub debounce.
 
-use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::install::probe_rs_command;
 use crate::registry::Firmware;
 use crate::usb::{self, Selector};
 
-/// The RP USB controller's `SIE_CTRL` and its D+ pull-up enable bit.
 const SIE_CTRL: u32 = 0x5011_004c;
 const PULLUP_EN: u32 = 0x0001_0000;
 
-/// Let the freshly reset core bring its USB block up before the first write; a write that lands
-/// before it does reads back as zero and toggles nothing.
+/// A write before the fresh core's USB block is up reads back zero and toggles nothing.
 const FLASH_SETTLE: Duration = Duration::from_millis(500);
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 const ATTEMPTS: u32 = 6;
-/// The disconnect has to outlast the hub's debounce; the firmware's own remount detach uses
-/// 500 ms, and this is comfortably clear of it.
+/// Must outlast the hub's disconnect debounce.
 const HOLD: Duration = Duration::from_millis(1500);
 const GONE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Whether this row's part needs the soft-disconnect. Every RP part hides its boot-time pull-up
-/// drop under the debounce the same way.
+/// Whether this part needs the soft-disconnect; true of every RP part.
 pub fn applies(chip: &str) -> bool {
     chip.starts_with("RP")
 }
 
 fn read_word(fw: &Firmware, via: &str, addr: u32) -> Option<u32> {
-    let out = Command::new("probe-rs")
+    let out = probe_rs_command()
         .args(["read", "b32", "--chip", fw.chip, "--probe", via])
         .arg(format!("{addr:#x}"))
         .arg("1")
@@ -45,8 +35,7 @@ fn read_word(fw: &Firmware, via: &str, addr: u32) -> Option<u32> {
     parse_word(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// `probe-rs read b32` prints `<address>: <word> [<word>...]` per line, hex and no `0x`; take
-/// the first word after the colon.
+/// First word of a `probe-rs read b32` line (`<address>: <word> ...`).
 fn parse_word(text: &str) -> Option<u32> {
     text.lines()
         .filter_map(|l| l.split_once(':'))
@@ -54,7 +43,7 @@ fn parse_word(text: &str) -> Option<u32> {
 }
 
 fn write_word(fw: &Firmware, via: &str, addr: u32, value: u32) -> bool {
-    Command::new("probe-rs")
+    probe_rs_command()
         .args(["write", "b32", "--chip", fw.chip, "--probe", via])
         .arg(format!("{addr:#x}"))
         .arg(format!("{value:#x}"))
@@ -63,9 +52,20 @@ fn write_word(fw: &Firmware, via: &str, addr: u32, value: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Drop `PULLUP_EN`, hold until the host drops the device, then restore it. Returns false when
-/// the register could not be driven or the host never saw the device leave -- in which case the
-/// descriptors it holds are still the pre-flash ones and nothing downstream may be trusted.
+/// Best-effort clear of `PULLUP_EN` before the download, so the halt does not leave the host retrying.
+pub fn clear_pullup(fw: &Firmware, via: &str) -> bool {
+    let Some(sie) = read_word(fw, via, SIE_CTRL) else {
+        eprintln!("clear pull-up: could not read SIE_CTRL");
+        return false;
+    };
+    if sie == 0 {
+        eprintln!("clear pull-up: SIE_CTRL reads zero, the core is still coming up");
+        return false;
+    }
+    write_word(fw, via, SIE_CTRL, sie & !PULLUP_EN)
+}
+
+/// Drop `PULLUP_EN` until the host drops the device, then restore it; false means stale descriptors.
 pub fn run(fw: &Firmware, via: &str, sel: &Selector) -> bool {
     println!("re-attaching {sel}: SIE_CTRL soft-disconnect over {via}");
     std::thread::sleep(FLASH_SETTLE);
@@ -76,8 +76,7 @@ pub fn run(fw: &Firmware, via: &str, sel: &Selector) -> bool {
             std::thread::sleep(RETRY_DELAY);
             continue;
         };
-        // A zero here is not a connected controller with every bit clear: it is the core still
-        // coming up. Writing it would toggle nothing and disconnect nothing.
+        // Zero means the core is still coming up; writing it would toggle nothing.
         if sie == 0 {
             eprintln!(
                 "re-attach attempt {attempt}: SIE_CTRL reads zero, the core is still coming up"
@@ -85,7 +84,6 @@ pub fn run(fw: &Firmware, via: &str, sel: &Selector) -> bool {
             std::thread::sleep(RETRY_DELAY);
             continue;
         }
-        // Read-modify-write: every other bit the running firmware set stays as it is.
         if !write_word(fw, via, SIE_CTRL, sie & !PULLUP_EN) {
             eprintln!("re-attach attempt {attempt}: could not write SIE_CTRL");
             std::thread::sleep(RETRY_DELAY);
@@ -138,8 +136,7 @@ mod tests {
         assert!(!applies("STM32F103CB"));
     }
 
-    /// probe-rs 0.32 prefixes every line with the address it read, so a parser that takes the
-    /// first token takes the address and never a value.
+    /// Each line is prefixed with the address read, which a first-token parser would take.
     #[test]
     fn reads_the_first_word_probe_rs_prints() {
         assert_eq!(parse_word("5011004c: 20010000\n"), Some(0x2001_0000));

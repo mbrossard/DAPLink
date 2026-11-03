@@ -42,49 +42,4 @@ mod tests {
         let a = NoArbiter;
         assert!(a.begin_session().is_some());
     }
-
-    struct MockResetControl {
-        asserted: bool,
-    }
-
-    impl ResetControl for MockResetControl {
-        type Error = ();
-        fn set_reset(&mut self, asserted: bool) -> Result<(), Self::Error> {
-            self.asserted = asserted;
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn mock_reset_control_behaves() {
-        let mut mock = MockResetControl { asserted: false };
-
-        assert_eq!(mock.set_reset(true), Ok(()));
-        assert!(mock.asserted);
-
-        assert_eq!(mock.set_reset(false), Ok(()));
-        assert!(!mock.asserted);
-    }
-
-    struct MockProbeInfo {
-        calls: u32,
-    }
-
-    impl ProbeInfo for MockProbeInfo {
-        fn read_dpidr(&mut self) -> Option<u32> {
-            self.calls += 1;
-            match self.calls {
-                1 => Some(0x0BC1_1477),
-                _ => None,
-            }
-        }
-    }
-
-    #[test]
-    fn mock_probe_info_reads_dpidr() {
-        let mut mock = MockProbeInfo { calls: 0 };
-
-        assert_eq!(mock.read_dpidr(), Some(0x0BC1_1477));
-        assert_eq!(mock.read_dpidr(), None);
-    }
 }

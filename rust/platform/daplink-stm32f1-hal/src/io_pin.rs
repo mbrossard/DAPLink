@@ -1,21 +1,22 @@
-//! Port-register GPIO line for the bit-bang SWJ driver on the F1's CRL/CRH-style ports.
+//! Port-register GPIO line for the bit-bang SWJ driver.
 
 use daplink_rs::InputOutputPin;
 use stm32f1xx_hal::pac;
 
+/// CNF+MODE nibbles (RM0008); for input with pull, ODR selects up/down.
+const CFG_OUTPUT_PP_50M: u32 = 0b0011;
+const CFG_OUTPUT_OD_50M: u32 = 0b0111;
+const CFG_INPUT_PULL: u32 = 0b1000;
+
 /// Which GPIO port a bit-bang pin lives on; [`IoPin::new`] clocks it, so no `split` is needed.
 #[derive(Clone, Copy)]
 pub enum Port {
-    /// GPIO port A.
     A,
-    /// GPIO port B.
     B,
-    /// GPIO port C.
     C,
 }
 
-/// A GPIO line driven through the port registers (CRL/CRH for direction, BSRR for level);
-/// `Copy`, holding an identity rather than ownership, and a no-op when `connected` is false.
+/// A GPIO line driven through the port registers; a no-op when not connected.
 #[derive(Clone, Copy)]
 pub struct IoPin {
     port: Port,
@@ -26,7 +27,12 @@ pub struct IoPin {
 
 impl IoPin {
     /// A connected bidirectional line on `port`/`pin`, enabling that port's GPIO clock.
+    ///
+    /// # Panics
+    ///
+    /// If `pin` is 16 or more.
     pub fn new(port: Port, pin: u8) -> Self {
+        assert!(pin < 16, "F1 GPIO index must be below 16");
         // SAFETY: one RMW of RCC APB2ENR during single-threaded bring-up, per-port bits.
         let rcc = unsafe { &*pac::RCC::ptr() };
         rcc.apb2enr().modify(|_, w| match port {
@@ -42,16 +48,18 @@ impl IoPin {
         }
     }
 
-    /// A connected **open-drain** line (nRESET): low is driven, high only releases the net. Such a
-    /// line stays in output mode from its first direction call, so a bare BSRR write reaches it.
+    /// A connected open-drain line (nRESET): low is driven, high only releases the net.
     pub fn open_drain(port: Port, pin: u8) -> Self {
-        Self {
+        let mut line = Self {
             open_drain: true,
             ..Self::new(port, pin)
-        }
+        };
+        // Released and an output from here on: the SWJ wrapper never switches nRESET's mode.
+        line.set_as_input();
+        line
     }
 
-    /// A no-connect pin (unused signal): every operation is a no-op.
+    /// A no-connect pin: every operation is a no-op.
     pub fn nc() -> Self {
         Self {
             port: Port::A,
@@ -61,7 +69,7 @@ impl IoPin {
         }
     }
 
-    /// The register block this pin's port lives in; every F1 GPIO port shares one layout.
+    /// Every F1 GPIO port shares one register layout.
     fn block(&self) -> *const pac::gpioa::RegisterBlock {
         match self.port {
             Port::A => pac::GPIOA::ptr(),
@@ -70,13 +78,11 @@ impl IoPin {
         }
     }
 
-    /// Write the 4-bit CNF+MODE field for this pin in CRL (pins 0..7) or CRH (8..15).
     fn set_mode(&self, mode: u32) {
         if !self.connected {
             return;
         }
-        // SAFETY: a port `new` clocked, whose config bits nothing else rewrites concurrently
-        // (bring-up and the engine are strictly sequential).
+        // SAFETY: the port was clocked by `new`; bring-up and the engine are strictly sequential.
         let r = unsafe { &*self.block() };
         if self.pin < 8 {
             let shift = self.pin as u32 * 4;
@@ -93,8 +99,12 @@ impl IoPin {
 impl InputOutputPin for IoPin {
     #[inline]
     fn set_as_output(&mut self) {
-        // MODE 0b11 (output, 50 MHz) with CNF 0b00 push-pull, or 0b01 open-drain for wired-AND.
-        self.set_mode(if self.open_drain { 0b0111 } else { 0b0011 });
+        // Push-pull, or open-drain for wired-AND.
+        self.set_mode(if self.open_drain {
+            CFG_OUTPUT_OD_50M
+        } else {
+            CFG_OUTPUT_PP_50M
+        });
     }
     #[inline(always)]
     fn set_high(&mut self, high: bool) {
@@ -111,19 +121,22 @@ impl InputOutputPin for IoPin {
         if !self.connected {
             return;
         }
-        // MODE 0b00 (input) with CNF 0b10 (pull up/down); ODR = 1 first selects the pull-up, so
-        // SWDIO idles high and never briefly reads as pull-down. SAFETY: see `set_high`.
+        // ODR = 1 before the input switch selects the pull-up, so SWDIO never reads pulled down.
+        // SAFETY: see `set_high`.
         let r = unsafe { &*self.block() };
         r.bsrr().write(|w| unsafe { w.bits(1 << self.pin) });
-        // An open-drain line is released by the ODR = 1 above and stays an output.
-        self.set_mode(if self.open_drain { 0b0111 } else { 0b1000 });
+        self.set_mode(if self.open_drain {
+            CFG_OUTPUT_OD_50M
+        } else {
+            CFG_INPUT_PULL
+        });
     }
     #[inline(always)]
     fn is_high(&mut self) -> bool {
         if !self.connected {
             return false;
         }
-        // SAFETY: IDR is read-only and reads the real net level even in output mode.
+        // SAFETY: IDR is read-only.
         let r = unsafe { &*self.block() };
         r.idr().read().bits() & (1 << self.pin) != 0
     }

@@ -1,26 +1,36 @@
-//! A source scan for statements written as `debug_assert!` arguments. The macro and its siblings
-//! expand to nothing in release, so a call placed there never runs in a shipped image. Clippy's
-//! `debug_assert_with_mut_call` decides the same question from types and is exact where it
-//! applies, but it skips proc-macro expansions -- so it sees nothing inside `#[rtic::app]` or
-//! `#[embassy_executor::task]`, which is where every firmware task body lives. This scan reads
-//! the source text and so reaches there; it pays for that with a syntactic rule, flagging an
-//! operand that is a call and carries no comparison.
+//! Source scan for calls inside `debug_assert!` operands, reaching proc-macro bodies Clippy skips.
 
 use std::path::{Path, PathBuf};
 
-/// A flagged operand that is in fact effect-free, and why. Keyed by the operand text rather than
-/// a line, so the entry survives edits above it and dies with the assertion it names.
+/// An effect-free flagged operand, keyed by its text so it dies with its assertion.
 pub struct Allowed {
     pub path: &'static str,
     pub argument: &'static str,
     pub reason: &'static str,
 }
 
-pub const ALLOWED: &[Allowed] = &[Allowed {
-    path: "crates/daplink-vfs/src/transfer.rs",
-    argument: "self.is_pending()",
-    reason: "a pure `&self` predicate; the syntactic rule cannot tell it from a mutating call",
-}];
+pub const ALLOWED: &[Allowed] = &[
+    Allowed {
+        path: "crates/daplink-vfs/src/transfer.rs",
+        argument: "self.is_pending()",
+        reason: "a pure `&self` predicate; the syntactic rule cannot tell it from a mutating call",
+    },
+    Allowed {
+        path: "crates/daplink-rs/src/flash_backend.rs",
+        argument: "run.is_none()",
+        reason: "a pure `Option` predicate on a local",
+    },
+    Allowed {
+        path: "tools/vcom-bench/src/record.rs",
+        argument: "stream::key(Direction::HostToDut)",
+        reason: "a pure `const fn`-shaped lookup, compared against its literal",
+    },
+    Allowed {
+        path: "tools/vcom-bench/src/record.rs",
+        argument: "stream::key(Direction::DutToHost)",
+        reason: "a pure `const fn`-shaped lookup, compared against its literal",
+    },
+];
 
 pub struct Finding {
     pub path: String,
@@ -28,7 +38,6 @@ pub struct Finding {
     pub argument: String,
 }
 
-/// Operators that make an operand a comparison rather than a bare call.
 const COMPARISONS: &[&str] = &["==", "!=", "<", ">", "&&", "||"];
 
 /// Every `.rs` file under `dir`, skipping build-artifact and hidden trees.
@@ -87,16 +96,14 @@ fn top_level_commas(arg: &str) -> Vec<&str> {
     parts
 }
 
-/// Flag operands of `debug_assert*!` that are calls with no comparison around them. Returns the
-/// line number and the operand text of each.
+/// Line and text of each `debug_assert*!` operand that is a call with no comparison.
 pub fn scan_source(src: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while let Some(found) = src[at..].find("debug_assert") {
         let start = at + found;
         at = start + "debug_assert".len();
-        // The equality forms carry two operands; every form may carry trailing format arguments,
-        // which are never operands.
+        // Equality forms carry two operands; trailing format arguments are never operands.
         let (operands, rest) = match &src[at..] {
             r if r.starts_with("_eq!") || r.starts_with("_ne!") => (2, &r[4..]),
             r if r.starts_with('!') => (1, &r[1..]),
@@ -160,8 +167,6 @@ pub fn scan(root: &Path) -> Vec<Finding> {
 mod tests {
     use super::{scan, scan_source, ALLOWED};
 
-    /// The shape that shipped dead: the ring push was the assertion's argument, so the bridge leg
-    /// pushed nothing in release.
     #[test]
     fn a_push_written_as_the_assertion_argument_is_flagged() {
         let found = scan_source("debug_assert!(vcom.tx.push(byte));");
@@ -202,7 +207,6 @@ debug_assert!(programmed);
         );
     }
 
-    /// An exemption outlives its assertion silently, so each one must still match live source.
     #[test]
     fn every_allowed_operand_still_exists() {
         for allowed in ALLOWED {

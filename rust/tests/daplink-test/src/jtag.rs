@@ -1,4 +1,4 @@
-//! The jtag case: proves the memory roundtrip over JTAG, on the probe's JTDO/JTAG chain.
+//! The jtag case: the memory roundtrip over JTAG.
 
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::WireProtocol;
@@ -7,8 +7,7 @@ use probe_rs::{MemoryInterface, Permissions};
 use crate::util::chain;
 use crate::{swd, Ctx, Failure};
 
-/// Unroute the trace pin JTDO shares, run the shared roundtrip over JTAG, then hand a fresh SWD
-/// session back to `cx` whatever the outcome.
+/// Unroute the trace pin JTDO shares, run the roundtrip over JTAG, then always reopen SWD.
 pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
     let mut session = cx
         .session
@@ -26,10 +25,7 @@ pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
     result
 }
 
-/// Clear DBGMCU_CR TRACE_IOEN where the target has that register: its trace pin carries JTDO
-/// too, and trace routing the swo case left enabled would break the JTAG chain. A target
-/// without the register shares no pin, so there is nothing to unroute -- and no write to land
-/// on whatever else its address might mean there.
+/// Clear DBGMCU_CR TRACE_IOEN, whose trace pin carries JTDO, where the target has that register.
 pub(crate) fn unroute_trace_pin(
     session: &mut probe_rs::Session,
     dbgmcu_cr: Option<u64>,

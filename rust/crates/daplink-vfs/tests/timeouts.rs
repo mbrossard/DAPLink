@@ -1,19 +1,10 @@
-//! Tick-edge tests: the transfer timeouts and the remount delay accumulated across many small
-//! `dt` steps (the real firmware shape: 1 ms SysTick deltas), with the threshold boundaries
-//! pinned exactly (threshold - 1 does not fire; one more millisecond does).
+//! Tick-edge tests: timeouts and remount delay over 1 ms steps, pinned at their thresholds.
 
+mod common;
+
+use common::{dir_entry, uf2_block};
 use daplink_vfs::transfer::TransferOutcome;
 use daplink_vfs::{fat, MediaState, NoObserver, StatsSink, VfsConfig, VfsFile};
-
-/// Build a root-directory entry for a dropped file.
-fn dir_entry(name: &[u8; 11], attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
-    let mut e = [0u8; 32];
-    e[0..11].copy_from_slice(name);
-    e[11] = attr;
-    e[26..28].copy_from_slice(&first_cluster.to_le_bytes());
-    e[28..32].copy_from_slice(&size.to_le_bytes());
-    e
-}
 
 fn make_vfs<'a>(
     files: &'a mut [&'a mut dyn VfsFile],
@@ -21,43 +12,27 @@ fn make_vfs<'a>(
     daplink_vfs::Vfs::new(VfsConfig::default(), files, StatsSink::new(), NoObserver)
 }
 
-/// One well-formed 512-byte UF2 block carrying four payload bytes at `addr`.
-fn uf2_block(addr: u32) -> [u8; 512] {
-    let mut b = [0u8; 512];
-    b[0..4].copy_from_slice(&0x0A32_4655u32.to_le_bytes()); // MAGIC_START0
-    b[4..8].copy_from_slice(&0x9E5D_5157u32.to_le_bytes()); // MAGIC_START1
-    b[12..16].copy_from_slice(&addr.to_le_bytes()); // target addr
-    b[16..20].copy_from_slice(&4u32.to_le_bytes()); // payload size
-    b[508..512].copy_from_slice(&0x0AB1_6F30u32.to_le_bytes()); // MAGIC_END
-    b
-}
-
-/// Start an unfinishable transfer: a stream whose dirent declared a size it is far short of
-/// cannot complete and can only time out (the active-timeout path).
+/// Start a transfer far short of its declared size, which can only time out.
 fn start_unfinishable_stream(vfs: &mut daplink_vfs::Vfs<'_, StatsSink, NoObserver>) {
     let mut root = [0u8; 512];
     root[0..32].copy_from_slice(&dir_entry(b"BAD     UF2", 0x20, 3, 4096));
     vfs.write_sector(131, &root);
-    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000));
+    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000, &[0; 4]));
     assert!(vfs.is_transfer_active());
 }
 
-/// Start a finishable transfer: an unsized uf2 stream has no in-stream terminator and ends at a
-/// block boundary, so the finishable idle timeout completes it. The dirent is bound first with
-/// the cluster still unallocated, so the window is unknown and the block-magic content guard is
-/// what lets the first sector start it.
+/// Start an unsized uf2 transfer the finishable idle timeout completes.
 fn start_finishable_stream(vfs: &mut daplink_vfs::Vfs<'_, StatsSink, NoObserver>) {
     let mut root = [0u8; 512];
     root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 0, 0));
     vfs.write_sector(131, &root);
-    vfs.write_sector(fat::DATA_START_LBA, &uf2_block(0x0800_0000));
+    vfs.write_sector(fat::DATA_START_LBA, &uf2_block(0x0800_0000, &[0; 4]));
     assert!(vfs.is_transfer_active());
 }
 
 #[test]
 fn active_timeout_accumulates_in_small_steps() {
-    // The 20 s active timeout must accumulate across many 1 ms deltas exactly as it would from
-    // one big jump: 19,999 single-millisecond ticks stay Ready, the 20,000th fires the timeout.
+    // The active timeout accumulates over 1 ms ticks exactly: 19,999 stay Ready, 20,000 fire.
     let mut files: [&mut dyn VfsFile; 0] = [];
     let mut vfs = make_vfs(&mut files);
     start_unfinishable_stream(&mut vfs);
@@ -72,12 +47,7 @@ fn active_timeout_accumulates_in_small_steps() {
 
 #[test]
 fn finishable_timeout_boundary() {
-    // An unsized transfer -- no dirent has ever supplied a size -- completes on the
-    // longer unsized idle timeout, not the tight sized-and-met one: one ms short of it stays
-    // Ready, one more completes the transfer and detaches the volume. This is also the
-    // regression case for a paused-but-not-finished unsized copy: a >= 500 ms gap (the OLD
-    // threshold, still exercised by `paused_unsized_stream_does_not_complete_early` below) must
-    // NOT complete it early.
+    // An unsized transfer completes on the unsized idle timeout, not the sized one.
     let mut files: [&mut dyn VfsFile; 0] = [];
     let mut vfs = make_vfs(&mut files);
     start_finishable_stream(&mut vfs);
@@ -93,11 +63,7 @@ fn finishable_timeout_boundary() {
 
 #[test]
 fn paused_unsized_stream_does_not_complete_early() {
-    // The composed failure this backs out of: a paused (not finished) unsized copy must
-    // survive a gap at least as long as the OLD 500 ms finishable threshold without being
-    // declared Done. A premature Done here would flash whatever prefix had streamed so far and
-    // report success, then the remount would clear the directory shadow so the host's resumed
-    // writes re-diff as a fresh Created and start a second transfer over the same drop.
+    // A paused unsized copy must not be declared Done during a 500 ms gap.
     let mut files: [&mut dyn VfsFile; 0] = [];
     let mut vfs = make_vfs(&mut files);
     start_finishable_stream(&mut vfs);
@@ -109,7 +75,7 @@ fn paused_unsized_stream_does_not_complete_early() {
     );
     assert!(vfs.is_transfer_active(), "the transfer is still open");
     // The host resumes streaming: the same transfer continues rather than restarting.
-    vfs.write_sector(fat::DATA_START_LBA + 1, &uf2_block(0x0800_0100));
+    vfs.write_sector(fat::DATA_START_LBA + 1, &uf2_block(0x0800_0100, &[0; 4]));
     assert!(
         vfs.is_transfer_active(),
         "resumed data extends the same transfer, not a second one"
@@ -118,16 +84,14 @@ fn paused_unsized_stream_does_not_complete_early() {
 
 #[test]
 fn known_size_unmet_stall_uses_active_timeout_and_fails_loud() {
-    // A stream whose dirent size is known but which stalls SHORT of it must not complete a
-    // truncated prefix on the 500 ms finishable timeout: the 20 s active timeout applies, and
-    // when it fires the outcome is a loud Timeout, not Done.
+    // A sized stream stalled short of its size times out loud on the active timeout, not Done.
     let mut files: [&mut dyn VfsFile; 0] = [];
     let mut vfs = make_vfs(&mut files);
     let mut root = [0u8; 512];
     root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 3, 2048));
     vfs.write_sector(131, &root);
     // 512 of the declared 2048 bytes, then silence.
-    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000));
+    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000, &[0; 4]));
     assert!(vfs.is_transfer_active());
 
     // Well past the finishable threshold: the short stream must NOT complete.
@@ -144,8 +108,7 @@ fn known_size_unmet_stall_uses_active_timeout_and_fails_loud() {
 
 #[test]
 fn bound_never_streamed_boundary() {
-    // A recognized image dirent with no accepted data is under the active timeout: 19,999 ms of
-    // silence stays Ready, one more millisecond fails the drop loud and detaches the volume.
+    // A bound image with no accepted data fails at exactly the active timeout.
     let mut files: [&mut dyn VfsFile; 0] = [];
     let mut vfs = make_vfs(&mut files);
     let mut root = [0u8; 512];
@@ -165,8 +128,7 @@ fn bound_never_streamed_boundary() {
 
 #[test]
 fn reconnect_boundary_and_write_resets_idle() {
-    // Remount boundary: 2,499 ms after detaching the volume is still detached; one more
-    // millisecond remounts it and raises the media-changed latch.
+    // Remount boundary: detached at 2,499 ms, remounted with the media-changed latch at 2,500.
     let mut files: [&mut dyn VfsFile; 0] = [];
     let mut vfs = make_vfs(&mut files);
     start_finishable_stream(&mut vfs);
@@ -181,9 +143,7 @@ fn reconnect_boundary_and_write_resets_idle() {
     assert_eq!(vfs.tick(1), MediaState::Ready);
     assert!(vfs.take_media_changed(), "a remount raises the latch");
 
-    // A mid-transfer data-sector write resets the accumulated idle: after part of the unsized
-    // idle window plus a write, the window restarts (one ms short of it stays Ready, one more
-    // fires).
+    // A mid-transfer write restarts the idle window.
     let mut files: [&mut dyn VfsFile; 0] = [];
     let mut vfs = make_vfs(&mut files);
     start_finishable_stream(&mut vfs);
@@ -192,7 +152,7 @@ fn reconnect_boundary_and_write_resets_idle() {
         MediaState::Ready
     );
     // The stream's next sector, restarting the idle window.
-    vfs.write_sector(fat::DATA_START_LBA + 1, &uf2_block(0x0800_0100));
+    vfs.write_sector(fat::DATA_START_LBA + 1, &uf2_block(0x0800_0100, &[0; 4]));
     assert_eq!(
         vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_UNSIZED_MS - 1),
         MediaState::Ready,
@@ -202,11 +162,7 @@ fn reconnect_boundary_and_write_resets_idle() {
     assert_eq!(vfs.sink().outcome(), Some(TransferOutcome::Done));
 }
 
-/// Regression (bench): a transfer that ends via the IDLE-TIMEOUT detach edge after a prior
-/// remount cycle must schedule its remount at exactly `MSC_RECONNECT_MS`. The first cycle
-/// leaves the volume's internal remount timer in a used state; the second detach must re-arm
-/// the schedule from the constant rather than inherit anything stale -- a stale value here
-/// once pushed the remount into the far future and the drive never came back.
+/// An idle-timeout detach after a prior remount cycle re-arms exactly `MSC_RECONNECT_MS`.
 #[test]
 fn idle_timeout_detach_after_prior_remount_schedules_exact_reconnect() {
     let mut files: [&mut dyn VfsFile; 0] = [];
@@ -221,15 +177,14 @@ fn idle_timeout_detach_after_prior_remount_schedules_exact_reconnect() {
     assert_eq!(vfs.tick(daplink_vfs::MSC_RECONNECT_MS), MediaState::Ready);
     assert!(vfs.take_media_changed());
 
-    // Cycle 2 (the bench sequence): another transfer ends via the idle-timeout detach edge.
+    // Cycle 2: another transfer ends via the idle-timeout detach edge.
     start_finishable_stream(&mut vfs);
     assert_eq!(
         vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_UNSIZED_MS),
         MediaState::Detached,
         "idle-timeout path detaches the volume"
     );
-    // The scheduled delay is exactly MSC_RECONNECT_MS: one millisecond short stays detached,
-    // one more remounts.
+    // The delay is exactly MSC_RECONNECT_MS.
     assert_eq!(
         vfs.tick(daplink_vfs::MSC_RECONNECT_MS - 1),
         MediaState::Detached,
@@ -243,8 +198,7 @@ fn idle_timeout_detach_after_prior_remount_schedules_exact_reconnect() {
     assert!(vfs.take_media_changed(), "the remount republishes status");
 }
 
-/// The FINISHED-LATCH detach edge (a self-terminating stream, e.g. a final uf2 block) re-arms
-/// the same exact `MSC_RECONNECT_MS` schedule after a prior remount cycle.
+/// The finished-latch detach edge also re-arms exactly `MSC_RECONNECT_MS` after a cycle.
 #[test]
 fn finished_latch_detach_after_prior_remount_schedules_exact_reconnect() {
     let mut files: [&mut dyn VfsFile; 0] = [];
@@ -258,13 +212,16 @@ fn finished_latch_detach_after_prior_remount_schedules_exact_reconnect() {
     );
     assert_eq!(vfs.tick(daplink_vfs::MSC_RECONNECT_MS), MediaState::Ready);
 
-    // Cycle 2: a sized transfer whose last sector completes it -- the finished latch fires on
-    // the next tick without any idle accumulation.
+    // Cycle 2: a sized transfer completed by its last sector detaches after the write silence.
     let mut root = [0u8; 512];
     root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 3, 512));
     vfs.write_sector(131, &root);
-    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000));
-    assert_eq!(vfs.tick(1), MediaState::Detached, "finished-latch detach");
+    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000, &[0; 4]));
+    assert_eq!(
+        vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_MS),
+        MediaState::Detached,
+        "finished-latch detach"
+    );
 
     assert_eq!(
         vfs.tick(daplink_vfs::MSC_RECONNECT_MS - 1),
@@ -273,10 +230,7 @@ fn finished_latch_detach_after_prior_remount_schedules_exact_reconnect() {
     assert_eq!(vfs.tick(1), MediaState::Ready);
 }
 
-/// Degenerate tick sequences around a detach must neither remount early nor defer the remount:
-/// a burst of zero-elapsed ticks (a sub-millisecond service loop) leaves the schedule intact,
-/// and an oversized elapsed value (a caller's stale-timestamp delta) saturates into an
-/// immediate remount instead of wrapping into a far-future one.
+/// Zero-elapsed ticks leave the remount schedule intact; an oversized delta saturates.
 #[test]
 fn detach_schedule_survives_zero_and_oversized_ticks() {
     // Zero-elapsed storm: the countdown must not move (no early remount, no deferral).
@@ -305,4 +259,48 @@ fn detach_schedule_survives_zero_and_oversized_ticks() {
         MediaState::Detached
     );
     assert_eq!(vfs.tick(u32::MAX), MediaState::Ready);
+}
+
+/// A corrupt block in the declared window ends the transfer at once; remount on the next tick.
+#[test]
+fn a_corrupt_block_needs_no_idle_wait() {
+    let mut files: [&mut dyn VfsFile; 0] = [];
+    let mut vfs = make_vfs(&mut files);
+    let mut root = [0u8; 512];
+    root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 3, 4 * 512));
+    vfs.write_sector(131, &root);
+    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000, &[0; 4]));
+    assert!(vfs.is_transfer_active());
+
+    vfs.write_sector(fat::cluster_to_lba(3) + 2, &[0x5Au8; 512]);
+    assert!(!vfs.is_transfer_active(), "the corrupt write ended it");
+    assert_eq!(vfs.transfer_timeout(), 0, "nothing is waiting on a timeout");
+    assert_eq!(vfs.tick(1), MediaState::Detached);
+    assert!(vfs.take_transfer_finished());
+    assert_eq!(vfs.sink().outcome(), Some(TransferOutcome::DecodeError));
+}
+
+/// A sized stream with a gap waits only the gapped window before reporting the reorder.
+#[test]
+fn gapped_timeout_boundary() {
+    let mut files: [&mut dyn VfsFile; 0] = [];
+    let mut vfs = make_vfs(&mut files);
+    let mut root = [0u8; 512];
+    root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 3, 4 * 512));
+    vfs.write_sector(131, &root);
+    vfs.write_sector(fat::cluster_to_lba(3), &uf2_block(0x0800_0000, &[0; 4]));
+    vfs.write_sector(fat::cluster_to_lba(3) + 2, &uf2_block(0x0800_0200, &[0; 4]));
+    assert_eq!(
+        vfs.transfer_timeout(),
+        daplink_vfs::MSC_TIMEOUT_GAPPED_MS,
+        "the discarded sector shortens the wait"
+    );
+
+    assert_eq!(
+        vfs.tick(daplink_vfs::MSC_TIMEOUT_GAPPED_MS - 1),
+        MediaState::Ready
+    );
+    assert_eq!(vfs.tick(1), MediaState::Detached);
+    assert!(vfs.take_transfer_finished());
+    assert_eq!(vfs.sink().outcome(), Some(TransferOutcome::OutOfOrder));
 }

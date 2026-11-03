@@ -43,7 +43,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Decode the discovery `kind` byte.
     pub fn from_u8(v: u8) -> Kind {
         match v {
             0x00 => Kind::None,
@@ -54,7 +53,6 @@ impl Kind {
         }
     }
 
-    /// A short human-readable name for the bootloader.
     pub fn label(self) -> &'static str {
         match self {
             Kind::None => "none (no ROM update path)",
@@ -84,7 +82,6 @@ impl Kind {
     }
 }
 
-/// A parsed discovery reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Discovery {
     /// The vendor-command protocol version byte.
@@ -93,8 +90,7 @@ pub struct Discovery {
     pub kind: Kind,
 }
 
-/// Parse a discovery reply `[0x9F, b"dlrs", version, kind]`; a wrong id echo or magic means the
-/// probe is not a daplink-rs probe.
+/// Parse a discovery reply `[0x9F, b"dlrs", version, kind]`; a wrong echo or magic is a foreign probe.
 pub fn parse_discovery(resp: &[u8]) -> Result<Discovery> {
     if resp.len() < 7 {
         bail!("discovery reply too short ({} bytes, need 7)", resp.len());
@@ -130,7 +126,6 @@ pub enum Status {
 }
 
 impl Status {
-    /// Decode the status byte.
     pub fn from_u8(v: u8) -> Status {
         match v {
             0x00 => Status::Armed,
@@ -141,7 +136,6 @@ impl Status {
         }
     }
 
-    /// A human-readable description.
     pub fn label(self) -> &'static str {
         match self {
             Status::Armed => "armed (probe detaching)",
@@ -199,7 +193,6 @@ mod tests {
 
     #[test]
     fn rejects_a_foreign_probe_reply() {
-        // Another probe answering 0x9F without the magic (or 0xFF invalid) is "not ours".
         let foreign = [0x9F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert!(parse_discovery(&foreign).is_err());
         let too_short = [0x9F, b'd', b'l'];

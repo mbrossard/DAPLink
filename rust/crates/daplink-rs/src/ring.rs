@@ -3,23 +3,19 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-/// SPSC byte ring plus an overrun counter, buffering `N - 1` bytes; split once with
-/// [`split`](ByteRing::split). Plain atomic load/store only, never RMW, so it is sound on thumbv6m.
+/// SPSC byte ring plus an overrun counter, buffering `N - 1` bytes; load/store only, sound on thumbv6m.
 pub struct ByteRing<const N: usize> {
-    /// Backing storage; each cell is written only by the producer and read only by the consumer,
-    /// at disjoint indices, so per-cell interior mutability is sound.
+    /// Each cell is written only by the producer and read only by the consumer, at disjoint indices.
     buf: [UnsafeCell<u8>; N],
     /// Next write index (owned by the producer, observed by the consumer).
     head: AtomicUsize,
     /// Next read index (owned by the consumer, observed by the producer).
     tail: AtomicUsize,
-    /// Bytes the producer dropped into a full ring, ever; written only by the producer, so the
-    /// consumer snapshots it rather than clearing it.
+    /// Bytes the producer dropped into a full ring; producer-written, so the consumer snapshots it.
     overruns: AtomicU32,
 }
 
-// SAFETY: cells are accessed only through the producer/consumer split at disjoint indices, with
-// head/tail publishing the hand-off via Acquire/Release ordering.
+// SAFETY: cells are accessed only through the split at disjoint indices, published via Acquire/Release.
 unsafe impl<const N: usize> Sync for ByteRing<N> {}
 
 impl<const N: usize> ByteRing<N> {
@@ -83,8 +79,7 @@ impl<const N: usize> ByteProducer<'_, N> {
         }
     }
 
-    /// Push one byte, reporting whether it fit; on a full ring the byte is dropped and the
-    /// overrun counted.
+    /// Push one byte, reporting whether it fit; a dropped byte counts an overrun.
     pub fn push(&mut self, b: u8) -> bool {
         let head = self.ring.head.load(Ordering::Relaxed);
         let next = ByteRing::<N>::wrap_next(head);
@@ -95,8 +90,7 @@ impl<const N: usize> ByteProducer<'_, N> {
             self.ring.overruns.store(n, Ordering::Relaxed);
             return false;
         }
-        // SAFETY: only the producer advances `head`, and the consumer never reads this cell until
-        // the Release store below publishes the new `head`.
+        // SAFETY: only the producer writes this cell, published by the Release store of `head` below.
         unsafe { *self.ring.buf[head].get() = b };
         self.ring.head.store(next, Ordering::Release);
         true
@@ -106,8 +100,7 @@ impl<const N: usize> ByteProducer<'_, N> {
 /// Bytes one interrupt entry moves out of a hardware RX FIFO before it returns.
 pub const FIFO_DRAIN_BUDGET: usize = 32;
 
-/// Push up to `budget` bytes from `next` into `producer`, returning the count. The budget is what
-/// keeps a line that refills the FIFO as fast as the loop empties it from holding the interrupt.
+/// Push up to `budget` bytes from `next`, so a line refilling the FIFO cannot hold the interrupt.
 pub fn drain_fifo<const N: usize>(
     producer: &mut ByteProducer<'_, N>,
     budget: usize,
@@ -144,8 +137,7 @@ impl<const N: usize> ByteConsumer<'_, N> {
         if tail == self.ring.head.load(Ordering::Acquire) {
             return None;
         }
-        // SAFETY: `head != tail` means this cell was fully written and published; only the
-        // consumer advances `tail`, so the read cannot race.
+        // SAFETY: `head != tail` means this cell was published, and only the consumer advances `tail`.
         let b = unsafe { *self.ring.buf[tail].get() };
         self.ring
             .tail
@@ -184,14 +176,13 @@ impl<const N: usize> ByteConsumer<'_, N> {
         self.ring.head.load(Ordering::Acquire) == self.ring.tail.load(Ordering::Relaxed)
     }
 
-    /// Discard all buffered bytes and any overruns recorded so far.
+    /// Drain until empty and acknowledge overruns; continuous production can prevent completion.
     pub fn clear(&mut self) {
         while self.pop().is_some() {}
         self.overruns_seen = self.ring.overruns.load(Ordering::Relaxed);
     }
 
-    /// Whether the producer overran since the last call; a snapshot of the producer-owned total,
-    /// so an overrun landing concurrently is reported next time rather than erased.
+    /// Whether the producer overran since the last call; a concurrent overrun is reported next time.
     pub fn take_overrun(&mut self) -> bool {
         let total = self.ring.overruns.load(Ordering::Relaxed);
         let overran = total != self.overruns_seen;

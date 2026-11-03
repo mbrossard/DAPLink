@@ -10,16 +10,13 @@ const MSD_OPEN: u8 = 0x8A;
 const MSD_CLOSE: u8 = 0x8B;
 /// `MSD_Write`: one chunk of the image stream. `[id, len, data...]` -> `[id, error_t]`.
 const MSD_WRITE: u8 = 0x8C;
-/// `SelectEraseMode`: 0 selects chip erase, nonzero selects sector erase. `[id, mode]` ->
-/// `[id, DAP_OK]`.
+/// `SelectEraseMode`: 0 chip erase, nonzero sector erase. `[id, mode]` -> `[id, DAP_OK]`.
 const SELECT_ERASE_MODE: u8 = 0x8D;
-/// uf2 stream type.
 const STREAM_TYPE_UF2: u8 = 2;
 /// Shared success status for every reply in this set (`ERROR_SUCCESS` and `DAP_OK` are both 0).
 const STATUS_OK: u8 = 0x00;
 
-/// Reflash `--dut-uf2` over raw bulk and verify the readback; skips when the firmware answers
-/// the first vendor command as unimplemented.
+/// Reflash `--dut-uf2` over raw bulk and verify; skips when the first vendor command is unimplemented.
 pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
     let uf2_path = cx
         .dut_uf2
@@ -60,19 +57,28 @@ pub(crate) fn run(cx: &mut Ctx, full_run: bool) -> Result<(), Failure> {
     verify(cx, addr, payload)
 }
 
-/// `MSD_Open`, every chunk of `image` through `MSD_Write`, then `MSD_Close`, requiring status 0
-/// throughout.
 fn stream_image(dap: &mut RawDap, chunk: usize, image: &[u8]) -> Result<(), String> {
-    let open = dap.command(&[MSD_OPEN, STREAM_TYPE_UF2])?;
+    stream(|request| dap.command(request), chunk, image)
+}
+
+/// `MSD_Open`, every chunk through `MSD_Write`, then `MSD_Close`, requiring status 0 throughout.
+fn stream(
+    mut command: impl FnMut(&[u8]) -> Result<Vec<u8>, String>,
+    chunk: usize,
+    image: &[u8],
+) -> Result<(), String> {
+    let open = command(&[MSD_OPEN, STREAM_TYPE_UF2])?;
     expect_ok(&open, MSD_OPEN, "MSD_Open")?;
 
-    for piece in image.chunks(chunk) {
-        let resp = dap.command(&write_report(piece))?;
-        expect_ok(&resp, MSD_WRITE, "MSD_Write")?;
-    }
+    let written = image.chunks(chunk).try_for_each(|piece| {
+        let resp = command(&write_report(piece))?;
+        expect_ok(&resp, MSD_WRITE, "MSD_Write")
+    });
 
-    let close = dap.command(&[MSD_CLOSE])?;
-    expect_ok(&close, MSD_CLOSE, "MSD_Close")
+    // A failed stream holds its open slot until a close.
+    let close = command(&[MSD_CLOSE]);
+    written?;
+    expect_ok(&close?, MSD_CLOSE, "MSD_Close")
 }
 
 /// Frame one `MSD_Write` chunk: `[id, len, data...]`, `len` a single byte.
@@ -113,6 +119,39 @@ fn expect_ok(resp: &[u8], id: u8, what: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which ids the stream sent, with the write at `refuse` answered with a bad status.
+    fn stream_ids(refuse: Option<usize>) -> (Vec<u8>, Result<(), String>) {
+        let mut ids = Vec::new();
+        let mut writes = 0;
+        let result = stream(
+            |request| {
+                ids.push(request[0]);
+                let refused = request[0] == MSD_WRITE && {
+                    writes += 1;
+                    Some(writes) == refuse
+                };
+                Ok(vec![request[0], u8::from(refused)])
+            },
+            2,
+            &[0; 6],
+        );
+        (ids, result)
+    }
+
+    #[test]
+    fn a_stream_closes_after_every_write() {
+        let (ids, result) = stream_ids(None);
+        assert_eq!(ids, [MSD_OPEN, MSD_WRITE, MSD_WRITE, MSD_WRITE, MSD_CLOSE]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_refused_write_stops_the_stream_closes_it_and_stays_the_error() {
+        let (ids, result) = stream_ids(Some(2));
+        assert_eq!(ids, [MSD_OPEN, MSD_WRITE, MSD_WRITE, MSD_CLOSE]);
+        assert!(result.unwrap_err().starts_with("MSD_Write"));
+    }
 
     #[test]
     fn chunk_len_reserves_the_id_and_length_bytes() {

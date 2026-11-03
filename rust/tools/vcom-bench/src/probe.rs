@@ -3,9 +3,10 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use dap_bench::dap;
 use dap_bench::transport::{self, Probe, ProbeSelector};
 
-use crate::stream::VcomCounters;
+use crate::counters::VcomCounters;
 
 /// Vendor command id of the VCOM realized-baud query (`ID_DAP_Vendor30`).
 const VCOM_BAUD_CMD: u8 = 0x9E;
@@ -13,8 +14,7 @@ const VCOM_BAUD_CMD: u8 = 0x9E;
 /// Vendor command id of the VCOM counter query (`ID_DAP_Vendor29`).
 const VCOM_STATS_CMD: u8 = 0x9D;
 
-/// The two `0x9E` reply lengths, negotiated the same way: the realized rate alone (v1), and the
-/// realized rate with the applied rate and the `flags` word (v2).
+/// `0x9E` reply lengths: realized rate alone (v1), or with applied rate and `flags` (v2).
 const VCOM_BAUD_V1_LEN: usize = 5;
 const VCOM_BAUD_V2_LEN: usize = 13;
 
@@ -23,8 +23,7 @@ const VCOM_BAUD_APPLIED_VALID: u32 = 1 << 0;
 /// `flags` bit: no rate change is in flight. Meaningful only with `VCOM_BAUD_APPLIED_VALID`.
 const VCOM_BAUD_SETTLED: u32 = 1 << 1;
 
-/// The three reply lengths, negotiated by length alone: six counters (v1), six plus the valid
-/// word, and twelve plus the `valid`, `grade` and `units` words (v2).
+/// Length-negotiated replies: six counters, six plus validity, or nine plus validity/grade/units.
 const VCOM_STATS_V1_LEN: usize = 1 + 4 * 6;
 const VCOM_STATS_V1_VALID_LEN: usize = VCOM_STATS_V1_LEN + 4;
 const VCOM_STATS_V2_FIELDS: usize = 9;
@@ -39,8 +38,7 @@ pub struct DapLink {
 }
 
 impl DapLink {
-    /// Open the CMSIS-DAP v2 bulk interface matching `selector` (`VID:PID[:serial]`).
-    /// With `vendor` false the vendor queries are never sent and read as unserved.
+    /// Open the bulk interface matching `selector`; without `vendor` the vendor queries read unserved.
     pub fn open(selector: &str, vendor: bool) -> Result<DapLink> {
         let selector: ProbeSelector = selector
             .parse()
@@ -59,6 +57,31 @@ impl DapLink {
     /// Bulk max packet size the probe enumerated with: 64 on full-speed, 512 on high-speed.
     pub fn max_packet_size(&self) -> usize {
         self.max_packet_size
+    }
+
+    /// The probe's `DAP_Info` packet geometry; a field the probe rejects reads `None`.
+    pub fn packet_geometry(&mut self) -> Result<PacketGeometry> {
+        let mut query = |id| self.probe.transfer(&dap::encode_info(id), TIMEOUT).ok();
+        Ok(PacketGeometry {
+            size: query(dap::InfoId::PacketSize)
+                .and_then(|r| dap::decode_info_packet_size(&r).ok()),
+            count: query(dap::InfoId::PacketCount)
+                .and_then(|r| dap::decode_info_packet_count(&r).ok()),
+        })
+    }
+
+    /// `DAP_Info`'s firmware row and firmware version; a field the probe rejects reads `None`.
+    pub fn firmware_identity(&mut self) -> (Option<String>, Option<String>) {
+        let mut query = |id| {
+            let reply = self.probe.transfer(&dap::encode_info(id), TIMEOUT).ok()?;
+            dap::decode_info_string(&reply)
+                .ok()
+                .filter(|s| !s.is_empty())
+        };
+        (
+            query(dap::InfoId::FirmwareRow),
+            query(dap::InfoId::FirmwareVersion),
+        )
     }
 
     /// `None` when the firmware does not serve the query (answers `0xFF`, or a short reply).
@@ -80,8 +103,14 @@ impl DapLink {
     }
 }
 
-/// The probe's answer to `0x9E`. A firmware predating the applied-ness reply leaves `settled`
-/// `None`, which is the host's cue that it can only infer settling from a timeout.
+/// `DAP_PACKET_SIZE` and `DAP_PACKET_COUNT` as the probe reports them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacketGeometry {
+    pub size: Option<u16>,
+    pub count: Option<u8>,
+}
+
+/// The probe's answer to `0x9E`; `settled` is `None` where the firmware does not report it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VcomBaud {
     /// The rate the divisor now on the wire produces, `None` before the first programming.
@@ -96,8 +125,7 @@ fn parse_vcom_baud(resp: &[u8]) -> Option<VcomBaud> {
     if resp.first() != Some(&VCOM_BAUD_CMD) {
         return None;
     }
-    // A longer reply than this host knows is read as far as it does know, so a firmware ahead of
-    // the tool stays measurable in exactly the way an older one does.
+    // A longer reply than this host knows is read as far as it knows.
     if resp.len() < VCOM_BAUD_V1_LEN {
         return None;
     }

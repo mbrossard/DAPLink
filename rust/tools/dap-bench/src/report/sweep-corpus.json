@@ -1,0 +1,38 @@
+{
+  "schema_version": 6,
+  "timestamp_utc": "2026-01-02T03:04:05Z",
+  "probe": {
+    "vendor": "vendor\"\\\n\t\u0001",
+    "product": null,
+    "serial": "serial\rnumber",
+    "firmware_version": null,
+    "firmware_row": "firmware/mculink",
+    "firmware_row_source": "image",
+    "packet_size": null,
+    "packet_count": 4
+  },
+  "protocol": "swd",
+  "target": "target\"name",
+  "window_ms": 500,
+  "chunk_bytes": 4096,
+  "sweep": {
+    "rows": [
+      {
+        "clock_hz": 1000000,
+        "kib_per_s": 123.4,
+        "iterations": 10,
+        "verdict": "pass",
+        "depth": 1
+      },
+      {
+        "clock_hz": 2000000,
+        "kib_per_s": null,
+        "iterations": 0,
+        "verdict": "fail",
+        "depth": 4
+      }
+    ],
+    "plateau_hz": null,
+    "failure_interval_hz": [1000000, null]
+  }
+}

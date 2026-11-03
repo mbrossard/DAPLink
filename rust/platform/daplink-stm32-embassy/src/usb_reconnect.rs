@@ -2,7 +2,7 @@
 
 use daplink_rs::daplink_core::UsbReconnect;
 
-/// Forces a USB re-enumeration by toggling the device controller's internal D+ pull-up.
+/// Re-enumerates by toggling the controller's internal D+ pull-up.
 pub struct StmUsbReconnect;
 
 impl UsbReconnect for StmUsbReconnect {

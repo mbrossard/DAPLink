@@ -1,6 +1,5 @@
 //! Virtual files exposed on the volume: the [`VfsFile`] trait plus the built-in status files.
 
-/// One logical sector, in bytes.
 const SECTOR: usize = 512;
 
 /// A file rendered on demand into the virtual volume.
@@ -9,8 +8,7 @@ pub trait VfsFile {
     fn name(&self) -> &FatShortName;
     /// The file size, in bytes.
     fn size(&self) -> u32;
-    /// Whether the file currently exists on the volume; `false` gets no directory entry and no
-    /// cluster chain. Sampled per (re)mount, so the answer must be stable between remounts.
+    /// Whether the file exists on the volume; sampled per (re)mount, so keep it stable between.
     fn present(&self) -> bool {
         true
     }
@@ -98,7 +96,6 @@ impl FileAttrs {
     pub const HIDDEN: FileAttrs = FileAttrs(0x02);
 }
 
-/// Copy up to a sector's worth of `body` starting at `sector_offset` into `buf`.
 fn read_from(body: &[u8], sector_offset: u32, buf: &mut [u8]) -> usize {
     let start = sector_offset as usize * SECTOR;
     if start >= body.len() {
@@ -116,23 +113,19 @@ pub struct DeviceInfo<'a> {
     pub version: &'a str,
     /// Device serial string.
     pub serial: &'a str,
-    /// Probe resets since power-on, or 0 when the firmware does not track it. Sampled once at
-    /// boot, so a jump between two reads of `DETAILS.TXT` proves a reboot in between.
+    /// Probe resets since power-on (0 if untracked), sampled once at boot.
     pub reset_count: u32,
 }
 
 /// Width of the fixed `Status:` field in `DETAILS.TXT`; longer status text is truncated.
 pub const STATUS_MAX: usize = 64;
 
-/// Width of the fixed `Fault:` field in `DETAILS.TXT`, and of the reason a
-/// [`ResetStamp`](crate::stamp::ResetStamp) latches for it.
+/// Width of the `Fault:` field and retained fault reason.
 pub const FAULT_MAX: usize = 48;
 
-/// Width of the fixed zero-padded counter fields in `DETAILS.TXT`.
 const COUNTER_WIDTH: usize = 8;
 
-/// A fixed 512-byte `DETAILS.TXT`, baked once at construction. Only the `Remount count:`,
-/// `Status:` and `Fault:` fields are patched in place, so no size or offset ever moves.
+/// A fixed 512-byte `DETAILS.TXT`; remount, status and fault fields are patched in place.
 pub struct DetailsFile<'a> {
     body: [u8; SECTOR],
     /// Byte offset of the `Remount count:` numeric field.
@@ -145,7 +138,7 @@ pub struct DetailsFile<'a> {
     _info: core::marker::PhantomData<&'a ()>,
 }
 
-/// Write `v` into `field` as zero-padded decimal (saturating at all-nines on overflow).
+/// Write `v` into `field` as zero-padded decimal, saturating at all nines.
 fn write_counter(field: &mut [u8], mut v: u32) {
     field.fill(b'0');
     let mut i = field.len();
@@ -161,8 +154,7 @@ fn write_counter(field: &mut [u8], mut v: u32) {
 }
 
 impl<'a> DetailsFile<'a> {
-    /// An unbaked details file: an all-zero body and no field offsets. Every field is a plain
-    /// value, so a `static` holding it lands in `.bss` and can be [`bake`](Self::bake)d in place.
+    /// An unbaked, all-zero details file, so a `static` lands in `.bss` and is baked in place.
     pub const BLANK: Self = Self {
         body: [0u8; SECTOR],
         remount_off: 0,
@@ -179,8 +171,7 @@ impl<'a> DetailsFile<'a> {
         this
     }
 
-    /// Render the whole body for `info` in place, with no sector-sized temporary in the caller's
-    /// frame. Resets the remount counter, so call it once.
+    /// Render the whole body for `info` in place; resets the remount counter, so call it once.
     pub fn bake(&mut self, info: DeviceInfo<'a>) {
         self.remount_count = 0;
         let body = &mut self.body;
@@ -218,8 +209,7 @@ impl<'a> DetailsFile<'a> {
 }
 
 impl DetailsFile<'_> {
-    /// Seed the `Status:` field with a status that survived a probe reset (from a
-    /// [`ResetStamp`](crate::stamp::ResetStamp)), without counting a remount.
+    /// Seed `Status:` with a status that survived a probe reset, without counting a remount.
     pub fn seed_status(&mut self, status: &[u8]) {
         let field = &mut self.body[self.status_off..self.status_off + STATUS_MAX];
         field.fill(b' ');
@@ -227,8 +217,7 @@ impl DetailsFile<'_> {
         field[..n].copy_from_slice(&status[..n]);
     }
 
-    /// Seed the `Fault:` field with the reason a fault latched before the reset that ended the
-    /// previous boot; blank when the probe has not faulted.
+    /// Seed `Fault:` with the reason a fault latched before the previous boot's reset.
     pub fn seed_fault(&mut self, reason: &[u8]) {
         let field = &mut self.body[self.fault_off..self.fault_off + FAULT_MAX];
         field.fill(b' ');
@@ -351,8 +340,7 @@ mod tests {
         assert_eq!(buf[off + FAULT_MAX], b'\r');
     }
 
-    /// frozen: a host that scrapes `Status:`/`Fault:` at fixed columns, or caches the 512-byte
-    /// size across remounts, depends on every one of these bytes and offsets staying put.
+    /// Frozen: hosts scrape `Status:`/`Fault:` at fixed columns and cache the 512-byte size.
     #[test]
     fn details_txt_golden_vector_known_device() {
         const SERIAL: &str = "1234567890ABCDEF";

@@ -74,8 +74,7 @@ pub(crate) fn parse_csw(bytes: &[u8], expected_tag: u32) -> Result<(u8, u32), St
     Ok((bytes[12], residue))
 }
 
-/// FAT16 geometry, parsed from the boot sector the volume actually rendered; nothing is
-/// hardcoded, since probes differ.
+/// FAT16 geometry, parsed from the boot sector the volume actually rendered.
 pub(crate) struct BootLayout {
     bytes_per_sector: u16,
     sectors_per_cluster: u8,
@@ -194,8 +193,7 @@ pub(crate) fn find_free_slot(root: &[u8]) -> Option<usize> {
     None
 }
 
-/// The lowest cluster past every entry already in `root`, so a drop never collides with the
-/// generated files however many the firmware carries.
+/// The lowest cluster past every entry already in `root`.
 pub(crate) fn next_free_cluster(root: &[u8], layout: &BootLayout) -> u32 {
     let cluster_bytes = layout.sectors_per_cluster() * SECTOR_SIZE as u32;
     let mut end = 2u32;
@@ -216,8 +214,7 @@ pub(crate) fn next_free_cluster(root: &[u8], layout: &BootLayout) -> u32 {
     end
 }
 
-/// Patch FAT sector `sector_idx` (256 entries per 512-byte FAT16 sector) with what a contiguous
-/// chain from `first_cluster` contributes; everything else is left as the caller supplied it.
+/// Patch FAT sector `sector_idx` with a contiguous chain from `first_cluster`; the rest is left alone.
 pub(crate) fn apply_fat_chain(
     sector: &mut [u8; SECTOR_SIZE],
     sector_idx: u32,
@@ -240,8 +237,7 @@ pub(crate) fn apply_fat_chain(
     }
 }
 
-/// A well-behaved host's drop order: data sectors ascending, then every FAT copy's chain
-/// entries, then the directory entry -- whose landing last is what completes the transfer.
+/// A well-behaved host's drop order: data ascending, then every FAT copy, then the directory entry last.
 pub(crate) fn program_image<W: SectorIo>(
     w: &mut W,
     layout: &BootLayout,
@@ -284,11 +280,18 @@ pub(crate) fn status_line(body: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&rest[..end]).trim_end().to_string())
 }
 
+/// The `Remount count: ` value from a rendered `DETAILS.TXT` body; `None` if it has none.
+pub(crate) fn remount_count(body: &[u8]) -> Option<u32> {
+    let marker = b"Remount count: ";
+    let start = body.windows(marker.len()).position(|w| w == marker)? + marker.len();
+    let rest = &body[start..];
+    let end = rest.iter().position(|b| !b.is_ascii_digit())?;
+    std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- CBW/CSW framing ---
 
     #[test]
     fn cbw_round_trip_fields() {
@@ -341,8 +344,6 @@ mod tests {
         assert!(parse_csw(&[0u8; CSW_LEN - 1], 0).is_err());
     }
 
-    // --- Skip-detection ---
-
     #[test]
     fn is_msc_bot_class_requires_the_full_triple() {
         assert!(is_msc_bot_class(0x08, 0x06, 0x50));
@@ -368,10 +369,7 @@ mod tests {
             .any(|&(c, s, p)| is_msc_bot_class(c, s, p)));
     }
 
-    // --- FAT math from a synthetic boot sector ---
-
-    /// A boot sector rendering the real volume geometry, so the expectations below cross-check
-    /// the firmware side.
+    /// A boot sector rendering the real volume geometry.
     fn synthetic_boot_sector() -> [u8; SECTOR_SIZE] {
         let mut b = [0u8; SECTOR_SIZE];
         b[11..13].copy_from_slice(&512u16.to_le_bytes());
@@ -428,8 +426,6 @@ mod tests {
         assert_eq!(sector, [0xAAu8; SECTOR_SIZE]);
     }
 
-    // --- Dirent construction ---
-
     #[test]
     fn build_dirent_lays_out_name_attr_cluster_and_size() {
         let e = build_dirent(&IMAGE_NAME, 0x20, 10, 4096);
@@ -479,8 +475,6 @@ mod tests {
         let layout = BootLayout::parse(&synthetic_boot_sector()).unwrap();
         assert_eq!(next_free_cluster(&[0u8; SECTOR_SIZE], &layout), 2);
     }
-
-    // --- write-plan ordering ---
 
     /// A sector store that logs every LBA written, so `program_image`'s order is observable.
     struct Recorder {
@@ -564,8 +558,6 @@ mod tests {
         assert_eq!(u16::from_le_bytes([fat_sector[6], fat_sector[7]]), 0xFFFF); // cluster 3 EOC
     }
 
-    // --- status parsing ---
-
     #[test]
     fn status_line_extracts_a_clean_done_status() {
         let mut body = vec![b' '; 512];
@@ -576,6 +568,16 @@ mod tests {
             status_line(&body).as_deref(),
             Some("Flash: 4096 bytes -> Done")
         );
+    }
+
+    #[test]
+    fn remount_count_reads_the_padded_field() {
+        let mut body = [b' '; 512];
+        let text = b"Reset count: 00000009\r\nRemount count: 00000012\r\nStatus: x\r\n";
+        body[..text.len()].copy_from_slice(text);
+        assert_eq!(remount_count(&body), Some(12));
+        assert_eq!(remount_count(&[0u8; 512]), None);
+        assert_eq!(remount_count(b"Remount count: "), None);
     }
 
     #[test]

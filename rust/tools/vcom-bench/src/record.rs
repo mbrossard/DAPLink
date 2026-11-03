@@ -1,19 +1,37 @@
 //! JSONL run records: one line per measured run or window, plus a summary line per ladder.
 
-use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Serialize, Serializer};
+use serde_json::ser::{CharEscape, Formatter};
+use serde_json::value::RawValue;
 
 use daplink_test_protocol::v1::Direction;
 use daplink_test_protocol::Stats;
 
 use crate::budget::Clamp;
 use crate::contract::CaseResult;
+use crate::counters;
 use crate::stream::{self, Leg, Run};
 
-pub const SCHEMA_VERSION: u32 = 13;
+mod summary;
+pub(crate) use summary::staged_summary;
+
+pub const SCHEMA_VERSION: u32 = 15;
+
+/// The image a record measured.
+#[derive(Clone, Copy)]
+pub struct Firmware<'a> {
+    /// The firmware registry row, when anything names it.
+    pub row: Option<&'a str>,
+    /// What named it: `image`, `operator` or `none`.
+    pub source: &'a str,
+    /// The probe's `DAP_Info` firmware version.
+    pub version: Option<&'a str>,
+}
 
 const DEFAULT_FILE_NAME: &str = "vcom-bench.jsonl";
 
@@ -21,6 +39,7 @@ const CHECKOUT_MARKER: &str = "rust/tools/vcom-bench/Cargo.toml";
 
 pub struct RunRecord<'a> {
     pub probe: &'a str,
+    pub firmware: Firmware<'a>,
     pub verb: &'a str,
     /// Which phase of the verb; `run` is the only one an echo has.
     pub phase: &'a str,
@@ -50,8 +69,7 @@ pub struct RunRecord<'a> {
     pub note: Option<&'a str>,
 }
 
-/// Search upward from the running binary for the repository root and use `artifacts/` inside it,
-/// or fall back to `./artifacts/` when no root is found.
+/// Prefer the checkout's artifacts directory, falling back to the executable directory.
 pub fn default_path() -> PathBuf {
     let start = std::env::current_exe()
         .ok()
@@ -88,91 +106,169 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn append_contract(path: &Path, probe: &str, result: &CaseResult) -> std::io::Result<()> {
-    append_line(path, &render_contract(probe, result, unix_now()))
+pub fn append_contract(
+    path: &Path,
+    probe: &str,
+    firmware: Firmware,
+    result: &CaseResult,
+) -> std::io::Result<()> {
+    append_line(path, &render_contract(probe, firmware, result, unix_now()))
 }
 
-pub fn render_contract(probe: &str, r: &CaseResult, unix_s: u64) -> String {
-    let class = r
-        .counter_classification
-        .map(|class| quote(class.key()))
-        .unwrap_or_else(|| "null".into());
-    let failure = r
-        .failure
-        .as_deref()
-        .map(quote)
-        .unwrap_or_else(|| "null".into());
-    let tier = r
-        .tier
-        .as_deref()
-        .map(quote)
-        .unwrap_or_else(|| "null".into());
-    format!(
-        "{{\"schema_version\":{SCHEMA_VERSION},\"tool\":\"vcom-bench\",\"unix_s\":{unix_s},\"probe\":{},\"verb\":\"contract\",\"case\":{},\"tier\":{tier},\"baud_nominal\":{},\"latency\":{{\"samples\":{},\"p50_us\":{},\"p99_us\":{},\"max_us\":{}}},\"byte_exact\":{},\"counter_classification\":{class},\"dap_progress\":{},\"recovery_us\":{},\"pass\":{},\"failure_reason\":{failure}}}",
-        quote(probe), quote(r.case), r.baud, r.latencies.count(),
-        opt_num(r.latencies.percentile_us(50)), opt_num(r.latencies.percentile_us(99)),
-        opt_num(r.latencies.max_us()), r.exact, r.dap_progress,
-        opt_num(r.recovery.map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)), r.pass,
-    )
+#[derive(Serialize)]
+struct LatencyWire {
+    samples: usize,
+    p50_us: Option<u64>,
+    p99_us: Option<u64>,
+    max_us: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ContractWire<'a> {
+    schema_version: u32,
+    tool: &'static str,
+    unix_s: u64,
+    probe: &'a str,
+    firmware_row: Option<&'a str>,
+    firmware_row_source: &'a str,
+    firmware_version: Option<&'a str>,
+    verb: &'static str,
+    case: &'a str,
+    tier: Option<&'a str>,
+    baud_nominal: u32,
+    latency: LatencyWire,
+    byte_exact: bool,
+    counter_classification: Option<&'static str>,
+    dap_progress: bool,
+    recovery_us: Option<u64>,
+    pass: bool,
+    failure_reason: Option<&'a str>,
+}
+
+pub fn render_contract(probe: &str, firmware: Firmware, r: &CaseResult, unix_s: u64) -> String {
+    let wire = ContractWire {
+        schema_version: SCHEMA_VERSION,
+        tool: "vcom-bench",
+        unix_s,
+        probe,
+        firmware_row: firmware.row,
+        firmware_row_source: firmware.source,
+        firmware_version: firmware.version,
+        verb: "contract",
+        case: r.case,
+        tier: r.tier.as_deref(),
+        baud_nominal: r.baud,
+        latency: LatencyWire {
+            samples: r.latencies.count(),
+            p50_us: r.latencies.percentile_us(50),
+            p99_us: r.latencies.percentile_us(99),
+            max_us: r.latencies.max_us(),
+        },
+        byte_exact: r.exact,
+        counter_classification: r.counter_classification.map(|c| c.key()),
+        dap_progress: r.dap_progress,
+        recovery_us: r
+            .recovery
+            .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64),
+        pass: r.pass,
+        failure_reason: r.failure.as_deref(),
+    };
+    to_json(&wire)
+}
+
+#[derive(Serialize)]
+struct DutStatsWire {
+    rx: u32,
+    tx: u32,
+    ferr: u32,
+    ovr: u32,
+    drop: u32,
+    stuck: u32,
+}
+
+impl From<Stats> for DutStatsWire {
+    fn from(s: Stats) -> Self {
+        DutStatsWire {
+            rx: s.rx,
+            tx: s.tx,
+            ferr: s.ferr,
+            ovr: s.ovr,
+            drop: s.drop,
+            stuck: s.stuck,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RunRecordWire<'a> {
+    schema_version: u32,
+    tool: &'static str,
+    unix_s: u64,
+    probe: &'a str,
+    firmware_row: Option<&'a str>,
+    firmware_row_source: &'a str,
+    firmware_version: Option<&'a str>,
+    verb: &'a str,
+    phase: &'a str,
+    shape: &'static str,
+    baud_nominal: u32,
+    dut_realized: Option<u32>,
+    probe_realized: Option<u32>,
+    len: u64,
+    chunk: usize,
+    mode: &'a str,
+    #[serde(serialize_with = "ser_bare")]
+    secs: f64,
+    host_written: u64,
+    host_read: u64,
+    byte_exact: bool,
+    first_divergence: Option<u64>,
+    #[serde(serialize_with = "ser_f1")]
+    throughput_bps: f64,
+    dut_stats: Option<DutStatsWire>,
+    dap_roundtrips: Option<u64>,
+    pass: Option<bool>,
+    note: Option<&'a str>,
 }
 
 /// No trailing newline.
 pub fn render(r: &RunRecord, unix_s: u64) -> String {
-    let mut s = String::with_capacity(512);
-    let _ = write!(
-        s,
-        "{{\"schema_version\":{SCHEMA_VERSION},\"tool\":\"vcom-bench\",\"unix_s\":{unix_s},\
-         \"probe\":{},\"verb\":{},\"phase\":{},\"shape\":\"echo\",\"baud_nominal\":{},\
-         \"dut_realized\":{},\"probe_realized\":{},\"len\":{},\"chunk\":{},\"mode\":{},\
-         \"secs\":{},\"host_written\":{},\"host_read\":{},\"byte_exact\":{},\
-         \"first_divergence\":{},\"throughput_bps\":{:.1}",
-        quote(r.probe),
-        quote(r.verb),
-        quote(r.phase),
-        r.baud_nominal,
-        opt_num(r.dut_realized.map(u64::from)),
-        opt_num(r.probe_realized.map(u64::from)),
-        r.len,
-        r.chunk,
-        quote(r.mode),
-        r.secs,
-        r.host_written,
-        r.host_read,
-        r.byte_exact,
-        opt_num(r.first_divergence),
-        r.throughput_bps,
-    );
-    if let Some(st) = &r.dut_stats {
-        let _ = write!(
-            s,
-            ",\"dut_stats\":{{\"rx\":{},\"tx\":{},\"ferr\":{},\"ovr\":{},\"drop\":{},\"stuck\":{}}}",
-            st.rx, st.tx, st.ferr, st.ovr, st.drop, st.stuck
-        );
-    } else {
-        s.push_str(",\"dut_stats\":null");
-    }
-    let _ = write!(s, ",\"dap_roundtrips\":{}", opt_num(r.dap_roundtrips));
-    match r.pass {
-        Some(p) => {
-            let _ = write!(s, ",\"pass\":{p}");
-        }
-        None => s.push_str(",\"pass\":null"),
-    }
-    match r.note {
-        Some(n) => {
-            let _ = write!(s, ",\"note\":{}", quote(n));
-        }
-        None => s.push_str(",\"note\":null"),
-    }
-    s.push('}');
-    s
+    let wire = RunRecordWire {
+        schema_version: SCHEMA_VERSION,
+        tool: "vcom-bench",
+        unix_s,
+        probe: r.probe,
+        firmware_row: r.firmware.row,
+        firmware_row_source: r.firmware.source,
+        firmware_version: r.firmware.version,
+        verb: r.verb,
+        phase: r.phase,
+        shape: "echo",
+        baud_nominal: r.baud_nominal,
+        dut_realized: r.dut_realized,
+        probe_realized: r.probe_realized,
+        len: r.len,
+        chunk: r.chunk,
+        mode: r.mode,
+        secs: r.secs,
+        host_written: r.host_written,
+        host_read: r.host_read,
+        byte_exact: r.byte_exact,
+        first_divergence: r.first_divergence,
+        throughput_bps: r.throughput_bps,
+        dut_stats: r.dut_stats.map(DutStatsWire::from),
+        dap_roundtrips: r.dap_roundtrips,
+        pass: r.pass,
+        note: r.note,
+    };
+    to_json(&wire)
 }
 
 pub struct V1Record<'a> {
     pub probe: &'a str,
+    pub firmware: Firmware<'a>,
     pub verb: &'a str,
-    /// Which phase of the verb: `warmup`, `sweep`, `screen`, `sustain`, `return-priority`,
-    /// `discovery`, `qualify`, `soak`, or `run`.
+    /// The measurement phase, including unscored warmup windows.
     pub phase: &'a str,
     /// The rate both ends were asked for.
     pub baud_nominal: u32,
@@ -187,278 +283,483 @@ pub fn append_v1(path: &Path, record: &V1Record) -> std::io::Result<()> {
     append_line(path, &render_v1(record, unix_now()))
 }
 
+#[derive(Serialize)]
+struct SeedsWire {
+    h2d: u32,
+    d2h: u32,
+}
+
+#[derive(Serialize)]
+struct BpsPairWire {
+    #[serde(serialize_with = "ser_f1")]
+    h2d: f64,
+    #[serde(serialize_with = "ser_f1")]
+    d2h: f64,
+}
+
+#[derive(Serialize)]
+struct AbandonWire<'a> {
+    #[serde(serialize_with = "ser_f3")]
+    at_s: f64,
+    checkpoint: usize,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct TrendWire {
+    host_to_dut: &'static str,
+    dut_to_host: &'static str,
+}
+
+#[derive(Serialize)]
+struct SliceWire {
+    payload: u64,
+    #[serde(serialize_with = "ser_f4")]
+    frac: f64,
+    corrupt: u64,
+    missing: u64,
+    duplicate: u64,
+    unresolved: u64,
+    resyncs: u32,
+}
+
+impl From<stream::Slice> for SliceWire {
+    fn from(s: stream::Slice) -> Self {
+        SliceWire {
+            payload: s.payload,
+            frac: s.frac,
+            corrupt: s.corrupt,
+            missing: s.missing,
+            duplicate: s.duplicate,
+            unresolved: s.unresolved,
+            resyncs: s.resyncs,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PointWire {
+    #[serde(serialize_with = "ser_f3")]
+    at_s: f64,
+    host_to_dut: Option<SliceWire>,
+    dut_to_host: Option<SliceWire>,
+}
+
+#[derive(Serialize)]
+struct CheckpointsWire {
+    #[serde(serialize_with = "ser_bare")]
+    period_s: f64,
+    trend: TrendWire,
+    points: Vec<PointWire>,
+}
+
+#[derive(Serialize)]
+struct BurstWire {
+    bytes: u32,
+    idle_ms: u32,
+    host: bool,
+    dut: bool,
+}
+
+#[derive(Serialize)]
+struct CreditWire {
+    window: u64,
+    granted: u64,
+    obeyed: u64,
+}
+
+#[derive(Serialize)]
+struct DapWire {
+    profile: &'static str,
+    commands: u64,
+    bytes: u64,
+    #[serde(serialize_with = "ser_f4")]
+    secs: f64,
+    #[serde(serialize_with = "ser_f1")]
+    cmd_per_s: f64,
+    #[serde(serialize_with = "ser_f1")]
+    bytes_per_s: f64,
+}
+
+#[derive(Serialize)]
+struct ClampWire {
+    #[serde(serialize_with = "ser_f3")]
+    demand_slots_per_ms: f64,
+    #[serde(serialize_with = "ser_f3")]
+    budget_slots_per_ms: f64,
+    fits: bool,
+    high_speed: bool,
+}
+
+#[derive(Serialize)]
+struct CountersWire {
+    uart_rx: u32,
+    cdc_in: u32,
+    host_dropped: u32,
+    ring_full: u32,
+    frame_err: u32,
+    overrun: u32,
+    cdc_out: u32,
+    uart_tx: u32,
+    rx_dma_err: u32,
+    valid: Option<u32>,
+    grade: Option<u32>,
+    units: Option<u32>,
+}
+
+impl From<counters::VcomCounters> for CountersWire {
+    fn from(c: counters::VcomCounters) -> Self {
+        CountersWire {
+            uart_rx: c.uart_rx,
+            cdc_in: c.cdc_in,
+            host_dropped: c.host_dropped,
+            ring_full: c.ring_full,
+            frame_err: c.frame_err,
+            overrun: c.overrun,
+            cdc_out: c.cdc_out,
+            uart_tx: c.uart_tx,
+            rx_dma_err: c.rx_dma_err,
+            valid: c.valid,
+            grade: c.grade,
+            units: c.units,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProbeCountersWire {
+    classification: &'static str,
+    before: CountersWire,
+    cumulative: CountersWire,
+    bracket: CountersWire,
+}
+
+#[derive(Serialize)]
+struct LegWire {
+    claimed: bool,
+    tx_payload: u64,
+    tx_frames: u32,
+    verified: u64,
+    corrupt: u64,
+    missing: u64,
+    duplicate: u64,
+    unresolved: u64,
+    rx_frames: u32,
+    resyncs: u32,
+    eos: bool,
+    eos_total: Option<u64>,
+    credit: u64,
+    elapsed_us: u32,
+    onset_us: u32,
+    maxgap_us: u32,
+    reconciles: bool,
+    #[serde(serialize_with = "ser_f1")]
+    goodput_bps: f64,
+    #[serde(serialize_with = "ser_f4")]
+    budget_frac: f64,
+}
+
+impl LegWire {
+    fn from_leg(leg: &Leg, run: &Run) -> Self {
+        let rx = &leg.rx;
+        LegWire {
+            claimed: leg.claimed,
+            tx_payload: leg.tx_payload,
+            tx_frames: leg.tx_frames,
+            verified: rx.verified,
+            corrupt: rx.corrupt,
+            missing: rx.missing,
+            duplicate: rx.duplicate,
+            unresolved: rx.unresolved,
+            rx_frames: rx.frames,
+            resyncs: rx.resyncs,
+            eos: rx.eos,
+            eos_total: leg.rx_eos_total,
+            credit: rx.credit,
+            elapsed_us: rx.elapsed_us,
+            onset_us: rx.onset_us,
+            maxgap_us: rx.maxgap_us,
+            reconciles: leg.reconciles(),
+            goodput_bps: run.goodput_bps(leg.dir),
+            budget_frac: run.budget_frac(leg.dir),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct V1Wire<'a> {
+    schema_version: u32,
+    tool: &'static str,
+    unix_s: u64,
+    probe: &'a str,
+    firmware_row: Option<&'a str>,
+    firmware_row_source: &'a str,
+    firmware_version: Option<&'a str>,
+    verb: &'a str,
+    phase: &'a str,
+    shape: &'static str,
+    mode: &'static str,
+    baud_nominal: u32,
+    dut_realized: u32,
+    probe_realized: Option<u32>,
+    interval: u32,
+    #[serde(serialize_with = "ser_f6")]
+    payload_fraction: f64,
+    #[serde(serialize_with = "ser_bare")]
+    window_s: f64,
+    #[serde(serialize_with = "ser_f4")]
+    measured_s: f64,
+    #[serde(serialize_with = "ser_bare")]
+    host_frac: f64,
+    seeds: SeedsWire,
+    budget_h2d: u32,
+    budget_d2h: u32,
+    payload_budget_bps: BpsPairWire,
+    pass_bar_bps: BpsPairWire,
+    #[serde(serialize_with = "ser_f3")]
+    sustained_s: f64,
+    timed_out: bool,
+    closed: bool,
+    dut_ferr: u32,
+    dut_ovr: u32,
+    dut_drop: u32,
+    dut_stuck: u32,
+    abandoned: Option<AbandonWire<'a>>,
+    checkpoints: CheckpointsWire,
+    burst: Option<BurstWire>,
+    credit: Option<CreditWire>,
+    dap: DapWire,
+    clamp: Option<ClampWire>,
+    probe_counters: Option<ProbeCountersWire>,
+    host_to_dut: Option<LegWire>,
+    dut_to_host: Option<LegWire>,
+    pass: bool,
+    reasons: Vec<String>,
+    note: Option<&'a str>,
+}
+
 pub fn render_v1(r: &V1Record, unix_s: u64) -> String {
+    // The wire field names are literal; keep `stream::key` in step with them.
+    debug_assert_eq!(stream::key(Direction::HostToDut), "host_to_dut");
+    debug_assert_eq!(stream::key(Direction::DutToHost), "dut_to_host");
+
     let run = r.run;
     let plan = &run.plan;
     let verdict = run.verdict();
-    let mut s = String::with_capacity(2048);
-    let _ = write!(
-        s,
-        "{{\"schema_version\":{SCHEMA_VERSION},\"tool\":\"vcom-bench\",\"unix_s\":{unix_s},\
-         \"probe\":{},\"verb\":{},\"phase\":{},\"shape\":\"v1\",\"mode\":{},\
-         \"baud_nominal\":{},\"dut_realized\":{},\"probe_realized\":{},\"interval\":{},\
-         \"payload_fraction\":{:.6},\"window_s\":{},\"measured_s\":{:.4},\"host_frac\":{},\
-         \"seeds\":{{\"h2d\":{},\"d2h\":{}}},\"budget_h2d\":{},\"budget_d2h\":{},\
-         \"payload_budget_bps\":{{\"h2d\":{:.1},\"d2h\":{:.1}}},\"pass_bar_bps\":{{\"h2d\":{:.1},\"d2h\":{:.1}}},\"sustained_s\":{:.3},\
-         \"timed_out\":{},\"closed\":{},\"dut_ferr\":{},\"dut_ovr\":{},\"dut_drop\":{},\
-         \"dut_stuck\":{}",
-        quote(r.probe),
-        quote(r.verb),
-        quote(r.phase),
-        quote(plan.shape.key()),
-        r.baud_nominal,
-        plan.dut_baud,
-        opt_num(r.probe_realized.map(u64::from)),
-        plan.interval,
-        plan.payload_fraction(),
-        plan.secs,
-        run.measured_secs,
-        plan.host_frac,
-        plan.seeds.h2d,
-        plan.seeds.d2h,
-        plan.budget_h2d(),
-        plan.budget_d2h(),
-        plan.payload_budget_bps(Direction::HostToDut),
-        plan.payload_budget_bps(Direction::DutToHost),
-        plan.pass_bar_bps(Direction::HostToDut),
-        plan.pass_bar_bps(Direction::DutToHost),
-        run.sustained_secs(),
-        run.timed_out,
-        run.closed,
-        run.ferr,
-        run.ovr,
-        run.drop,
-        run.stuck,
-    );
-    match &run.abandoned {
-        Some(a) => {
-            let _ = write!(
-                s,
-                ",\"abandoned\":{{\"at_s\":{:.3},\"checkpoint\":{},\"reason\":{}}}",
-                a.at_secs,
-                a.checkpoint,
-                quote(&a.reason),
-            );
-        }
-        None => s.push_str(",\"abandoned\":null"),
-    }
-    series_json(&mut s, run);
-    match plan.burst {
-        Some(burst) => {
-            let _ = write!(
-                s,
-                ",\"burst\":{{\"bytes\":{},\"idle_ms\":{},\"host\":{},\"dut\":{}}}",
-                burst.bytes, burst.idle_ms, plan.burst_host, plan.burst_dut
-            );
-        }
-        None => s.push_str(",\"burst\":null"),
-    }
-    match run.credit {
-        Some(credit) => {
-            let _ = write!(
-                s,
-                ",\"credit\":{{\"window\":{},\"granted\":{},\"obeyed\":{}}}",
-                plan.credit_window, credit.granted, credit.obeyed
-            );
-        }
-        None => s.push_str(",\"credit\":null"),
-    }
-    let dap = &run.dap;
-    let _ = write!(
-        s,
-        ",\"dap\":{{\"profile\":{},\"commands\":{},\"bytes\":{},\"secs\":{:.4},\
-         \"cmd_per_s\":{:.1},\"bytes_per_s\":{:.1}}}",
-        quote(dap.profile.key()),
-        dap.commands,
-        dap.bytes,
-        dap.secs,
-        dap.cps(),
-        dap.bps(),
-    );
-    match r.clamp {
-        Some(clamp) => {
-            let _ = write!(
-                s,
-                ",\"clamp\":{{\"demand_slots_per_ms\":{:.3},\"budget_slots_per_ms\":{:.3},\
-                 \"fits\":{},\"high_speed\":{}}}",
-                clamp.demand, clamp.budget, clamp.fits, clamp.high_speed
-            );
-        }
-        None => s.push_str(",\"clamp\":null"),
-    }
-    match run.conservation {
-        Some(c) => {
-            let d = c.delta();
-            let _ = write!(
-                s,
-                ",\"probe_counters\":{{\"classification\":{},",
-                quote(c.classification().key())
-            );
-            counters_json(&mut s, "cumulative", c.after);
-            s.push(',');
-            counters_json(&mut s, "bracket", d);
-            s.push('}');
-        }
-        None => s.push_str(",\"probe_counters\":null"),
-    }
-    for dir in stream::DIRECTIONS {
-        let _ = write!(s, ",{}:", quote(stream::key(dir)));
-        match run.leg(dir) {
-            Some(leg) => leg_json(&mut s, leg, run),
-            None => s.push_str("null"),
-        }
-    }
-    let _ = write!(s, ",\"pass\":{},\"reasons\":[", verdict.pass);
-    for (i, reason) in verdict.reasons.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str(&quote(reason));
-    }
-    s.push(']');
-    match r.note {
-        Some(n) => {
-            let _ = write!(s, ",\"note\":{}", quote(n));
-        }
-        None => s.push_str(",\"note\":null"),
-    }
-    s.push('}');
-    s
+
+    let checkpoints = CheckpointsWire {
+        period_s: run.series.period,
+        trend: TrendWire {
+            host_to_dut: run.series.trend(Direction::HostToDut).key(),
+            dut_to_host: run.series.trend(Direction::DutToHost).key(),
+        },
+        points: run
+            .series
+            .points
+            .iter()
+            .map(|p| PointWire {
+                at_s: p.at_secs,
+                host_to_dut: p.h2d.map(SliceWire::from),
+                dut_to_host: p.d2h.map(SliceWire::from),
+            })
+            .collect(),
+    };
+
+    let probe_counters = run.conservation.map(|c| ProbeCountersWire {
+        classification: c.classification().key(),
+        before: CountersWire::from(c.before),
+        cumulative: CountersWire::from(c.after),
+        bracket: CountersWire::from(c.delta()),
+    });
+
+    let wire = V1Wire {
+        schema_version: SCHEMA_VERSION,
+        tool: "vcom-bench",
+        unix_s,
+        probe: r.probe,
+        firmware_row: r.firmware.row,
+        firmware_row_source: r.firmware.source,
+        firmware_version: r.firmware.version,
+        verb: r.verb,
+        phase: r.phase,
+        shape: "v1",
+        mode: plan.shape.key(),
+        baud_nominal: r.baud_nominal,
+        dut_realized: plan.dut_baud,
+        probe_realized: r.probe_realized,
+        interval: plan.interval,
+        payload_fraction: plan.payload_fraction(),
+        window_s: plan.secs,
+        measured_s: run.measured_secs,
+        host_frac: plan.host_frac,
+        seeds: SeedsWire {
+            h2d: plan.seeds.h2d,
+            d2h: plan.seeds.d2h,
+        },
+        budget_h2d: plan.budget_h2d(),
+        budget_d2h: plan.budget_d2h(),
+        payload_budget_bps: BpsPairWire {
+            h2d: plan.payload_budget_bps(Direction::HostToDut),
+            d2h: plan.payload_budget_bps(Direction::DutToHost),
+        },
+        pass_bar_bps: BpsPairWire {
+            h2d: plan.pass_bar_bps(Direction::HostToDut),
+            d2h: plan.pass_bar_bps(Direction::DutToHost),
+        },
+        sustained_s: run.sustained_secs(),
+        timed_out: run.timed_out,
+        closed: run.closed,
+        dut_ferr: run.ferr,
+        dut_ovr: run.ovr,
+        dut_drop: run.drop,
+        dut_stuck: run.stuck,
+        abandoned: run.abandoned.as_ref().map(|a| AbandonWire {
+            at_s: a.at_secs,
+            checkpoint: a.checkpoint,
+            reason: &a.reason,
+        }),
+        checkpoints,
+        burst: plan.burst.map(|burst| BurstWire {
+            bytes: burst.bytes,
+            idle_ms: burst.idle_ms,
+            host: plan.burst_host,
+            dut: plan.burst_dut,
+        }),
+        credit: run.credit.map(|credit| CreditWire {
+            window: plan.credit_window,
+            granted: credit.granted,
+            obeyed: credit.obeyed,
+        }),
+        dap: DapWire {
+            profile: run.dap.profile.key(),
+            commands: run.dap.commands,
+            bytes: run.dap.bytes,
+            secs: run.dap.secs,
+            cmd_per_s: run.dap.cps(),
+            bytes_per_s: run.dap.bps(),
+        },
+        clamp: r.clamp.map(|clamp| ClampWire {
+            demand_slots_per_ms: clamp.demand,
+            budget_slots_per_ms: clamp.budget,
+            fits: clamp.fits,
+            high_speed: clamp.high_speed,
+        }),
+        probe_counters,
+        host_to_dut: run
+            .leg(Direction::HostToDut)
+            .map(|leg| LegWire::from_leg(leg, run)),
+        dut_to_host: run
+            .leg(Direction::DutToHost)
+            .map(|leg| LegWire::from_leg(leg, run)),
+        pass: verdict.pass,
+        reasons: verdict.reasons,
+        note: r.note,
+    };
+    to_json(&wire)
 }
 
-fn series_json(s: &mut String, run: &Run) {
-    let series = &run.series;
-    let _ = write!(
-        s,
-        ",\"checkpoints\":{{\"period_s\":{},\"trend\":{{",
-        series.period
-    );
-    for (i, dir) in stream::DIRECTIONS.into_iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        let _ = write!(
-            s,
-            "{}:{}",
-            quote(stream::key(dir)),
-            quote(series.trend(dir).key())
-        );
+/// Emit `text`, already a JSON number, as a raw literal.
+fn ser_raw<S: Serializer>(text: String, s: S) -> Result<S::Ok, S::Error> {
+    RawValue::from_string(text)
+        .map_err(|e| serde::ser::Error::custom(e.to_string()))?
+        .serialize(s)
+}
+
+fn ser_f1<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    ser_raw(format!("{v:.1}"), s)
+}
+
+fn ser_f2<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    ser_raw(format!("{v:.2}"), s)
+}
+
+fn ser_f3<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    ser_raw(format!("{v:.3}"), s)
+}
+
+fn ser_f4<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    ser_raw(format!("{v:.4}"), s)
+}
+
+fn ser_f6<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    ser_raw(format!("{v:.6}"), s)
+}
+
+/// Plain `{}` display for an `f64`: shortest form, no forced decimal.
+fn ser_bare<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    ser_raw(format!("{v}"), s)
+}
+
+/// Compact formatter that writes every escaped character as `\u00xx`.
+struct HexControlFormatter;
+
+impl Formatter for HexControlFormatter {
+    fn write_char_escape<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        char_escape: CharEscape,
+    ) -> std::io::Result<()> {
+        use CharEscape::*;
+        let byte = match char_escape {
+            Quote => return writer.write_all(b"\\\""),
+            ReverseSolidus => return writer.write_all(b"\\\\"),
+            Solidus => return writer.write_all(b"/"),
+            Backspace => 0x08,
+            FormFeed => 0x0C,
+            LineFeed => 0x0A,
+            CarriageReturn => 0x0D,
+            Tab => 0x09,
+            AsciiControl(byte) => byte,
+        };
+        write!(writer, "\\u{byte:04x}")
     }
-    s.push_str("},\"points\":[");
-    for (i, point) in series.points.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        let _ = write!(s, "{{\"at_s\":{:.3}", point.at_secs);
-        for dir in stream::DIRECTIONS {
-            let _ = write!(s, ",{}:", quote(stream::key(dir)));
-            match point.slice(dir) {
-                Some(slice) => {
-                    let _ = write!(
-                        s,
-                        "{{\"payload\":{},\"frac\":{:.4},\"corrupt\":{},\"missing\":{},\
-                         \"duplicate\":{},\"unresolved\":{},\"resyncs\":{}}}",
-                        slice.payload,
-                        slice.frac,
-                        slice.corrupt,
-                        slice.missing,
-                        slice.duplicate,
-                        slice.unresolved,
-                        slice.resyncs,
-                    );
-                }
-                None => s.push_str("null"),
-            }
-        }
-        s.push('}');
-    }
-    s.push_str("]}");
 }
 
-fn counters_json(s: &mut String, name: &str, c: stream::VcomCounters) {
-    let _ = write!(
-        s,
-        "{}:{{\"uart_rx\":{},\"cdc_in\":{},\"host_dropped\":{},\"ring_full\":{},\
-         \"frame_err\":{},\"overrun\":{},\"cdc_out\":{},\"uart_tx\":{},\
-         \"rx_dma_err\":{},\"valid\":{},\"grade\":{},\"units\":{}}}",
-        quote(name),
-        c.uart_rx,
-        c.cdc_in,
-        c.host_dropped,
-        c.ring_full,
-        c.frame_err,
-        c.overrun,
-        c.cdc_out,
-        c.uart_tx,
-        c.rx_dma_err,
-        opt_num(c.valid.map(u64::from)),
-        opt_num(c.grade.map(u64::from)),
-        opt_num(c.units.map(u64::from)),
-    );
-}
-
-fn leg_json(s: &mut String, leg: &Leg, run: &Run) {
-    let rx = &leg.rx;
-    let _ = write!(
-        s,
-        "{{\"claimed\":{},\"tx_payload\":{},\"tx_frames\":{},\"verified\":{},\"corrupt\":{},\
-         \"missing\":{},\"duplicate\":{},\"unresolved\":{},\"rx_frames\":{},\"resyncs\":{},\
-         \"eos\":{},\"eos_total\":{},\"credit\":{},\"elapsed_us\":{},\"onset_us\":{},\
-         \"maxgap_us\":{},\"reconciles\":{},\"goodput_bps\":{:.1},\"budget_frac\":{:.4}}}",
-        leg.claimed,
-        leg.tx_payload,
-        leg.tx_frames,
-        rx.verified,
-        rx.corrupt,
-        rx.missing,
-        rx.duplicate,
-        rx.unresolved,
-        rx.frames,
-        rx.resyncs,
-        rx.eos,
-        opt_num(leg.rx_eos_total),
-        rx.credit,
-        rx.elapsed_us,
-        rx.onset_us,
-        rx.maxgap_us,
-        leg.reconciles(),
-        run.goodput_bps(leg.dir),
-        run.budget_frac(leg.dir),
-    );
-}
-
-pub fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn opt_num(v: Option<u64>) -> String {
-    v.map_or_else(|| "null".to_string(), |n| n.to_string())
+/// Render one wire struct as its committed JSONL line: no trailing newline.
+fn to_json<T: Serialize>(value: &T) -> String {
+    let mut buf = Vec::with_capacity(512);
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, HexControlFormatter);
+    value
+        .serialize(&mut ser)
+        .expect("record serializes to JSON");
+    String::from_utf8(buf).expect("JSON output is valid UTF-8")
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::budget::{BusBudget, DapAchieved, DapProfile};
     use crate::stream::{legs, Clock, Credit, Plan, Seeds, Shape, DEFAULT_INTERVAL};
     use daplink_test_protocol::v1::Direction;
     use daplink_test_protocol::v1::{RxCounters, TxCounters, V1Report};
 
+    pub(crate) const FIRMWARE: Firmware<'static> = Firmware {
+        row: Some("firmware/mculink"),
+        source: "image",
+        version: Some("2.1.1.gfeedc0ffee12"),
+    };
+
+    pub(crate) fn assert_record(name: &str, line: &str) {
+        let actual: serde_json::Value = serde_json::from_str(line).expect("complete JSON record");
+        let prefix = format!("{{\"case\":\"{name}\",\"record\":");
+        let fixture = include_str!("record/corpus.jsonl")
+            .lines()
+            .find(|row| row.starts_with(&prefix))
+            .expect("named corpus case");
+        let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        assert_eq!(actual, expected["record"], "{name}");
+        assert_eq!(actual["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            format!("{prefix}{line}}}"),
+            fixture,
+            "{name}: JSONL formatting"
+        );
+    }
+
     fn sample() -> RunRecord<'static> {
         RunRecord {
             probe: "0d28:0204:AA",
+            firmware: FIRMWARE,
             verb: "echo",
             phase: "run",
             baud_nominal: 2_625_000,
@@ -487,43 +788,29 @@ mod tests {
     #[test]
     fn a_record_renders_as_one_json_line_with_the_schema_version() {
         let line = render(&sample(), 1_700_000_000);
-        assert!(line.starts_with("{\"schema_version\":13,\"tool\":\"vcom-bench\""));
-        assert!(!line.contains('\n'));
-        assert!(line.ends_with('}'));
-        for needle in [
-            "\"shape\":\"echo\"",
-            "\"baud_nominal\":2625000",
-            "\"probe_realized\":2666666",
-            "\"dut_stats\":{\"rx\":256,",
-            "\"stuck\":0",
-            "\"byte_exact\":true",
-            "\"pass\":true",
-            "\"first_divergence\":null",
-            "\"note\":null",
-        ] {
-            assert!(line.contains(needle), "{line} is missing {needle}");
-        }
+        assert_record(
+            "a_record_renders_as_one_json_line_with_the_schema_version",
+            &line,
+        );
     }
 
     #[test]
     fn absent_fields_render_as_null() {
         let mut r = sample();
+        r.firmware = Firmware {
+            row: None,
+            source: "none",
+            version: None,
+        };
         r.dut_realized = None;
         r.probe_realized = None;
         r.dut_stats = None;
         r.pass = None;
         let line = render(&r, 0);
-        for needle in [
-            "\"dut_realized\":null",
-            "\"probe_realized\":null",
-            "\"dut_stats\":null",
-            "\"pass\":null",
-        ] {
-            assert!(line.contains(needle), "{line} is missing {needle}");
-        }
+        assert_record("absent_fields_render_as_null", &line);
     }
 
-    /// A clean duplex run of `secs` at the F401's edge rate.
+    /// A clean duplex run of `secs`.
     fn v1_run(secs: f64) -> Run {
         let plan = Plan {
             shape: Shape::Duplex,
@@ -573,7 +860,6 @@ mod tests {
             payload: u64::from(plan.budget_h2d()),
             frames,
             credit: 0,
-            complete: true,
         };
         Run {
             legs: legs(&plan, Some(host_tx), Some(host_rx), &report),
@@ -601,6 +887,7 @@ mod tests {
     fn v1_sample(run: &Run) -> V1Record<'_> {
         V1Record {
             probe: "0d28:0204:AA",
+            firmware: FIRMWARE,
             verb: "run",
             phase: "run",
             baud_nominal: 2_625_000,
@@ -618,31 +905,10 @@ mod tests {
     fn a_v1_window_renders_both_ledgers_and_its_verdict_on_one_line() {
         let run = v1_run(30.0);
         let line = render_v1(&v1_sample(&run), 1_700_000_000);
-        assert!(line.starts_with("{\"schema_version\":13,\"tool\":\"vcom-bench\""));
-        assert!(!line.contains('\n'));
-        assert!(line.ends_with('}'));
-        for needle in [
-            "\"shape\":\"v1\"",
-            "\"mode\":\"duplex\"",
-            "\"interval\":2048",
-            "\"payload_fraction\":0.988417",
-            "\"seeds\":{\"h2d\":1592590337,\"d2h\":1592590338}",
-            "\"host_to_dut\":{\"claimed\":true,",
-            "\"dut_to_host\":{\"claimed\":true,",
-            "\"unresolved\":0",
-            "\"onset_us\":90",
-            "\"maxgap_us\":1100",
-            "\"reconciles\":true",
-            "\"dap\":{\"profile\":\"representative\"",
-            "\"clamp\":{\"demand_slots_per_ms\":8.403",
-            "\"fits\":true",
-            "\"credit\":null",
-            "\"burst\":null",
-            "\"pass\":true",
-            "\"reasons\":[]",
-        ] {
-            assert!(line.contains(needle), "{line} is missing {needle}");
-        }
+        assert_record(
+            "a_v1_window_renders_both_ledgers_and_its_verdict_on_one_line",
+            &line,
+        );
     }
 
     #[test]
@@ -651,10 +917,7 @@ mod tests {
         run.ovr = 3;
         run.legs[1].rx.eos = false;
         let line = render_v1(&v1_sample(&run), 0);
-        assert!(line.contains("\"pass\":false"), "{line}");
-        assert!(line.contains("overruns"), "{line}");
-        assert!(line.contains("end-of-stream"), "{line}");
-        assert!(line.contains("\"eos\":false"), "{line}");
+        assert_record("a_failed_window_carries_every_reason_it_failed", &line);
     }
 
     #[test]
@@ -662,40 +925,28 @@ mod tests {
         let mut run = v1_run(30.0);
         run.stuck = 2;
         let line = render_v1(&v1_sample(&run), 0);
-        assert!(line.contains("\"dut_stuck\":2"), "{line}");
-        assert!(line.contains("\"pass\":false"), "{line}");
-        assert!(line.contains("stuck DMA aborts"), "{line}");
+        assert_record("a_stuck_dma_abort_is_recorded_and_fails_the_window", &line);
     }
 
     #[test]
     fn a_window_records_the_probe_ledger_cumulative_and_over_its_bracket() {
         let mut run = v1_run(30.0);
-        run.conservation = Some(stream::Conservation {
-            before: stream::VcomCounters {
+        run.conservation = Some(counters::Conservation {
+            before: counters::VcomCounters {
                 uart_rx: 4096,
                 cdc_in: 4096,
-                ..stream::VcomCounters::default()
+                ..counters::VcomCounters::default()
             },
-            after: stream::VcomCounters {
+            after: counters::VcomCounters {
                 uart_rx: 1_004_096,
                 cdc_in: 1_004_096,
-                ..stream::VcomCounters::default()
+                ..counters::VcomCounters::default()
             },
         });
         let line = render_v1(&v1_sample(&run), 0);
-        assert!(
-            line.contains("\"probe_counters\":{\"classification\":\"partial-clean\","),
-            "{line}"
-        );
-        assert!(
-            line.contains("\"cumulative\":{\"uart_rx\":1004096,"),
-            "{line}"
-        );
-        assert!(line.contains("\"bracket\":{\"uart_rx\":1000000,"), "{line}");
-        assert!(line.contains("\"overrun\":0"), "{line}");
-        assert!(
-            line.contains("\"rx_dma_err\":0,\"valid\":null,\"grade\":null"),
-            "{line}"
+        assert_record(
+            "a_window_records_the_probe_ledger_cumulative_and_over_its_bracket",
+            &line,
         );
     }
 
@@ -731,31 +982,28 @@ mod tests {
             reason: "DUT -> host: 41216 missing".to_string(),
         });
         let line = render_v1(&v1_sample(&run), 0);
-        for needle in [
-            "\"sustained_s\":12.400",
-            "\"closed\":true",
-            "\"abandoned\":{\"at_s\":12.400,\"checkpoint\":2,",
-            "\"checkpoints\":{\"period_s\":5,",
-            "\"trend\":{\"host_to_dut\":\"holding\",\"dut_to_host\":\"declining\"}",
-            "\"points\":[{\"at_s\":5.000,",
-            "\"missing\":41216",
-        ] {
-            assert!(line.contains(needle), "{line} is missing {needle}");
-        }
+        assert_record(
+            "a_window_records_the_checkpoint_series_that_diagnoses_it",
+            &line,
+        );
     }
 
     #[test]
     fn a_window_that_took_no_checkpoint_records_an_empty_series() {
         let line = render_v1(&v1_sample(&v1_run(2.0)), 0);
-        assert!(line.contains("\"points\":[]"), "{line}");
-        assert!(line.contains("\"dut_to_host\":\"unsampled\""), "{line}");
-        assert!(line.contains("\"abandoned\":null"), "{line}");
+        assert_record(
+            "a_window_that_took_no_checkpoint_records_an_empty_series",
+            &line,
+        );
     }
 
     #[test]
     fn a_window_from_a_firmware_without_the_query_records_a_null_ledger() {
         let line = render_v1(&v1_sample(&v1_run(30.0)), 0);
-        assert!(line.contains("\"probe_counters\":null"), "{line}");
+        assert_record(
+            "a_window_from_a_firmware_without_the_query_records_a_null_ledger",
+            &line,
+        );
     }
 
     #[test]
@@ -763,8 +1011,10 @@ mod tests {
         let mut run = v1_run(30.0);
         run.legs.retain(|leg| leg.dir == Direction::DutToHost);
         let line = render_v1(&v1_sample(&run), 0);
-        assert!(line.contains("\"host_to_dut\":null"), "{line}");
-        assert!(line.contains("\"dut_to_host\":{"), "{line}");
+        assert_record(
+            "a_simplex_window_records_the_silent_direction_as_null",
+            &line,
+        );
     }
 
     #[test]
@@ -775,17 +1025,38 @@ mod tests {
             obeyed: 999_424,
         });
         let line = render_v1(&v1_sample(&run), 0);
-        assert!(
-            line.contains("\"credit\":{\"window\":4096,\"granted\":1000000,\"obeyed\":999424}"),
-            "{line}"
+        assert_record(
+            "a_credit_window_records_both_sides_of_the_grant_ledger",
+            &line,
         );
     }
 
     #[test]
-    fn quoting_escapes_what_json_requires() {
-        assert_eq!(quote("plain"), "\"plain\"");
-        assert_eq!(quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
-        assert_eq!(quote("x\ny"), "\"x\\u000ay\"");
+    fn escaped_failed_echo_record() {
+        let mut r = sample();
+        r.probe = "probe\"\\\n\t";
+        r.note = Some("failed \"exchange\"\r\n\\");
+        r.pass = Some(false);
+        r.byte_exact = false;
+        r.first_divergence = Some(17);
+        r.dut_stats.as_mut().unwrap().stuck = 1;
+        assert_record("escaped-failed-echo", &render(&r, 0));
+    }
+
+    #[test]
+    fn burst_timeout_record() {
+        let mut run = v1_run(30.0);
+        run.plan.burst = Some(daplink_test_protocol::v1::BurstSpec {
+            bytes: 256,
+            idle_ms: 100,
+        });
+        run.plan.burst_host = true;
+        run.plan.burst_dut = true;
+        run.timed_out = true;
+        let mut r = v1_sample(&run);
+        r.clamp = None;
+        r.note = Some("missing \"EOS\"\n");
+        assert_record("burst-timeout", &render_v1(&r, 0));
     }
 
     #[test]
@@ -798,27 +1069,18 @@ mod tests {
             tier: Some("250ms".into()),
             baud: 115_200,
             exact: false,
-            counter_classification: Some(crate::stream::ConservationClass::ObservedLoss),
+            counter_classification: Some(crate::counters::ConservationClass::ObservedLoss),
             dap_progress: true,
             recovery: Some(std::time::Duration::from_micros(1_200)),
             latencies,
             pass: false,
             failure: Some("named loss".into()),
         };
-        let line = render_contract("probe", &result, 12);
-        for needle in [
-            "\"schema_version\":13",
-            "\"verb\":\"contract\"",
-            "\"case\":\"reader-pause\"",
-            "\"p50_us\":400",
-            "\"p99_us\":900",
-            "\"counter_classification\":\"observed-loss\"",
-            "\"recovery_us\":1200",
-            "\"pass\":false",
-            "\"failure_reason\":\"named loss\"",
-        ] {
-            assert!(line.contains(needle), "{line} is missing {needle}");
-        }
+        let line = render_contract("probe", FIRMWARE, &result, 12);
+        assert_record(
+            "a_contract_failure_records_latency_recovery_and_reason",
+            &line,
+        );
     }
 
     #[test]
@@ -841,13 +1103,11 @@ mod tests {
             pass: false,
             failure: Some(failure),
         };
-        let line = render_contract("probe", &result, 12);
-        assert!(line.contains("\"case\":\"line-coding\""), "{line}");
-        assert!(
-            line.contains("cycle 14 rate 921600 target control stage"),
-            "{line}"
+        let line = render_contract("probe", FIRMWARE, &result, 12);
+        assert_record(
+            "a_line_transport_failure_reaches_the_contract_record",
+            &line,
         );
-        assert!(line.contains("\"pass\":false"), "{line}");
     }
 
     #[test]

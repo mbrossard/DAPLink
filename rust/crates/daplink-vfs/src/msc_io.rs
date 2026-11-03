@@ -15,33 +15,53 @@ pub enum SectorPoll {
     Pending,
 }
 
-/// A block device presented to the USB mass-storage class.
+/// A block device; retry the same operation on `Pending`. `Ready` need not mean programmed.
 pub trait SectorIo {
     /// Whether the medium is present and ready.
     fn media_ready(&self) -> bool;
     /// Read logical block `lba` into `buf`.
     fn read(&mut self, lba: u32, buf: &mut [u8; 512]) -> SectorPoll;
-    /// Write `buf` to logical block `lba`.
+    /// Write `buf` to logical block `lba`; on `Pending`, retry the same `lba` and bytes.
+    /// `Ready` is this adapter's acceptance, not necessarily the write's completion.
     fn write(&mut self, lba: u32, buf: &[u8; 512]) -> SectorPoll;
-    /// Return and clear a pending media-changed edge, for the class to raise SCSI UNIT ATTENTION.
-    /// Defaults `false`, for a backend that signals remounts some other way (the epoch).
+    /// Return and clear a media-changed edge, for SCSI UNIT ATTENTION.
     fn media_changed(&mut self) -> bool {
         false
     }
-    /// Note that the transport entered (`true`) or left (`false`) a host command's data phase.
-    /// A backend whose medium can change on its own must hold that change until the phase closes.
+    /// Note entering or leaving a data phase; a self-changing medium holds changes until it closes.
     fn set_data_phase(&mut self, _open: bool) {}
+    /// The deadline a parked operation waits on, in microseconds; `None` when none or already due.
+    fn next_wake_us(&self) -> Option<u64> {
+        None
+    }
 }
 
-/// A [`SectorIo`] that services each request against the volume inline (always [`SectorPoll::Ready`]).
+/// Inline sector I/O; retry the same write on `Pending`, as dropping it does not cancel work.
 pub struct DirectIo<'v, 'a, S: TransferSink, O: VfsObserver> {
     vfs: &'v mut Vfs<'a, S, O>,
+    /// The transport's microsecond clock, when it has one to lend.
+    clock: Option<fn() -> u64>,
+    /// Whether the sector last written is still being programmed.
+    parked: bool,
 }
 
 impl<'v, 'a, S: TransferSink, O: VfsObserver> DirectIo<'v, 'a, S, O> {
-    /// Wrap a mutable reference to `vfs`.
+    /// Wrap a mutable reference to `vfs`, servicing every request inline.
     pub fn new(vfs: &'v mut Vfs<'a, S, O>) -> Self {
-        Self { vfs }
+        Self {
+            vfs,
+            clock: None,
+            parked: false,
+        }
+    }
+
+    /// Wrap `vfs` and let a sector write park while the flash steps, timed by `clock`.
+    pub fn with_clock(vfs: &'v mut Vfs<'a, S, O>, clock: fn() -> u64) -> Self {
+        Self {
+            vfs,
+            clock: Some(clock),
+            parked: false,
+        }
     }
 }
 
@@ -56,8 +76,21 @@ impl<S: TransferSink, O: VfsObserver> SectorIo for DirectIo<'_, '_, S, O> {
     }
 
     fn write(&mut self, lba: u32, buf: &[u8; 512]) -> SectorPoll {
-        self.vfs.write_sector(lba, buf);
-        SectorPoll::Ready
+        let Some(clock) = self.clock else {
+            self.vfs.write_sector(lba, buf);
+            return SectorPoll::Ready;
+        };
+        // A parked write resumes the sink rather than delivering the sector a second time.
+        if !self.parked {
+            self.vfs.sink_mut().set_deferred(true);
+            self.vfs.write_sector(lba, buf);
+        }
+        self.parked = self.vfs.sink_mut().advance(clock()) == SectorPoll::Pending;
+        if self.parked {
+            SectorPoll::Pending
+        } else {
+            SectorPoll::Ready
+        }
     }
 
     fn media_changed(&mut self) -> bool {
@@ -67,17 +100,22 @@ impl<S: TransferSink, O: VfsObserver> SectorIo for DirectIo<'_, '_, S, O> {
     fn set_data_phase(&mut self, open: bool) {
         self.vfs.set_data_phase(open);
     }
+
+    fn next_wake_us(&self) -> Option<u64> {
+        // Report only a future deadline, so a step-again-now park keeps the plain yield.
+        let clock = self.clock?;
+        let wake = self.vfs.sink().deferred_wake_us()?;
+        (wake > clock()).then_some(wake)
+    }
 }
 
-/// A [`SectorIo`] that offloads each request to an application-side worker: reads park as
-/// [`SectorPoll::Pending`] until a reply lands, writes enqueue or report `Pending` when full.
+/// A [`SectorIo`] that offloads each request to an application-side worker.
 pub struct QueuedIo<'a, 'q, 'r, 'o, const DEPTH: usize = 4> {
     ops: &'a mut OpProducer<'q, DEPTH>,
     replies: &'r ReplySlot,
     media_ready: bool,
     epoch: u32,
-    /// The `(lba, epoch)` of the read in flight, if any. Caller-owned so it survives a service
-    /// pass; the caller must also clear it on the USB and Bulk-Only reset paths.
+    /// The `(lba, epoch)` read in flight; the caller also clears it on USB and Bulk-Only resets.
     outstanding: &'o mut Option<(u32, u32)>,
 }
 
@@ -154,8 +192,7 @@ pub struct WorkerStep {
     pub media: MediaState,
 }
 
-/// Advance the worker one step: service at most one queued operation, tick the volume by
-/// `elapsed_ms`, and republish the shared media state, bumping `media_epoch` on each remount.
+/// Service at most one queued operation, tick the volume, and republish the media state.
 pub fn msc_worker_step<S: TransferSink, O: VfsObserver, const DEPTH: usize>(
     vfs: &mut Vfs<'_, S, O>,
     ops: &mut OpConsumer<'_, DEPTH>,
@@ -208,31 +245,12 @@ pub fn msc_worker_step<S: TransferSink, O: VfsObserver, const DEPTH: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{dir_entry, uf2_block};
     use crate::queue::OpQueue;
     use crate::{NoObserver, NullSink, Vfs, VfsConfig};
 
     fn make_vfs<'a>(files: &'a mut [&'a mut dyn crate::VfsFile]) -> Vfs<'a, NullSink, NoObserver> {
         Vfs::new(VfsConfig::default(), files, NullSink, NoObserver)
-    }
-
-    /// One well-formed 512-byte UF2 block, the smallest thing that starts a transfer.
-    fn uf2_block() -> [u8; 512] {
-        let mut b = [0u8; 512];
-        b[0..4].copy_from_slice(&0x0A32_4655u32.to_le_bytes()); // MAGIC_START0
-        b[4..8].copy_from_slice(&0x9E5D_5157u32.to_le_bytes()); // MAGIC_START1
-        b[12..16].copy_from_slice(&0x0800_0000u32.to_le_bytes()); // target addr
-        b[16..20].copy_from_slice(&4u32.to_le_bytes()); // payload size
-        b[508..512].copy_from_slice(&0x0AB1_6F30u32.to_le_bytes()); // MAGIC_END
-        b
-    }
-
-    fn dir_entry(name: &[u8; 11], attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
-        let mut e = [0u8; 32];
-        e[0..11].copy_from_slice(name);
-        e[11] = attr;
-        e[26..28].copy_from_slice(&first_cluster.to_le_bytes());
-        e[28..32].copy_from_slice(&size.to_le_bytes());
-        e
     }
 
     #[test]
@@ -251,7 +269,7 @@ mod tests {
 
             assert_eq!(io.write(131, &root), SectorPoll::Ready);
             assert_eq!(
-                io.write(crate::fat::DATA_START_LBA, &uf2_block()),
+                io.write(crate::fat::DATA_START_LBA, &uf2_block(0x0800_0000, &[0; 4])),
                 SectorPoll::Ready
             );
         }
@@ -269,7 +287,7 @@ mod tests {
             let mut io = DirectIo::new(&mut vfs);
             assert!(!io.media_changed(), "the initial mount raises no edge");
             assert_eq!(
-                io.write(crate::fat::DATA_START_LBA, &uf2_block()),
+                io.write(crate::fat::DATA_START_LBA, &uf2_block(0x0800_0000, &[0; 4])),
                 SectorPoll::Ready
             );
         }
@@ -297,12 +315,15 @@ mod tests {
             io.set_data_phase(true);
             assert_eq!(io.write(131, &root), SectorPoll::Ready);
             assert_eq!(
-                io.write(crate::fat::DATA_START_LBA, &uf2_block()),
+                io.write(crate::fat::DATA_START_LBA, &uf2_block(0x0800_0000, &[0; 4])),
                 SectorPoll::Ready
             );
         }
-        // The image met its size, but the tick under the open phase must only arm the detach.
-        assert_eq!(vfs.tick(1), MediaState::Ready);
+        // The image met its size, but the settle under the open phase must only arm the detach.
+        assert_eq!(
+            vfs.tick(crate::MSC_TIMEOUT_FINISHABLE_MS),
+            MediaState::Ready
+        );
         assert_eq!(vfs.tick(1), MediaState::Ready);
 
         DirectIo::new(&mut vfs).set_data_phase(false);
@@ -351,7 +372,7 @@ mod tests {
         .expect("dirent");
         p.try_push(MscOp::Write(Sector {
             lba: crate::fat::DATA_START_LBA,
-            data: uf2_block(),
+            data: uf2_block(0x0800_0000, &[0; 4]),
             epoch: 0,
         }))
         .ok()
@@ -359,7 +380,11 @@ mod tests {
 
         assert_eq!(step(&mut vfs, &mut c, 1), MediaState::Ready); // phase opens
         assert_eq!(step(&mut vfs, &mut c, 1), MediaState::Ready); // dirent
-        assert_eq!(step(&mut vfs, &mut c, 1), MediaState::Ready); // image, detach armed
+        assert_eq!(step(&mut vfs, &mut c, 1), MediaState::Ready); // image: settling
+        assert_eq!(
+            step(&mut vfs, &mut c, crate::MSC_TIMEOUT_FINISHABLE_MS - 1),
+            MediaState::Ready
+        ); // detach armed
 
         assert_eq!(
             step(&mut vfs, &mut c, crate::MSC_DETACH_DEFER_MS - 1),
@@ -613,7 +638,7 @@ mod tests {
         let mut root = [0u8; 512];
         root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 0, 0));
         vfs.write_sector(131, &root);
-        let sector = uf2_block();
+        let sector = uf2_block(0x0800_0000, &[0; 4]);
 
         p.try_push(MscOp::Write(Sector {
             lba: crate::fat::DATA_START_LBA,
@@ -678,7 +703,7 @@ mod tests {
         }))
         .ok()
         .expect("dirent");
-        let sector = uf2_block();
+        let sector = uf2_block(0x0800_0000, &[0; 4]);
         p.try_push(MscOp::Write(Sector {
             lba: crate::fat::DATA_START_LBA,
             data: sector,
@@ -694,7 +719,11 @@ mod tests {
             MediaState::Ready,
             "the image met its size, but the command is still in flight"
         );
-        assert_eq!(step(&mut vfs, &mut c, 1), MediaState::Ready, "still open");
+        assert_eq!(
+            step(&mut vfs, &mut c, crate::MSC_TIMEOUT_FINISHABLE_MS),
+            MediaState::Ready,
+            "still open"
+        );
         assert_eq!(epoch.load(Ordering::Acquire), 0);
 
         // Closing the phase is what the detach lands on.
@@ -724,7 +753,7 @@ mod tests {
         root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 0, 0));
         vfs.write_sector(131, &root);
 
-        let sector = uf2_block();
+        let sector = uf2_block(0x0800_0000, &[0; 4]);
 
         // A write from the old epoch must not be applied to the new mount.
         p.try_push(MscOp::Write(Sector {
@@ -740,6 +769,67 @@ mod tests {
         assert!(
             !vfs.is_transfer_active(),
             "a stale-epoch write must not be applied to the volume"
+        );
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+    use crate::fixtures::uf2_block;
+    use crate::flash_sink::step_tests::StepBackend;
+    use crate::{FlashSink, NoObserver, Vfs, VfsConfig};
+
+    /// The test clock a `fn()` pointer can reach.
+    static NOW_US: AtomicU32 = AtomicU32::new(0);
+
+    fn now_us() -> u64 {
+        u64::from(NOW_US.load(Ordering::Relaxed))
+    }
+
+    /// A clocked `DirectIo` parks a write while flash steps and delivers the sector exactly once.
+    #[test]
+    fn a_clocked_write_parks_then_completes() {
+        NOW_US.store(0, Ordering::Relaxed);
+        let mut files: [&mut dyn crate::VfsFile; 0] = [];
+        let mut vfs = Vfs::new(
+            VfsConfig::default(),
+            &mut files,
+            FlashSink::new(StepBackend::new(3, 2)),
+            NoObserver,
+        );
+        let block = uf2_block(0x0800_0000, &[0; 4]);
+        let mut polls = 0;
+        {
+            let mut io = DirectIo::with_clock(&mut vfs, now_us);
+            while io.write(crate::fat::DATA_START_LBA, &block) != SectorPoll::Ready {
+                polls += 1;
+                NOW_US.fetch_add(10, Ordering::Relaxed);
+                assert!(polls < 1000, "the write never completed");
+            }
+        }
+        assert!(polls > 0, "the write parked at least once");
+        assert_eq!(
+            vfs.sink().backend().bytes(),
+            &block[32..36],
+            "the block's payload reached the backend exactly once"
+        );
+    }
+
+    /// Without a clock the same write is serviced inline.
+    #[test]
+    fn an_unclocked_write_never_parks() {
+        let mut files: [&mut dyn crate::VfsFile; 0] = [];
+        let mut vfs = Vfs::new(
+            VfsConfig::default(),
+            &mut files,
+            FlashSink::new(StepBackend::new(3, 2)),
+            NoObserver,
+        );
+        let mut io = DirectIo::new(&mut vfs);
+        assert_eq!(
+            io.write(crate::fat::DATA_START_LBA, &uf2_block(0x0800_0000, &[0; 4])),
+            SectorPoll::Ready
         );
     }
 }

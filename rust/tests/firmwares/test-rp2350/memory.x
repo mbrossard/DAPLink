@@ -35,5 +35,10 @@ SECTIONS {
 
 } INSERT AFTER .uninit;
 
+/* cortex-m-rt takes these from `.` after .uninit, which .end_block leaves in flash. */
+_stack_end = __euninit;
+__sheap = __euninit;
+ASSERT(_stack_end >= ORIGIN(RAM) && _stack_end <= ORIGIN(RAM) + LENGTH(RAM), "_stack_end is not in RAM");
+
 PROVIDE(start_to_end = __end_block_addr - __start_block_addr);
 PROVIDE(end_to_start = __start_block_addr - __end_block_addr);

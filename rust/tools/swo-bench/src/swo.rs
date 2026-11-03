@@ -1,26 +1,27 @@
 //! `DAP_SWO_*` command encode/decode: pure byte-buffer transforms, independent of a probe.
 
 use dap_bench::dap::DecodeError;
+use dap_conformance::cmsis_dap::{ids, Command, Context, Finding, Link, Reply};
 
 /// `DAP_SWO_Transport`: select where captured trace is handed to the host.
-pub const DAP_SWO_TRANSPORT: u8 = 0x17;
+pub const DAP_SWO_TRANSPORT: u8 = ids::SWO_TRANSPORT;
 /// `DAP_SWO_Mode`: select the trace line encoding.
-pub const DAP_SWO_MODE: u8 = 0x18;
+pub const DAP_SWO_MODE: u8 = ids::SWO_MODE;
 /// `DAP_SWO_Baudrate`: request a capture baud; the probe answers with the realized one.
-pub const DAP_SWO_BAUDRATE: u8 = 0x19;
+pub const DAP_SWO_BAUDRATE: u8 = ids::SWO_BAUDRATE;
 /// `DAP_SWO_Control`: start or stop capture.
-pub const DAP_SWO_CONTROL: u8 = 0x1A;
+pub const DAP_SWO_CONTROL: u8 = ids::SWO_CONTROL;
 /// `DAP_SWO_Status`: capture-active flag plus buffered byte count.
-pub const DAP_SWO_STATUS: u8 = 0x1B;
+pub const DAP_SWO_STATUS: u8 = ids::SWO_STATUS;
 /// `DAP_SWO_Data`: drain up to N buffered trace bytes.
-pub const DAP_SWO_DATA: u8 = 0x1C;
+pub const DAP_SWO_DATA: u8 = ids::SWO_DATA;
 
 /// `DAP_Info` id for the probe's SWO trace buffer size (4 bytes LE).
-pub const INFO_SWO_TRACE_BUFFER_SIZE: u8 = 0xFD;
+pub const INFO_SWO_TRACE_BUFFER_SIZE: u8 = ids::info::SWO_BUFFER;
 /// `DAP_Info` id for the capability bitfield.
-pub const INFO_CAPABILITIES: u8 = 0xF0;
+pub const INFO_CAPABILITIES: u8 = ids::info::CAPABILITIES;
 /// Capability bit 2: SWO UART capture.
-pub const CAP_SWO_UART: u8 = 0x04;
+pub const CAP_SWO_UART: u8 = ids::capability::SWO_UART as u8;
 
 /// Generic single-byte OK status.
 const DAP_OK: u8 = 0x00;
@@ -80,24 +81,29 @@ pub struct Data {
     pub bytes: Vec<u8>,
 }
 
-/// Checks that `resp` starts with `command` and is at least `min_len` long, returning the rest.
-fn expect_command(resp: &[u8], command: u8, min_len: usize) -> Result<&[u8], DecodeError> {
-    let (&found, rest) = resp.split_first().ok_or(DecodeError::Truncated)?;
-    if found != command {
-        return Err(DecodeError::UnexpectedCommand {
-            expected: command,
-            found,
-        });
+/// `resp` decoded as the answer to `command`: the bytes after the id, or the `DAP_Info` value.
+fn reply(command: Command, resp: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    let expected = command.id();
+    match Reply::decode(&command, resp, Context::arm(Link::Swd)) {
+        Ok(Reply::Other(rest) | Reply::Info(rest)) => Ok(rest),
+        Ok(_) => Err(DecodeError::UnexpectedCommand {
+            expected,
+            found: ids::UNIMPLEMENTED,
+        }),
+        Err(Finding::WrongId(found)) => Err(DecodeError::UnexpectedCommand { expected, found }),
+        Err(Finding::NoReply | Finding::Truncated { .. }) => Err(DecodeError::Truncated),
+        Err(finding) => Err(DecodeError::Layout(finding)),
     }
-    if resp.len() < min_len {
-        return Err(DecodeError::Truncated);
-    }
-    Ok(rest)
+}
+
+/// `resp` decoded as the answer to the SWO command `id`.
+fn swo_reply(id: u8, resp: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    reply(Command::Other(id, Vec::new()), resp)
 }
 
 /// Decodes a `[command, status]` response, rejecting any status other than OK.
 fn decode_ok(resp: &[u8], command: u8) -> Result<(), DecodeError> {
-    let rest = expect_command(resp, command, 2)?;
+    let rest = swo_reply(command, resp)?;
     match rest[0] {
         DAP_OK => Ok(()),
         other => Err(DecodeError::InvalidStatus(other)),
@@ -134,7 +140,7 @@ pub fn encode_baudrate(baud: u32) -> Vec<u8> {
 
 /// Decodes a `DAP_SWO_Baudrate` response: the realized baud, `0` meaning the request was refused.
 pub fn decode_baudrate(resp: &[u8]) -> Result<u32, DecodeError> {
-    let rest = expect_command(resp, DAP_SWO_BAUDRATE, 5)?;
+    let rest = swo_reply(DAP_SWO_BAUDRATE, resp)?;
     Ok(u32::from_le_bytes(rest[0..4].try_into().unwrap()))
 }
 
@@ -155,7 +161,7 @@ pub fn encode_status() -> Vec<u8> {
 
 /// Decodes a `DAP_SWO_Status` response: `[0x1B, status, count(4 LE)]`.
 pub fn decode_status(resp: &[u8]) -> Result<Status, DecodeError> {
-    let rest = expect_command(resp, DAP_SWO_STATUS, 6)?;
+    let rest = swo_reply(DAP_SWO_STATUS, resp)?;
     Ok(Status {
         active: rest[0] & 0x01 != 0,
         bytes_available: u32::from_le_bytes(rest[1..5].try_into().unwrap()),
@@ -172,13 +178,10 @@ pub fn encode_data(count: u16) -> Vec<u8> {
 
 /// Decodes a `DAP_SWO_Data` response: `[0x1C, status, count(2 LE), data...]`.
 pub fn decode_data(resp: &[u8]) -> Result<Data, DecodeError> {
-    let rest = expect_command(resp, DAP_SWO_DATA, DATA_HEADER_LEN)?;
-    let count = usize::from(u16::from_le_bytes(rest[1..3].try_into().unwrap()));
-    let bytes = rest.get(3..3 + count).ok_or(DecodeError::Truncated)?;
-    Ok(Data {
-        active: rest[0] & 0x01 != 0,
-        bytes: bytes.to_vec(),
-    })
+    let mut bytes = swo_reply(DAP_SWO_DATA, resp)?;
+    let active = bytes[0] & 0x01 != 0;
+    bytes.drain(..3);
+    Ok(Data { active, bytes })
 }
 
 /// Trace bytes a single `DAP_SWO_Data` exchange can return within `packet_size`.
@@ -193,25 +196,20 @@ pub const fn data_response_len(count: u16) -> usize {
 
 /// Encodes a `DAP_Info` request: `[0x00, info_id]`.
 pub fn encode_info(info_id: u8) -> Vec<u8> {
-    vec![0x00, info_id]
+    Command::Info(info_id).encode()
 }
 
 /// Decodes a `DAP_Info` response carrying a 4-byte LE word (the SWO trace buffer size).
 pub fn decode_info_u32(resp: &[u8]) -> Result<u32, DecodeError> {
-    let rest = expect_command(resp, 0x00, 6)?;
-    if usize::from(rest[0]) < 4 {
-        return Err(DecodeError::Truncated);
-    }
-    Ok(u32::from_le_bytes(rest[1..5].try_into().unwrap()))
+    let value = reply(Command::Info(INFO_SWO_TRACE_BUFFER_SIZE), resp)?;
+    let word = value.get(..4).ok_or(DecodeError::Truncated)?;
+    Ok(u32::from_le_bytes(word.try_into().unwrap()))
 }
 
 /// Decodes a `DAP_Info` response carrying a single capability byte.
 pub fn decode_info_u8(resp: &[u8]) -> Result<u8, DecodeError> {
-    let rest = expect_command(resp, 0x00, 3)?;
-    if rest[0] == 0 {
-        return Err(DecodeError::Truncated);
-    }
-    Ok(rest[1])
+    let value = reply(Command::Info(INFO_CAPABILITIES), resp)?;
+    value.first().copied().ok_or(DecodeError::Truncated)
 }
 
 #[cfg(test)]

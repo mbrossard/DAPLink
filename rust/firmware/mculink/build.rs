@@ -1,4 +1,4 @@
-//! Place `memory.x` on the linker search path and add the link script.
+//! Link scripts, the `accel_engine` cfg, the alignment check and the 150 MHz power library.
 
 use std::env;
 use std::fs::File;
@@ -19,18 +19,18 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
 
-    // The DMA block is pinned ahead of `.data` so no unrelated static can move it.
     File::create(out.join("dmamem.x"))
         .unwrap()
         .write_all(include_bytes!("dmamem.x"))
         .unwrap();
     println!("cargo:rustc-link-arg-bins=-Tdmamem.x");
 
-    // The accel engine's SRAMX placement rides as its own `-T` script; memory.x cannot carry it.
-    if env::var_os("CARGO_FEATURE_ACCEL").is_some()
-        && env::var_os("CARGO_FEATURE_BITBANG").is_none()
-        && env::var_os("CARGO_FEATURE_FLASH").is_none()
-    {
+    // One wire engine per image: `bitbang` wins over `accel`.
+    println!("cargo::rustc-check-cfg=cfg(accel_engine)");
+    let accel_engine = env::var_os("CARGO_FEATURE_ACCEL").is_some()
+        && env::var_os("CARGO_FEATURE_BITBANG").is_none();
+    if accel_engine {
+        println!("cargo:rustc-cfg=accel_engine");
         File::create(out.join("sramx.x"))
             .unwrap()
             .write_all(include_bytes!("sramx.x"))
@@ -38,7 +38,17 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=-Tsramx.x");
     }
 
-    // defmt-rtt's linker script only exists to link against when the feature pulls the crate in.
+    // A `RUSTFLAGS` in the environment replaces the config's flags; LLVM takes the last value.
+    let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let align = rustflags
+        .rsplit_once("-align-all-functions=")
+        .map(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next().unwrap());
+    assert!(
+        align == Some("2"),
+        "build without RUSTFLAGS, or make `-C llvm-args=-align-all-functions=2` its last \
+         alignment flag: the paced bodies' timing depends on it"
+    );
+
     if env::var_os("CARGO_FEATURE_DEFMT").is_some() {
         println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
     }

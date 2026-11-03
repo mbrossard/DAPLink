@@ -13,13 +13,16 @@ platform crates; reusable crates never select a board.
 | `daplink-vfs` | Virtual FAT16 volume, transfer engine, MSC protocol, and vendor flashing |
 | `daplink-spi-swd` | Runtime-independent SPI-assisted SWD and direct-GPIO JTAG |
 | `daplink-probe-rs` | Host-only adapter from probe-rs raw DAP access to `daplink-flash` |
+| `pl011-baud` | PL011 baud divisor arithmetic shared by every RP seam that programs one |
 | `daplink-embassy-usb` | Async CMSIS-DAP, CDC-ACM, and optional MSC USB classes |
 | `daplink-usb-device` | Polled CMSIS-DAP, CDC-ACM, and optional MSC USB classes |
 | `daplink-rp-embassy` | Embassy RP clocks, pins, serial services, LEDs, and reboot integration |
 | `daplink-rp-hal` | rp2040-hal equivalents for the RTIC firmware |
-| `daplink-rp-pio` | Runtime-independent RP2040/RP235x PIO SWD backend |
+| `daplink-rp-pio` | Runtime-independent RP2040/RP235x [PIO SWD/JTAG engines](../design/rp-pio-engines.md) |
+| `daplink-rp-dma-uart` | PL011-over-DMA channel sequence and polled ring, shared by the probe seam and DUT images |
 | `daplink-stm32-embassy` | Embassy STM32H5-class platform integration |
 | `daplink-stm32f1-embassy` | Embassy STM32F1 platform integration |
+| `daplink-stm32f1-spi-swd` | STM32F1 register seam for the SPI-assisted SWD engine |
 | `daplink-stm32f1-hal` | stm32f1xx-hal platform integration for polled firmware |
 | `daplink-lpc55-hal` | lpc55-hal platform integration for polled LPC55S69 firmware |
 

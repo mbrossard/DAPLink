@@ -7,8 +7,7 @@ use daplink_decoder::{
 /// The full accepted-format set: uf2 is the only image format in tree.
 pub type AllDecoders = (Uf2Format,);
 
-/// A running decoder from a composed set: nesting `Either` builds a static-dispatch union sized
-/// to the set's largest decoder, naming only composed types.
+/// A running decoder from a composed set: a nested static-dispatch union.
 pub enum Either<L, R> {
     /// The head format's running decoder.
     Left(L),
@@ -41,8 +40,7 @@ impl<L: Decoder, R: Decoder> Decoder for Either<L, R> {
     }
 }
 
-/// A firmware-composed set of accepted image formats, implemented for tuples of
-/// [`FormatDecoder`] descriptors and resolved without dynamic dispatch or a heap.
+/// A firmware-composed tuple of [`FormatDecoder`] descriptors, resolved without dyn or heap.
 pub trait DecoderSet {
     /// The running-decoder union for this set.
     type Running: Decoder;

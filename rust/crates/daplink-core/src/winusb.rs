@@ -69,8 +69,7 @@ pub const MS_OS_DESCRIPTOR: [u8; MSOS_LEN as usize] = [
 mod tests {
     use super::*;
 
-    /// frozen: the exact BOS platform capability bytes a Windows host receives. Windows caches the
-    /// capability by content, so changing a byte breaks binding on hosts already paired.
+    /// frozen: the BOS platform capability bytes; Windows caches it by content.
     #[test]
     fn bos_platform_bytes_are_pinned() {
         #[rustfmt::skip]
@@ -86,8 +85,7 @@ mod tests {
         assert_eq!(BOS_PLATFORM, EXPECTED);
     }
 
-    /// frozen: the exact MS OS 2.0 descriptor set returned for `MSOS_VENDOR_CODE`. WinUSB binding
-    /// depends on every byte of the blob, not just the fields this crate computes.
+    /// frozen: the MS OS 2.0 descriptor set returned for `MSOS_VENDOR_CODE`.
     #[test]
     fn ms_os_descriptor_bytes_are_pinned() {
         #[rustfmt::skip]
@@ -126,15 +124,13 @@ mod tests {
         assert_eq!(MS_OS_DESCRIPTOR, EXPECTED);
     }
 
-    /// frozen: `bFirstInterface` stays 0, the interface DAP v2 is composed on. Moving DAP v2 without
-    /// moving this byte makes WinUSB bind the wrong interface.
+    /// frozen: `bFirstInterface` stays 0, the DAP v2 interface.
     #[test]
     fn ms_os_descriptor_first_interface_is_zero() {
         assert_eq!(MS_OS_DESCRIPTOR[14], 0, "bFirstInterface");
     }
 
-    /// frozen: `wTotalLength` and `wSubsetLength` self-check against the real blob length; a host
-    /// walks the set by those fields, so a disagreement is a silent parse failure, not a build error.
+    /// frozen: `wTotalLength` and `wSubsetLength` match the blob length.
     #[test]
     fn ms_os_descriptor_length_fields_self_check() {
         let total = u16::from_le_bytes([MS_OS_DESCRIPTOR[8], MS_OS_DESCRIPTOR[9]]);

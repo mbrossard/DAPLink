@@ -16,10 +16,12 @@ pub use daplink_flash::target::Target;
 
 pub mod algorithms {
     //! Shared, content-deduped flash-algorithm modules (one per flash controller).
+    #[cfg(feature = "_algo_nrf52")]
+    pub mod nrf52;
     #[cfg(feature = "_algo_rp2040")]
     pub mod rp2040_rom;
     #[cfg(feature = "_algo_rp2350")]
-    pub mod rp235x;
+    pub mod rp2350;
     #[cfg(feature = "_algo_stm32f4")]
     pub mod stm32f4;
     #[cfg(feature = "synthetic")]
@@ -28,6 +30,10 @@ pub mod algorithms {
 
 pub mod families {
     //! Hand-written per-family reset/unlock behavior and register facts.
+    #[cfg(feature = "_family_nrf52")]
+    pub mod nrf52;
+    #[cfg(any(feature = "_family_rp2040", feature = "_family_rp2350"))]
+    mod rp;
     #[cfg(feature = "_family_rp2040")]
     pub mod rp2040;
     #[cfg(feature = "_family_rp2350")]
@@ -36,10 +42,14 @@ pub mod families {
 
 pub mod targets {
     //! Per-chip target definitions referencing an algorithm and a family sequence by handle.
+    #[cfg(feature = "nrf52833")]
+    pub mod nrf52833;
+    #[cfg(feature = "nrf52840")]
+    pub mod nrf52840;
     #[cfg(feature = "rp2040")]
     pub mod rp2040;
     #[cfg(feature = "rp2350")]
-    pub mod rp235x;
+    pub mod rp2350;
     #[cfg(feature = "stm32f401ce")]
     pub mod stm32f401ce;
     #[cfg(feature = "synthetic")]
@@ -48,7 +58,6 @@ pub mod targets {
 
 pub mod selector;
 
-#[macro_use]
 pub mod table;
 
 pub use selector::{FixedTarget, ImageHint, SelectError, TargetSelector};
@@ -63,4 +72,13 @@ mod tests_stm32f401ce;
 mod tests_rp2040;
 
 #[cfg(all(test, feature = "rp2350"))]
-mod tests_rp235x;
+mod tests_rp2350;
+
+#[cfg(all(test, feature = "_family_nrf52", feature = "_algo_nrf52"))]
+mod tests_nrf52;
+
+#[cfg(all(test, feature = "nrf52840"))]
+mod tests_nrf52840;
+
+#[cfg(all(test, feature = "nrf52833"))]
+mod tests_nrf52833;

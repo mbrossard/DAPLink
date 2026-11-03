@@ -12,8 +12,7 @@ pub(crate) const UF2_MAGIC_END: u32 = 0x0AB1_6F30;
 pub(crate) const UF2_BLOCK: usize = 512;
 pub(crate) const UF2_PAYLOAD: usize = 256;
 
-/// The first block's target address and 256-byte payload: magic at 0/4/508, address at 12,
-/// payload at 32. A spot check, not a decode.
+/// The first block's target address and 256-byte payload; a spot check, not a decode.
 pub(crate) fn first_block(uf2: &[u8]) -> Option<(u32, &[u8])> {
     let block = uf2.get(..UF2_BLOCK)?;
     let le32 = |off: usize| u32::from_le_bytes(block[off..off + 4].try_into().unwrap());
@@ -23,8 +22,47 @@ pub(crate) fn first_block(uf2: &[u8]) -> Option<(u32, &[u8])> {
     Some((le32(12), &block[32..32 + UF2_PAYLOAD]))
 }
 
-/// Read back `payload.len()` bytes at `addr` and require a match, plus an RTT boot event when
-/// `--dut-elf` allows a symbol-scoped attach.
+/// The widest span an image may claim before its readback is refused as implausible.
+const MAX_SPAN: u64 = 1 << 20;
+
+/// The address range every block of `uf2` writes, as `(start, len)`; `None` if malformed or wider than [`MAX_SPAN`].
+pub(crate) fn image_span(uf2: &[u8]) -> Option<(u32, usize)> {
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    for block in uf2.chunks(UF2_BLOCK) {
+        let (addr, payload) = first_block(block)?;
+        lo = lo.min(u64::from(addr));
+        hi = hi.max(u64::from(addr) + payload.len() as u64);
+    }
+    if lo == u64::MAX || hi.checked_sub(lo)? > MAX_SPAN {
+        return None;
+    }
+    Some((lo as u32, (hi - lo) as usize))
+}
+
+/// Replace block `index`'s start magic, leaving every other block intact; `None` if there is no such block.
+pub(crate) fn corrupt_block(uf2: &[u8], index: usize) -> Option<Vec<u8>> {
+    if uf2.is_empty() || !uf2.len().is_multiple_of(UF2_BLOCK) || index >= uf2.len() / UF2_BLOCK {
+        return None;
+    }
+    let mut out = uf2.to_vec();
+    let at = index * UF2_BLOCK;
+    out[at..at + 4].copy_from_slice(&(!UF2_MAGIC_START0).to_le_bytes());
+    Some(out)
+}
+
+/// Block `index`'s target address, read whatever its magic says.
+pub(crate) fn block_addr(uf2: &[u8], index: usize) -> Option<u32> {
+    let at = index.checked_mul(UF2_BLOCK)? + 12;
+    Some(u32::from_le_bytes(uf2.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// The block the corruption case damages: neither the first nor the last.
+pub(crate) fn middle_block(uf2: &[u8]) -> Option<usize> {
+    let blocks = uf2.len() / UF2_BLOCK;
+    (blocks >= 2).then_some(blocks / 2)
+}
+
+/// Read back `payload.len()` bytes at `addr`, plus an RTT boot event when `--dut-elf` allows.
 pub(crate) fn verify(cx: &mut Ctx, addr: u32, payload: &[u8]) -> Result<(), Failure> {
     let dut_elf = cx.dut_elf.clone();
     let session = cx
@@ -81,6 +119,81 @@ mod tests {
         let mut uf2 = one_block_uf2(0x0800_0000, &[0u8; UF2_PAYLOAD]);
         uf2[0] = 0x00;
         assert!(first_block(&uf2).is_none());
+    }
+
+    /// The span covers every block, not just the first.
+    #[test]
+    fn image_span_covers_every_block() {
+        let mut image = one_block_uf2(0x0800_0000, &[0x11; UF2_PAYLOAD]);
+        image.extend_from_slice(&one_block_uf2(0x0800_0100, &[0x22; UF2_PAYLOAD]));
+        image.extend_from_slice(&one_block_uf2(0x0800_0200, &[0x33; UF2_PAYLOAD]));
+        assert_eq!(image_span(&image), Some((0x0800_0000, 3 * UF2_PAYLOAD)));
+    }
+
+    /// Blocks need not arrive in address order, and the span is still the whole range.
+    #[test]
+    fn image_span_does_not_assume_ascending_blocks() {
+        let mut image = one_block_uf2(0x0800_0200, &[0u8; UF2_PAYLOAD]);
+        image.extend_from_slice(&one_block_uf2(0x0800_0000, &[0u8; UF2_PAYLOAD]));
+        assert_eq!(image_span(&image), Some((0x0800_0000, 3 * UF2_PAYLOAD)));
+    }
+
+    /// A malformed or wildly addressed image is refused rather than turned into a huge read.
+    #[test]
+    fn image_span_refuses_what_it_cannot_bound() {
+        let mut image = one_block_uf2(0x0800_0000, &[0u8; UF2_PAYLOAD]);
+        image.extend_from_slice(&one_block_uf2(0x9000_0000, &[0u8; UF2_PAYLOAD]));
+        assert_eq!(image_span(&image), None);
+        assert_eq!(image_span(&[]), None);
+        let bad = corrupt_block(&one_block_uf2(0, &[0u8; UF2_PAYLOAD]), 0).unwrap();
+        assert_eq!(image_span(&bad), None);
+    }
+
+    /// The corrupted copy differs from the good one only in the named block's magic.
+    #[test]
+    fn corrupt_block_damages_only_the_named_block() {
+        let mut image = one_block_uf2(0x0800_0000, &[0x11; UF2_PAYLOAD]);
+        image.extend_from_slice(&one_block_uf2(0x0800_0100, &[0x22; UF2_PAYLOAD]));
+        let bad = corrupt_block(&image, 1).expect("block 1 exists");
+        assert_eq!(bad.len(), image.len());
+        assert_eq!(bad[..UF2_BLOCK], image[..UF2_BLOCK]);
+        assert_ne!(
+            bad[UF2_BLOCK..UF2_BLOCK + 4],
+            image[UF2_BLOCK..UF2_BLOCK + 4]
+        );
+        assert_eq!(bad[UF2_BLOCK + 4..], image[UF2_BLOCK + 4..]);
+        // The first block still parses, so the readback check still knows what to expect.
+        assert!(first_block(&bad).is_some());
+    }
+
+    #[test]
+    fn corrupt_block_refuses_what_it_cannot_corrupt() {
+        let image = one_block_uf2(0x0800_0000, &[0u8; UF2_PAYLOAD]);
+        assert!(corrupt_block(&image, 1).is_none());
+        assert!(corrupt_block(&[], 0).is_none());
+        assert!(corrupt_block(&image[..UF2_BLOCK - 1], 0).is_none());
+    }
+
+    /// A damaged block still names its address.
+    #[test]
+    fn block_addr_reads_a_corrupted_block() {
+        let mut image = one_block_uf2(0x0800_0000, &[0u8; UF2_PAYLOAD]);
+        image.extend_from_slice(&one_block_uf2(0x0800_0100, &[0u8; UF2_PAYLOAD]));
+        let bad = corrupt_block(&image, 1).unwrap();
+        assert_eq!(block_addr(&bad, 1), Some(0x0800_0100));
+        assert_eq!(block_addr(&bad, 2), None);
+    }
+
+    /// A one-block image has no middle, so the case skips.
+    #[test]
+    fn middle_block_needs_more_than_one_block() {
+        let one = one_block_uf2(0, &[0u8; UF2_PAYLOAD]);
+        assert_eq!(middle_block(&one), None);
+        let mut four = Vec::new();
+        for _ in 0..4 {
+            four.extend_from_slice(&one);
+        }
+        assert_eq!(middle_block(&four), Some(2));
     }
 
     #[test]

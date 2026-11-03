@@ -3,18 +3,12 @@
 #![no_std]
 #![no_main]
 
-use core::cell::{Cell, RefCell};
-
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
-use embassy_futures::select::select;
 use embassy_stm32::bind_interrupts;
 #[cfg(feature = "nanodap")]
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::peripherals;
 use embassy_stm32::usb::{Driver, InterruptHandler};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::signal::Signal;
 use embassy_usb::class::cdc_acm::{ControlChanged, Receiver, Sender};
 use embassy_usb::UsbDevice;
 use static_cell::ConstStaticCell;
@@ -28,11 +22,12 @@ use panic_halt as _;
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
-use daplink_embassy_usb::{session_ended, session_epoch, vcom_bridge, DapV2Class};
+use daplink_embassy_usb::{dap_sessions, vcom_bridge, DapPipeline, DapV2Class, PipelineSession};
 #[cfg(not(feature = "flash"))]
 use daplink_rs::daplink_core::DAP_FW_VERSION;
 use daplink_rs::daplink_core::{
-    product_string, DapConfig, DapQueue, QueueError, Submit, DAP_PACKET_SIZE, DEFAULT_VCOM_BAUD,
+    product_string, DapConfig, DapQueue, EndpointSize, PacketSize, DAP_PACKET_SIZE,
+    DEFAULT_VCOM_BAUD,
 };
 #[cfg(all(feature = "nanodap", not(feature = "flash"), not(feature = "accel")))]
 use daplink_rs::BitbangDap;
@@ -42,41 +37,45 @@ use daplink_rs::NoSwo;
 use daplink_rs::StatusLed;
 #[cfg(not(feature = "nanodap"))]
 use daplink_rs::SwdOnlyDap;
-use daplink_rs::{NoBootloader, RebootVendor, VcomBaudVendor, VcomStatsVendor, VendorChain};
-#[cfg(feature = "accel")]
+use daplink_rs::{NoBootloader, RebootVendor, VcomBaudVendor, VcomStatsVendor};
+#[cfg(all(feature = "accel", not(feature = "flash")))]
 use daplink_spi_swd::NoFastJtag;
 #[cfg(all(feature = "nanodap", not(feature = "accel")))]
 use daplink_stm32f1_embassy::swd_jtag_deps;
-#[cfg(feature = "accel")]
-use daplink_stm32f1_embassy::SpiSwdJtagDap;
+#[cfg(not(all(feature = "accel", feature = "flash")))]
+use daplink_stm32f1_embassy::IoPin;
 use daplink_stm32f1_embassy::{
-    clocks, mask_unhandled_interrupts, serial, vcom_baud_state, DmaVcom, DynCycleDelay, IoPin,
+    clocks, mask_unhandled_interrupts, serial, vcom_baud_state, DmaVcom, DynCycleDelay, F1UsbDriver,
 };
 #[cfg(not(feature = "nanodap"))]
 use daplink_stm32f1_embassy::{swd_only_deps, usart1_swo, BicolorLed, UartSwo};
+#[cfg(all(feature = "accel", not(feature = "flash")))]
+use daplink_stm32f1_spi_swd::SpiSwdJtagDap;
 
-// The mass-storage drive and the vendor flash commands, both over the flash-wins mux.
 #[cfg(feature = "flash")]
 use daplink_embassy_usb::msc::MscEndpoints;
 #[cfg(feature = "flash")]
-use daplink_rs::flash_mux::{
-    role_build_flash_backend, role_mux_dap_engine_with_vendor, RoleMuxDapEngine,
-    RoleMuxFlashBackend,
-};
+use daplink_rs::flash_mux::{mux_dap_engine, mux_flash_backend, MuxDapEngine, MuxFlashBackend};
+#[cfg(all(feature = "flash", not(feature = "accel")))]
+use daplink_rs::{LateJtag, LateJtagDeps, LateSwdDrv};
 #[cfg(feature = "flash")]
-use daplink_rs::{LateJtag, LateJtagDeps, LateSwdDrv, ScanChainStorage, SwdMux};
+use daplink_rs::{PooledFlashBackend, StagingPool};
 #[cfg(feature = "flash")]
-use daplink_stm32f1_embassy::clocks::UsbConnect;
+use daplink_rs::{ScanChainStorage, SwdMux};
+#[cfg(feature = "flash")]
+use daplink_stm32f1_embassy::UsbConnect;
+#[cfg(feature = "flash-nrf52833")]
+use daplink_targets::targets::nrf52833::NRF52833;
+#[cfg(feature = "flash-nrf52840")]
+use daplink_targets::targets::nrf52840::NRF52840;
 #[cfg(feature = "flash-stm32f401")]
 use daplink_targets::targets::stm32f401ce::STM32F401CE;
 #[cfg(feature = "flash")]
 use daplink_vfs::{AllDecoders, FlashSink, FlashVolume, VendorFlash, VolumeStorage};
 
-// The flash spine stays scoped to the nanoDAP board it is composed and benched on.
 #[cfg(all(feature = "flash", not(feature = "nanodap")))]
 compile_error!("`flash` composes only on the `nanodap` board wiring");
 
-// The accelerated SWD backend's board seam, composed in place of bit-bang SWD under `accel`.
 #[cfg(feature = "accel")]
 mod spi_swd;
 
@@ -84,57 +83,31 @@ mod spi_swd;
 #[cfg(all(feature = "accel", not(feature = "nanodap")))]
 compile_error!("`accel` composes only on the `nanodap` board wiring");
 
-// The accel engine and the flash-wins mux each claim the one wire adapter; they do not compose.
-#[cfg(all(feature = "accel", feature = "flash"))]
-compile_error!("`accel` and `flash` are mutually exclusive in this firmware");
+// Two board mappings: the plain board (PA9 bicolor LED, PA15 D+ switch, USART1 SWO, SWD only)
+// and the nanoDAP (PC13 LED, PB15 D+ switch, JTAG on PA7/PA5, no SWO); `flash` and `accel` need it.
 
-// The registry the flash spine selects from, derived from the rows below.
-#[cfg(feature = "flash")]
-daplink_targets::target_table! {
-    umbrella = "flash",
-    count = TARGET_COUNT,
-    primary = PrimaryTarget,
-    selector = Selector,
-    scratch = SCRATCH,
-    primary_ref = PRIMARY,
-    table = flash_table,
-    buffer = flash_scratch,
-    rows = [
-        ("flash-stm32f401", STM32F401CE, daplink_targets::targets::stm32f401ce::PROGRAM_BUFFER_SIZE),
-    ],
-}
+type UsbDrv = F1UsbDriver<'static>;
 
-// Both receive paths are polled DMA rings, so only the VCOM transmit channel is bound.
-bind_interrupts!(struct Irqs {
-    USB_LP_CAN1_RX0 => InterruptHandler<peripherals::USB>;
-    // VCOM transmit (USART2_TX is DMA1 channel 7, RM0008 table 78).
-    DMA1_CHANNEL7 => embassy_stm32::dma::InterruptHandler<peripherals::DMA1_CH7>;
-});
-
-/// USB driver type for the F1 full-speed device controller.
-type UsbDrv = Driver<'static, peripherals::USB>;
-
-/// The engine's `DapLeds` slot: the PA9 bicolor COM LED (tri-state, see below).
+/// The PA9 bicolor COM LED.
 #[cfg(not(feature = "nanodap"))]
 type StatusLedType = BicolorLed;
-/// The engine's `DapLeds` slot: the nanoDAP's single status LED on PC13, active-low.
+/// The nanoDAP status LED on PC13, active-low.
 #[cfg(feature = "nanodap")]
 type StatusLedType = StatusLed<Output<'static>>;
 
-/// The reboot-to-bootloader vendor command, honestly declined: the F103's ROM bootloader is
-/// USART-only, so there is no software-reachable USB update path to reboot into.
+/// The F103 ROM bootloader is USART-only, so reboot is declined.
 #[cfg(not(feature = "flash"))]
-type Vendor = VendorChain<RebootVendor<NoBootloader>, VendorChain<VcomBaudVendor, VcomStatsVendor>>;
+type Vendor = (RebootVendor<NoBootloader>, VcomBaudVendor, VcomStatsVendor);
 
-/// The default-map engine: bit-bang SWD only, with USART1-RX SWO capture in its SWO slot.
+/// Plain board: SWD only, with USART1 SWO.
 #[cfg(not(feature = "nanodap"))]
 type Engine = SwdOnlyDap<'static, IoPin, DynCycleDelay, UartSwo, Vendor, StatusLedType>;
 
-/// The nanoDAP engine: bit-bang SWD+JTAG (TDO on PA5), no SWO -- the board routes no trace pin.
+/// nanoDAP: bit-bang SWD and JTAG; the board routes no SWO.
 #[cfg(all(feature = "nanodap", not(feature = "flash"), not(feature = "accel")))]
 type Engine = BitbangDap<'static, IoPin, DynCycleDelay, NoSwo, Vendor, StatusLedType>;
 
-/// The accelerated engine: SPI-session SWD with bit-bang JTAG, same LED/vendor slots, no SWO.
+/// nanoDAP `accel`: SPI-assisted SWD, bit-bang JTAG.
 #[cfg(all(feature = "accel", not(feature = "flash")))]
 type Engine = SpiSwdJtagDap<
     'static,
@@ -147,96 +120,134 @@ type Engine = SpiSwdJtagDap<
     StatusLedType,
 >;
 
-/// The dap-rs dependency role of the one adapter the flash build arbitrates.
-#[cfg(feature = "flash")]
+/// nanoDAP `flash`: the wire engine the DAP and flash roles share, SPI-assisted under `accel`.
+#[cfg(all(feature = "flash", feature = "accel"))]
+type MuxDeps = spi_swd::AccelDeps;
+#[cfg(all(feature = "flash", not(feature = "accel")))]
 type MuxDeps = LateJtagDeps<IoPin, DynCycleDelay>;
-/// The SWD driver role of [`MuxDeps`].
-#[cfg(feature = "flash")]
+#[cfg(all(feature = "flash", feature = "accel"))]
+type MuxSwd = spi_swd::AccelSwd;
+#[cfg(all(feature = "flash", not(feature = "accel")))]
 type MuxSwd = LateSwdDrv<IoPin, DynCycleDelay>;
-/// The JTAG driver role of [`MuxDeps`].
-#[cfg(feature = "flash")]
+#[cfg(all(feature = "flash", feature = "accel"))]
+type MuxJtag = spi_swd::AccelJtag;
+#[cfg(all(feature = "flash", not(feature = "accel")))]
 type MuxJtag = LateJtag<IoPin, DynCycleDelay>;
 
-/// The flash-wins arbiter owning the one physical adapter.
 #[cfg(feature = "flash")]
 type Mux = SwdMux<MuxDeps, MuxSwd, MuxJtag>;
-/// The flash-algorithm runtime over an ungated flash-side handle on the mux.
 #[cfg(feature = "flash")]
-type Backend =
-    RoleMuxFlashBackend<MuxDeps, MuxSwd, MuxJtag, DynCycleDelay, PrimaryTarget, Selector>;
-/// The image-fragment sink one flash front-end owns.
+type Backend = PooledFlashBackend<
+    'static,
+    MuxFlashBackend<MuxDeps, MuxSwd, MuxJtag, DynCycleDelay, PrimaryTarget, Selector>,
+>;
 #[cfg(feature = "flash")]
 type Sink = FlashSink<Backend>;
-/// The vendor slot's flash-busy gate: the mux's own live-session flag.
 #[cfg(feature = "flash")]
 type RebootBusy = &'static Mux;
-/// The declined reboot command, chained ahead of the vendor flash-stream commands.
 #[cfg(feature = "flash")]
-type Vendor = VendorChain<
+type Vendor = (
     RebootVendor<NoBootloader, RebootBusy>,
-    VendorChain<VendorFlash<AllDecoders, Sink>, VendorChain<VcomBaudVendor, VcomStatsVendor>>,
->;
-/// The flash build's engine: gated by the mux, with the vendor flash commands composed in.
+    &'static mut VendorFlash<AllDecoders, Sink>,
+    VcomBaudVendor,
+    VcomStatsVendor,
+);
+
+/// nanoDAP `flash`: the DAP role of the shared engine.
 #[cfg(feature = "flash")]
-type Engine = RoleMuxDapEngine<
-    'static,
-    MuxDeps,
-    MuxSwd,
-    MuxJtag,
-    DynCycleDelay,
-    NoSwo,
-    Vendor,
-    StatusLedType,
->;
+type Engine =
+    MuxDapEngine<'static, MuxDeps, MuxSwd, MuxJtag, DynCycleDelay, NoSwo, Vendor, StatusLedType>;
 
-/// Core cycles of fixed bit-cell work subtracted from every requested half-period delay;
-/// swept for this pin path at 72 MHz, so re-sweep after an `opt-level` change.
-const SWD_FIXED_WORK_CYCLES: u32 = 8;
+#[cfg(feature = "flash-stm32f401")]
+type PrimaryTarget = STM32F401CE;
 
-/// Floor on the residual spin, in core cycles; zero lets a saturated request run flat out.
+#[cfg(feature = "flash-stm32f401")]
+static PRIMARY: &PrimaryTarget = &STM32F401CE;
+#[cfg(all(feature = "flash-nrf52840", not(feature = "flash-stm32f401")))]
+type PrimaryTarget = NRF52840;
+#[cfg(all(feature = "flash-nrf52840", not(feature = "flash-stm32f401")))]
+static PRIMARY: &PrimaryTarget = &NRF52840;
+#[cfg(all(
+    feature = "flash-nrf52833",
+    not(any(feature = "flash-stm32f401", feature = "flash-nrf52840"))
+))]
+type PrimaryTarget = NRF52833;
+#[cfg(all(
+    feature = "flash-nrf52833",
+    not(any(feature = "flash-stm32f401", feature = "flash-nrf52840"))
+))]
+static PRIMARY: &PrimaryTarget = &NRF52833;
+
+#[cfg(feature = "flash")]
+daplink_targets::target_table! {
+    umbrella = "flash",
+    count = TARGET_COUNT,
+    selector = Selector,
+    scratch = SCRATCH,
+    table = flash_table,
+    buffer = flash_scratch,
+    // The scratch must fit 20 KiB of RAM; the nRF52's 4 KiB pages program in chunks.
+    cap = 0x400,
+    rows = [
+        ("flash-stm32f401", STM32F401CE, daplink_targets::targets::stm32f401ce::PROGRAM_BUFFER_SIZE),
+        ("flash-nrf52840", NRF52840, daplink_targets::targets::nrf52840::PROGRAM_BUFFER_SIZE),
+        ("flash-nrf52833", NRF52833, daplink_targets::targets::nrf52833::PROGRAM_BUFFER_SIZE),
+    ],
+}
+
+// Both receive paths are polled DMA rings, so only the VCOM transmit channel is bound.
+bind_interrupts!(struct Irqs {
+    USB_LP_CAN1_RX0 => InterruptHandler<peripherals::USB>;
+    // USART2_TX is DMA1 channel 7.
+    DMA1_CHANNEL7 => embassy_stm32::dma::InterruptHandler<peripherals::DMA1_CH7>;
+});
+
+/// No fixed work: a write's ACK-to-turnaround cell is two halves of bare store and spin.
+const SWD_FIXED_WORK_CYCLES: u32 = 0;
+
+/// Floor on the residual spin, in core cycles; zero runs flat out.
 const MIN_HALF_PERIOD_CYCLES: u32 = 0;
 
-/// Half-period floor for the accel image's JTAG pacing, in core cycles: its leaner loop needs
-/// an unsubtracted, floored delay or the TDO sample lands on the TCK falling edge.
+/// Floor on the accel JTAG residual spin; below it TDO is sampled too close to the TCK fall.
 #[cfg(feature = "accel")]
 const JTAG_MIN_HALF_PERIOD_CYCLES: u32 = 8;
 
-/// Pipelined CMSIS-DAP command-queue depth, also the advertised `DAP_PACKET_COUNT`.
+/// Command-queue depth, also the advertised `DAP_PACKET_COUNT`.
 const DAP_QUEUE_DEPTH: usize = 4;
 
-/// Per-slot byte capacity of the command queue: one full-speed DAP v2 bulk packet.
 const DAP_QUEUE_SLOT: usize = DAP_PACKET_SIZE as usize;
 
-/// This image's command queue: the depth the host is told about and the storage behind it.
 type Queue = DapQueue<DAP_QUEUE_DEPTH, DAP_QUEUE_SLOT>;
 
-/// The `DAP_Info(MaxPacketCount)` this image advertises; fed to the engine below.
-const DAP_PACKET_COUNT: u8 = 4;
+const DAP_PACKET: PacketSize = Queue::packet_size::<DAP_PACKET_SIZE>();
+const DAP_ENDPOINT: EndpointSize = Queue::endpoint_size::<DAP_PACKET_SIZE>();
 
-// Advertised count, ring depth and slot size are one fact; widening one alone fails the build.
+type Pipeline = DapPipeline<DAP_QUEUE_DEPTH, DAP_QUEUE_SLOT>;
+
+const DAP_PACKET_COUNT: u8 = DAP_QUEUE_DEPTH as u8;
+
+// Advertised count, ring depth and slot size are one fact.
 const _: () = {
+    assert!(DAP_QUEUE_DEPTH <= u8::MAX as usize);
     assert!(Queue::new().depth() == DAP_PACKET_COUNT as usize);
     assert!(Queue::new().packet_capacity() == DAP_PACKET_SIZE as usize);
 };
 
-/// Control-endpoint (EP0) size: 32 bytes, freeing packet memory for the class endpoints.
+/// EP0 size: 32 bytes, freeing packet memory for the class endpoints.
 const EP0_SIZE: u8 = 32;
 
-/// Mass-storage bulk packet size: 32 bytes, all this part's 512-byte packet memory leaves once
-/// EP0, DAP v2 and the CDC pair are allocated.
+/// MSC bulk packet size: what the 512-byte packet memory leaves after the other endpoints.
 #[cfg(feature = "flash")]
 const MSC_EP: usize = 32;
 
-/// VCOM receive ring: must drain before the DMA cursor laps, 22 ms at 921600 baud.
+/// VCOM receive ring: must drain within 22 ms at 921600 baud.
 const VCOM_RX_RING: usize = 2048;
 
-/// Drive the USB device: enumeration, control transfers, and endpoint FIFOs.
 #[embassy_executor::task]
 async fn usb_task(mut usb: UsbDevice<'static, UsbDrv>) -> ! {
     usb.run().await
 }
 
-/// Bridge the CDC-ACM VCOM port to its USART, following the host's line-coding baud.
 #[embassy_executor::task]
 async fn vcom_task(
     mut cdc_tx: Sender<'static, UsbDrv>,
@@ -256,8 +267,7 @@ async fn vcom_task(
     .await
 }
 
-/// Mass-storage bulk transport: the CBW/CSW cycle, bouncing the board's PB15 D+ switch on each
-/// post-transfer remount so the host re-reads `DETAILS.TXT`.
+/// Mass-storage transport, bouncing the PB15 D+ switch on each remount.
 #[cfg(feature = "flash")]
 #[embassy_executor::task]
 async fn msc_task(
@@ -268,133 +278,199 @@ async fn msc_task(
     daplink_embassy_usb::msc::msc_task_with_reconnect(&mut msc, vfs, connect).await
 }
 
-/// Reset-surviving probe state (boot counter, last transfer status) in the `.uninit` section
-/// `link.x` already emits; on this part only a power cycle clears it.
 #[cfg(feature = "flash")]
-#[link_section = ".uninit.RESET_STAMP"]
-static mut RESET_STAMP: core::mem::MaybeUninit<daplink_vfs::ResetStamp> =
-    core::mem::MaybeUninit::uninit();
+daplink_vfs::retained_stamp!();
 
-/// Pipelined CMSIS-DAP loop: a reader fills the queue, an executor runs and answers the oldest.
 async fn dap_loop_pipelined(
-    class: &mut DapV2Class<UsbDrv>,
+    class: DapV2Class<UsbDrv>,
     dap: &mut Engine,
-    queue: &RefCell<Queue>,
+    pipeline: &mut Pipeline,
 ) -> ! {
-    loop {
-        class.wait_connection().await;
-        // Snapshot after the connection is up, so this session's own boundary cannot end it.
-        let session = session_epoch();
-        // Start clean: drop anything a prior session left queued, and clear a stale abort.
-        queue.borrow_mut().reset();
-
-        // Edge-triggered coordination, fresh per connection; one task, so `NoopRawMutex`.
-        let request_available: Signal<NoopRawMutex, ()> = Signal::new();
-        let slot_freed: Signal<NoopRawMutex, ()> = Signal::new();
-        // Set by whichever future first sees the host leave, so the other stops and the join ends.
-        let disconnected: Cell<bool> = Cell::new(false);
-        // Commands run this connection; a one-line summary at disconnect, not a line per packet.
-        #[cfg(feature = "defmt")]
-        let processed: Cell<u32> = Cell::new(0);
-
-        let (mut reader, mut writer) = class.split();
-        let dap = &mut *dap;
-
-        // Reader: pull OUT packets into the request ring; no borrow is held across an await.
-        let reader_fut = async {
-            let mut req = [0u8; DAP_QUEUE_SLOT];
-            loop {
-                let Ok(n) = reader.read_command(&mut req).await else {
-                    disconnected.set(true);
-                    request_available.signal(());
-                    return;
-                };
-                loop {
-                    let outcome = queue.borrow_mut().submit(&req[..n]);
-                    match outcome {
-                        Ok(Submit::Enqueued) => {
-                            request_available.signal(());
-                            break;
-                        }
-                        // Neither enqueues, so neither wakes the executor.
-                        Ok(Submit::AbortIntercepted | Submit::Dropped) => break,
-                        // Ring full: wait for a freed slot, unless the executor has stopped.
-                        Err(QueueError::Full) => {
-                            if disconnected.get() {
-                                return;
-                            }
-                            slot_freed.wait().await;
-                        }
-                        // Unreachable: the slot capacity is the endpoint packet size.
-                        Err(QueueError::Oversized) => break,
-                    }
-                }
-            }
-        };
-
-        // Executor: run the oldest queued command, then drain every ready response to the host.
-        let executor_fut = async {
-            let mut cmd = [0u8; DAP_QUEUE_SLOT];
-            let mut resp = [0u8; DAP_QUEUE_SLOT];
-            loop {
-                let taken = queue.borrow_mut().take_request(&mut cmd);
-                let Some(n) = taken else {
-                    // Nothing to run: stop if the host is gone, else park until a request lands.
-                    if disconnected.get() {
-                        return;
-                    }
-                    request_available.wait().await;
-                    continue;
-                };
-                // A request slot just opened; let a backpressured reader proceed.
-                slot_freed.signal(());
-
-                let len = dap.process_command(&cmd[..n], &mut resp);
-                #[cfg(feature = "defmt")]
-                processed.set(processed.get() + 1);
-
-                if queue.borrow_mut().post_response(&resp[..len]).is_err() {
-                    // The drain below empties the ring before the next command is taken.
-                    debug_assert!(false, "response ring full after a single command");
-                }
-                // Retire under the peek's generation, never the next session's packet.
-                loop {
-                    let peeked = {
-                        let q = queue.borrow();
-                        (q.generation(), q.peek_response(&mut resp))
-                    };
-                    let (generation, Some(l)) = peeked else { break };
-                    if writer.write_response(&resp[..l]).await.is_err() {
-                        disconnected.set(true);
-                        // Release a reader parked on a full ring, so the join can complete.
-                        slot_freed.signal(());
-                        return;
-                    }
-                    if !queue.borrow_mut().discard_response_for(generation) {
-                        break;
-                    }
-                }
-            }
-        };
-
-        // The boundary must be the first arm, so a write parked on a dead session is dropped.
-        select(session_ended(session), join(reader_fut, executor_fut)).await;
-        #[cfg(feature = "defmt")]
-        defmt::info!("dap session: {=u32} commands processed", processed.get());
-
-        // Host gone: release the wire so protocol state cannot leak into the next session.
-        dap.suspend();
-    }
+    let (reader, writer) = class.split();
+    let mut session = PipelineSession::new(reader, writer, pipeline);
+    dap_sessions::<{ cfg!(feature = "defmt") }, _, _, _, _, _>(
+        &mut session,
+        dap,
+        |dap, request, response| dap.process_command(request, response),
+        |dap| dap.suspend(),
+        |_dap, _processed| {
+            #[cfg(feature = "defmt")]
+            defmt::info!("dap session: {=u32} commands processed", _processed);
+        },
+    )
+    .await
 }
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    // Boot the stamp first: it arms the fault latch, and everything below can panic.
-    // SAFETY: `RESET_STAMP` is only touched here, once, before anything concurrent runs.
+// Each builder's temporaries die before the next runs, so the boot stack holds one at a time.
+#[cfg(feature = "flash")]
+#[inline(never)]
+fn build_engine(
+    mux: &'static Mux,
+    table: &'static [&'static dyn daplink_targets::Target],
+    delay: DynCycleDelay,
+    swo: NoSwo,
+    led: StatusLedType,
+    identity: daplink_rs::daplink_core::Identity,
+) -> &'static mut Engine {
+    static ENGINE: static_cell::StaticCell<Engine> = static_cell::StaticCell::new();
+    static MUX_SCAN: ScanChainStorage<{ daplink_rs::daplink_core::SCAN_CHAIN_SLOTS }> =
+        ScanChainStorage::new();
+    ENGINE.init_with(|| {
+        mux_dap_engine(
+            mux,
+            delay,
+            swo,
+            DAP_PACKET,
+            &MUX_SCAN,
+            (
+                RebootVendor::with_busy_check(NoBootloader, mux),
+                build_vendor_flash(mux, table, delay),
+                VcomBaudVendor::new(vcom_baud_state),
+                VcomStatsVendor::new(daplink_embassy_usb::vcom_counters),
+            ),
+            led,
+        )
+        .with_packet_count(DAP_PACKET_COUNT)
+        .with_identity(identity)
+    })
+}
+
+#[cfg(feature = "flash")]
+#[inline(never)]
+fn build_vendor_flash(
+    mux: &'static Mux,
+    table: &'static [&'static dyn daplink_targets::Target],
+    delay: DynCycleDelay,
+) -> &'static mut VendorFlash<AllDecoders, Sink> {
+    static VENDOR_FLASH: static_cell::StaticCell<VendorFlash<AllDecoders, Sink>> =
+        static_cell::StaticCell::new();
+    VENDOR_FLASH.init_with(|| VendorFlash::new(FlashSink::new(pooled_backend(mux, table, delay))))
+}
+
+/// The vendor and mass-storage backends share one scratch; the mux keeps their sessions apart.
+#[cfg(feature = "flash")]
+static STAGING: StagingPool<'static> = StagingPool::new();
+
+#[cfg(feature = "flash")]
+fn pooled_backend(
+    mux: &'static Mux,
+    table: &'static [&'static dyn daplink_targets::Target],
+    delay: DynCycleDelay,
+) -> Backend {
+    PooledFlashBackend::new(
+        mux_flash_backend(mux, delay, PRIMARY, table, &mut []),
+        &STAGING,
+    )
+}
+
+#[cfg(feature = "flash")]
+#[inline(never)]
+fn build_volume(
+    volume: &'static VolumeStorage<Sink>,
+    mux: &'static Mux,
+    table: &'static [&'static dyn daplink_targets::Target],
+    delay: DynCycleDelay,
+    serial: &'static str,
+    stamp: (
+        daplink_vfs::BootSnapshot,
+        daplink_vfs::stamp::StatusWriter<'static>,
+        daplink_vfs::stamp::SteadyToken<'static>,
+    ),
+) -> &'static mut FlashVolume<Sink> {
+    daplink_vfs::assemble_info(
+        volume,
+        FlashSink::new(pooled_backend(mux, table, delay)),
+        daplink_vfs::DeviceInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            serial,
+            reset_count: stamp.0.reset_count(),
+        },
+        Some(stamp),
+        "DAPLINK",
+    )
+}
+
+/// The USB, VCOM and mass-storage peripherals `start_usb` consumes.
+struct UsbParts {
+    usb: embassy_stm32::Peri<'static, peripherals::USB>,
+    dp: embassy_stm32::Peri<'static, peripherals::PA12>,
+    dm: embassy_stm32::Peri<'static, peripherals::PA11>,
+    usart: embassy_stm32::Peri<'static, peripherals::USART2>,
+    tx: embassy_stm32::Peri<'static, peripherals::PA2>,
+    rx: embassy_stm32::Peri<'static, peripherals::PA3>,
+    tx_dma: embassy_stm32::Peri<'static, peripherals::DMA1_CH7>,
+    rx_dma: embassy_stm32::Peri<'static, peripherals::DMA1_CH6>,
+    #[cfg(not(feature = "nanodap"))]
+    connect: embassy_stm32::Peri<'static, peripherals::PA15>,
+    #[cfg(feature = "nanodap")]
+    connect: embassy_stm32::Peri<'static, peripherals::PB15>,
+}
+
+/// Build the USB device, spawn its tasks and attach; returns the DAP class.
+#[inline(never)]
+fn start_usb(
+    spawner: Spawner,
+    p: UsbParts,
+    cfg: &DapConfig<'static>,
+    #[cfg(feature = "flash")] vfs: &'static mut FlashVolume<Sink>,
+) -> DapV2Class<UsbDrv> {
+    // A switched D+ pull-up (PA15, or PB15 on the nanoDAP), detached until the device exists.
+    #[cfg(not(feature = "nanodap"))]
+    let mut usb_connect = daplink_stm32f1_embassy::usb_connect_pa15(p.connect);
+    #[cfg(feature = "nanodap")]
+    let mut usb_connect = daplink_stm32f1_embassy::usb_connect_pb15(p.connect);
+
+    #[cfg(not(feature = "flash"))]
+    let (usb, class, cdc_tx, cdc_rx, control) = daplink_embassy_usb::usb_device(
+        F1UsbDriver::new(Driver::new(p.usb, Irqs, p.dp, p.dm)),
+        cfg,
+    );
     #[cfg(feature = "flash")]
-    let stamp = daplink_vfs::ResetStamp::boot_in_place(unsafe {
-        &mut *core::ptr::addr_of_mut!(RESET_STAMP)
-    });
+    let (usb, class, cdc_tx, cdc_rx, control, msc) = daplink_embassy_usb::usb_device_msc::<_, MSC_EP>(
+        F1UsbDriver::new(Driver::new(p.usb, Irqs, p.dp, p.dm)),
+        cfg,
+    );
+    spawner.spawn(usb_task(usb).expect("usb_task spawns once"));
+
+    // VCOM: USART2 (TX=PA2, RX=PA3), both legs on DMA -- the seam never reads the data register.
+    static RX_RING: ConstStaticCell<[u8; VCOM_RX_RING]> = ConstStaticCell::new([0; VCOM_RX_RING]);
+    let uart = DmaVcom::new_usart2(
+        p.usart,
+        p.tx,
+        p.rx,
+        p.tx_dma,
+        p.rx_dma,
+        Irqs,
+        RX_RING.take(),
+    );
+    spawner.spawn(
+        vcom_task(cdc_tx, cdc_rx, control, uart, DEFAULT_VCOM_BAUD).expect("vcom_task spawns once"),
+    );
+
+    usb_connect.attach();
+    // The mass-storage task now owns the D+ switch.
+    #[cfg(feature = "flash")]
+    spawner.spawn(msc_task(msc, vfs, usb_connect).expect("msc_task spawns once"));
+
+    // The switch must stay driven for as long as the device runs.
+    #[cfg(not(feature = "flash"))]
+    core::mem::forget(usb_connect);
+    class
+}
+
+/// Boot-time composition, kept out of the main future so its temporaries leave the poll frame.
+#[inline(never)]
+fn setup(spawner: Spawner) -> (&'static mut Engine, DapV2Class<UsbDrv>) {
+    #[cfg(feature = "flash")]
+    let stamp = unsafe {
+        // SAFETY: dedicated NOLOAD SRAM is readable at entry; no DMA or other core accesses it.
+        daplink_vfs::stamp::boot_retained(core::ptr::addr_of_mut!(__daplink_retained_stamp).cast())
+    };
+    #[cfg(all(feature = "flash", not(feature = "defmt")))]
+    // SAFETY: only this core runs terminal, non-returning fault handlers.
+    unsafe {
+        daplink_vfs::stamp::arm_terminal_faults(stamp.fault)
+    };
 
     #[cfg(feature = "defmt")]
     defmt::info!("stm32f103-embassy: boot");
@@ -425,7 +501,6 @@ async fn main(spawner: Spawner) {
     #[cfg(all(feature = "nanodap", not(feature = "accel")))]
     let deps = swd_jtag_deps(p.PB0, p.PA7, p.PB14, p.PB13, p.PA5, delay);
 
-    // Accel: the session backend replaces bit-bang SWD on the same pins, JTAG stays bit-bang.
     #[cfg(feature = "accel")]
     let deps = spi_swd::accel_deps(
         p.SPI2,
@@ -440,7 +515,15 @@ async fn main(spawner: Spawner) {
     );
 
     let serial = serial();
-    let mut cfg = DapConfig::daplink(serial).with_product(product_string!("stm32f103"));
+    let mut cfg =
+        DapConfig::daplink(serial, DAP_ENDPOINT).with_product(product_string!("stm32f103"));
+    let identity = daplink_rs::daplink_core::Identity {
+        vendor: cfg.manufacturer,
+        product: cfg.product,
+        serial: cfg.serial,
+        board_vendor: "daplink-rs",
+        board_name: "stm32f103",
+    };
     cfg.max_packet_size_0 = EP0_SIZE;
     #[cfg(feature = "defmt")]
     defmt::info!(
@@ -449,7 +532,7 @@ async fn main(spawner: Spawner) {
         cfg.serial
     );
 
-    // SWO capture on PA10 into a DMA1 CH5 ring; no embassy driver, so the clock is enabled here.
+    // SWO on PA10 into a DMA1 CH5 ring; no embassy driver, so the clock is enabled here.
     #[cfg(not(feature = "nanodap"))]
     let swo = {
         embassy_stm32::pac::RCC
@@ -467,129 +550,88 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "nanodap")]
     let swo = NoSwo;
 
-    // COM LED on PA9, a bicolor series pair: high = red (session activity), low = green (idle).
+    // PA9 bicolor pair: high = red (activity), low = green (idle).
     #[cfg(not(feature = "nanodap"))]
     let led = {
         let mut led = BicolorLed::new(p.PA9);
         led.idle();
         led
     };
-    // nanodap: onboard single LED on PC13, active-low (the pin sinks current).
+    // nanodap: LED on PC13, active-low.
     #[cfg(feature = "nanodap")]
     let led = StatusLed::new_active_low(Output::new(p.PC13, Level::High, Speed::Low));
 
     #[cfg(not(feature = "flash"))]
-    let mut engine: Engine = Engine::with_vendor(
-        deps,
-        led,
-        delay,
-        swo,
-        DAP_FW_VERSION,
-        cfg.max_packet_size,
-        VendorChain::new(
-            RebootVendor::new(NoBootloader),
-            VendorChain::new(
-                VcomBaudVendor::new(vcom_baud_state),
-                VcomStatsVendor::new(daplink_embassy_usb::vcom_counters),
-            ),
-        ),
-    )
-    .with_packet_count(DAP_PACKET_COUNT);
+    let engine: &'static mut Engine = {
+        static ENGINE: static_cell::StaticCell<Engine> = static_cell::StaticCell::new();
+        ENGINE.init_with(|| {
+            Engine::with_vendor(
+                deps,
+                led,
+                delay,
+                swo,
+                DAP_FW_VERSION,
+                DAP_PACKET,
+                (
+                    RebootVendor::new(NoBootloader),
+                    VcomBaudVendor::new(vcom_baud_state),
+                    VcomStatsVendor::new(daplink_embassy_usb::vcom_counters),
+                ),
+            )
+            .with_packet_count(DAP_PACKET_COUNT)
+            .with_identity(identity)
+        })
+    };
     #[cfg(feature = "flash")]
-    let (mut engine, vfs) = {
+    let (engine, vfs) = {
         static MUX: static_cell::StaticCell<Mux> = static_cell::StaticCell::new();
-        static MUX_SCAN: ScanChainStorage<{ daplink_rs::daplink_core::SCAN_CHAIN_SLOTS }> =
-            ScanChainStorage::new();
-        // Two front-ends, two backends; the mux grants one session and refuses the other.
-        static VENDOR_SCRATCH: ConstStaticCell<[u8; SCRATCH]> = ConstStaticCell::new([0; SCRATCH]);
         static VOLUME: VolumeStorage<Sink> = VolumeStorage::new();
 
         let mux: &'static Mux = MUX.init(SwdMux::new(deps));
         let table = flash_table();
-        let vendor_backend: Backend =
-            role_build_flash_backend(mux, delay, PRIMARY, table, VENDOR_SCRATCH.take());
-        let engine = role_mux_dap_engine_with_vendor(
-            mux,
-            delay,
-            swo,
-            cfg.max_packet_size,
-            &MUX_SCAN,
-            VendorChain::new(
-                RebootVendor::with_busy_check(NoBootloader, mux),
-                VendorChain::new(
-                    VendorFlash::new(FlashSink::new(vendor_backend)),
-                    VendorChain::new(
-                        VcomBaudVendor::new(vcom_baud_state),
-                        VcomStatsVendor::new(daplink_embassy_usb::vcom_counters),
-                    ),
-                ),
-            ),
-            led,
-        )
-        .with_packet_count(DAP_PACKET_COUNT);
-        let vfs_backend: Backend =
-            role_build_flash_backend(mux, delay, PRIMARY, table, flash_scratch());
-        let vfs = daplink_vfs::assemble_info(
+        STAGING.put(flash_scratch());
+        let engine = build_engine(mux, table, delay, swo, led, identity);
+        let vfs = build_volume(
             &VOLUME,
-            FlashSink::new(vfs_backend),
-            daplink_vfs::DeviceInfo {
-                version: env!("CARGO_PKG_VERSION"),
-                serial,
-                reset_count: stamp.reset_count(),
-            },
-            Some(stamp),
-            "DAPLINK",
+            mux,
+            table,
+            delay,
+            serial,
+            (stamp.snapshot, stamp.status, stamp.steady),
         );
         (engine, vfs)
     };
 
-    // A switched D+ pull-up (PA15, or PB15 on the nanoDAP), detached until the device exists.
     #[cfg(not(feature = "nanodap"))]
-    let mut usb_connect = clocks::usb_connect_pa15(p.PA15);
+    let connect = p.PA15;
     #[cfg(feature = "nanodap")]
-    let mut usb_connect = clocks::usb_connect_pb15(p.PB15);
-
-    // Full-speed device controller: D+=PA12, D-=PA11.
-    #[cfg(not(feature = "flash"))]
-    let (usb, mut class, cdc_tx, cdc_rx, control) =
-        daplink_embassy_usb::usb_device(Driver::new(p.USB, Irqs, p.PA12, p.PA11), &cfg);
-    #[cfg(feature = "flash")]
-    let (usb, mut class, cdc_tx, cdc_rx, control, msc) =
-        daplink_embassy_usb::usb_device_msc::<_, MSC_EP>(
-            Driver::new(p.USB, Irqs, p.PA12, p.PA11),
-            &cfg,
-        );
-    spawner.spawn(usb_task(usb).expect("usb_task spawns once"));
-
-    // VCOM: USART2 (TX=PA2, RX=PA3), both legs on DMA -- the seam never reads the data register.
-    static RX_RING: ConstStaticCell<[u8; VCOM_RX_RING]> = ConstStaticCell::new([0; VCOM_RX_RING]);
-    let uart = DmaVcom::new_usart2(
-        p.USART2,
-        p.PA2,
-        p.PA3,
-        p.DMA1_CH7,
-        p.DMA1_CH6,
-        Irqs,
-        RX_RING.take(),
-    );
-    spawner.spawn(
-        vcom_task(cdc_tx, cdc_rx, control, uart, DEFAULT_VCOM_BAUD).expect("vcom_task spawns once"),
+    let connect = p.PB15;
+    let class = start_usb(
+        spawner,
+        UsbParts {
+            usb: p.USB,
+            dp: p.PA12,
+            dm: p.PA11,
+            usart: p.USART2,
+            tx: p.PA2,
+            rx: p.PA3,
+            tx_dma: p.DMA1_CH7,
+            rx_dma: p.DMA1_CH6,
+            connect,
+        },
+        &cfg,
+        #[cfg(feature = "flash")]
+        vfs,
     );
 
-    // The device exists and `usb.run()` is scheduled, so present the D+ pull-up.
-    usb_connect.attach();
-    // Presented, so the mass-storage task takes the switch and bounces it once per remount.
-    #[cfg(feature = "flash")]
-    spawner.spawn(msc_task(msc, vfs, usb_connect).expect("msc_task spawns once"));
+    (engine, class)
+}
 
-    // Composition finished, so this boot is not a reset loop: forgive the fault streak.
-    #[cfg(feature = "flash")]
-    daplink_vfs::stamp::clear_fault_streak();
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let (engine, class) = setup(spawner);
+    static DAP_PIPELINE: ConstStaticCell<Pipeline> = ConstStaticCell::new(Pipeline::new());
+    let pipeline = DAP_PIPELINE.take();
 
-    // Caller-owned queue storage; `DAP_PACKET_COUNT` above names the same depth.
-    static DAP_QUEUE: ConstStaticCell<RefCell<Queue>> =
-        ConstStaticCell::new(RefCell::new(Queue::new()));
-    let queue = DAP_QUEUE.take();
-
-    dap_loop_pipelined(&mut class, &mut engine, queue).await
+    dap_loop_pipelined(class, engine, pipeline).await
 }

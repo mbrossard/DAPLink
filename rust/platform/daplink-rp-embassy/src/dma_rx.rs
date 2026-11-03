@@ -1,6 +1,7 @@
 //! VCOM receive over UART1 RX via DMA, as a [`DmaRxChannel`] the shared ring cursor reads.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 
 use daplink_rp_dma_uart::seq::DmaChannel;
 use daplink_rs::DmaRxChannel;
@@ -10,10 +11,11 @@ use embassy_rp::pac::dma::vals::{DataSize, TreqSel};
 use embassy_rp::Peri;
 use static_cell::ConstStaticCell;
 
-/// Receive ring entries: 2048 halfwords (4 KiB), sized against the poll gap rather than the FIFO.
+/// Receive ring entries; halfword width preserves the PL011 error flags.
 pub const RX_RING_LEN: usize = 2048;
-const RING_SIZE_LOG2: u8 = 12;
-const _: () = assert!(RX_RING_LEN * 2 == 1 << RING_SIZE_LOG2);
+const _: () = assert!((RX_RING_LEN * 2).is_power_of_two());
+/// `ring_size` field: log2 of the wrap width in bytes, derived so it cannot drift from the ring.
+const RING_SIZE_LOG2: u8 = (RX_RING_LEN * 2).trailing_zeros() as u8;
 
 /// Channel claimed for the receive ring; the handler is a free function and reads it from here.
 static RX_CHAN_NUM: AtomicU32 = AtomicU32::new(0);
@@ -34,7 +36,17 @@ static CHAIN_SINK: AtomicU32 = AtomicU32::new(0);
 
 /// The receive ring's memory, aligned so the controller's write-address wrap lands inside it.
 #[repr(C, align(4096))]
-struct RxRing([u16; RX_RING_LEN]);
+pub(crate) struct RxRing(UnsafeCell<[u16; RX_RING_LEN]>);
+
+impl RxRing {
+    pub(crate) fn read(&self, index: usize) -> u16 {
+        assert!(index < RX_RING_LEN);
+        // SAFETY: static initialized storage; no references to DMA-written entries are formed.
+        unsafe { self.0.get().cast::<u16>().add(index).read_volatile() }
+    }
+}
+// The DMA wrap region must fit inside one aligned allocation.
+const _: () = assert!(core::mem::align_of::<RxRing>() >= RX_RING_LEN * 2);
 
 /// The channels driving VCOM receive: the ring channel, plus RP2040's bounce channel.
 #[derive(Clone, Copy)]
@@ -49,15 +61,16 @@ pub struct DmaVcomRx {
 
 impl DmaVcomRx {
     fn chan(&self) -> DmaChannel {
-        DmaChannel::new(self.ch)
+        // SAFETY: the constructor consumed this channel; copies coordinate within this module.
+        unsafe { DmaChannel::new(self.ch) }
     }
 
     fn regs(&self) -> pac::dma::Channel {
-        self.chan().regs()
+        // SAFETY: only this module configures the claimed receive channel.
+        unsafe { self.chan().regs() }
     }
 
-    /// Arm the bounce channel through the non-triggering alias: a channel cannot chain to itself
-    /// (RP2040 datasheet section 2.5.2.2), so its one transfer exists only to chain back.
+    /// Arm the bounce channel through the non-triggering alias; a channel cannot chain to itself.
     #[cfg(feature = "rp2040")]
     fn arm_chain_b(&self) {
         let b = pac::DMA.ch(self.chain);
@@ -74,27 +87,33 @@ impl DmaVcomRx {
     }
 
     /// Arm the ring channel, and RP2040's bounce partner, to fill the ring forever; epoch zeroed.
-    pub(crate) fn start(&self) {
-        // The channel is stopped, so characters received at the old rate drain here, not into
-        // the new session's ring.
+    /// What the PL011 receive FIFO holds first goes to `keep`, as `UARTDR` entries.
+    pub(crate) fn start(&self, mut keep: impl FnMut(u16)) {
+        // Popped while the channel is stopped, so the DMA and the CPU never share the FIFO.
         while !pac::UART1.uartfr().read().rxfe() {
-            let _ = pac::UART1.uartdr().read();
+            keep(pac::UART1.uartdr().read().0 as u16);
         }
         #[cfg(feature = "rp2040")]
         self.arm_chain_b();
         let ch = self.regs();
-        self.chan().set_addrs(self.src, self.base);
+        // SAFETY: stopped claimed channel, UART1 source and static aligned halfword ring.
+        unsafe { self.chan().set_addrs(self.src, self.base) };
         // Exactly one ring, so the reload is invisible; `TRIGGER_SELF` re-arms it.
         #[cfg(feature = "rp2350")]
-        self.chan().set_count_retriggering(RX_RING_LEN as u32);
+        unsafe {
+            self.chan().set_count_retriggering(RX_RING_LEN as u32)
+        };
         // Exactly one ring, so the reload is invisible; the bounce channel re-arms it.
         #[cfg(feature = "rp2040")]
-        self.chan().set_count(RX_RING_LEN as u32);
+        unsafe {
+            self.chan().set_count(RX_RING_LEN as u32)
+        };
         cortex_m::interrupt::free(|_| {
             pac::DMA.ints(IRQ_LINE).write_value(1 << self.ch);
             RX_EPOCH.store(0, Ordering::Relaxed);
         });
         pac::DMA.inte(IRQ_LINE).modify(|v| *v |= 1 << self.ch);
+        compiler_fence(Ordering::SeqCst);
         ch.ctrl_trig().write(|w| {
             w.set_en(true);
             // Halfwords, so the PL011's per-character flags travel with their byte.
@@ -111,6 +130,7 @@ impl DmaVcomRx {
             // Every reload raises the completion the epoch counts.
             w.set_irq_quiet(false);
         });
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// Entries the controller has written since [`start`](Self::start), free-running and wrapping.
@@ -132,14 +152,33 @@ impl DmaVcomRx {
         }
     }
 
-    /// Stop the transfer; disarm completion first, as an abort can raise one (RP2040-E13,
-    /// RP2350-E5), and a busy channel must not be reconfigured.
+    /// Stop filling the ring with its counter intact; only [`halt`](Self::halt) then restarts it.
+    pub(crate) fn pause(&self) {
+        // SAFETY: clearing EN only pauses the claimed channel; nothing re-enables it but `start`.
+        unsafe { self.chan().disable() };
+    }
+
+    /// Stop both channels; abort timeout permanently halts without releasing or rebasing the ring.
     pub(crate) fn halt(&self) {
-        pac::DMA.inte(IRQ_LINE).modify(|v| *v &= !(1 << self.ch));
-        #[cfg(feature = "rp2040")]
-        DmaChannel::new(self.chain).abort();
-        self.chan().abort();
-        pac::DMA.ints(IRQ_LINE).write_value(1 << self.ch);
+        cortex_m::interrupt::free(|_| {
+            pac::DMA.inte(IRQ_LINE).modify(|v| *v &= !(1 << self.ch));
+            // SAFETY: disable both partners before either abort so chaining cannot restart one.
+            unsafe {
+                self.chan().disable();
+                #[cfg(feature = "rp2040")]
+                {
+                    let chain = DmaChannel::new(self.chain);
+                    chain.disable();
+                    if !chain.abort() {
+                        crate::dma_tx::abort_failed();
+                    }
+                }
+                if !self.chan().abort() {
+                    crate::dma_tx::abort_failed();
+                }
+            }
+            pac::DMA.ints(IRQ_LINE).write_value(1 << self.ch);
+        });
     }
 }
 
@@ -162,7 +201,7 @@ impl DmaRxChannel for DmaVcomRx {
 
     fn reload(&mut self, _len: usize) {
         self.halt();
-        self.start();
+        self.start(|_| {});
     }
 
     fn running(&self) -> bool {
@@ -171,21 +210,25 @@ impl DmaRxChannel for DmaVcomRx {
 }
 
 /// Claim the receive channels and ring memory, and start filling from `uart_dr`. Call once.
-pub fn new<R: ChannelInstance, C: ChannelInstance>(
+///
+/// # Safety
+/// The caller owns UART1; `uart_dr` must identify its UARTDR and the channels must be idle.
+pub(crate) unsafe fn new<R: ChannelInstance, C: ChannelInstance>(
     uart_dr: u32,
     _rx: Peri<'static, R>,
     _chain: Peri<'static, C>,
-) -> (DmaVcomRx, &'static [u16]) {
+) -> (DmaVcomRx, &'static RxRing) {
     RX_CHAN_NUM.store(R::number() as u32, Ordering::Relaxed);
-    static RING: ConstStaticCell<RxRing> = ConstStaticCell::new(RxRing([0; RX_RING_LEN]));
+    static RING: ConstStaticCell<RxRing> =
+        ConstStaticCell::new(RxRing(UnsafeCell::new([0; RX_RING_LEN])));
     #[cfg(feature = "rp2040")]
     {
         static SINK: ConstStaticCell<u32> = ConstStaticCell::new(0);
         CHAIN_SINK.store(SINK.take() as *mut u32 as u32, Ordering::Relaxed);
     }
     let ring = RING.take();
-    let base = ring.0.as_ptr() as u32;
-    let mem: &'static [u16] = &ring.0;
+    let base = ring.0.get() as u32;
+    let mem: &'static RxRing = ring;
     let chan = DmaVcomRx {
         ch: R::number() as usize,
         #[cfg(feature = "rp2040")]
@@ -193,6 +236,6 @@ pub fn new<R: ChannelInstance, C: ChannelInstance>(
         base,
         src: uart_dr,
     };
-    chan.start();
+    chan.start(|_| {});
     (chan, mem)
 }

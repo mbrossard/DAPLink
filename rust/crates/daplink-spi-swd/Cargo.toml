@@ -5,10 +5,16 @@ edition = "2021"
 license = "Apache-2.0"
 description = "SPI-session SWD transport (plus GPIO JTAG) over a chip-supplied register seam"
 
-# Own workspace: resolves independently of any root. Host tests run with `cargo test` here.
 [workspace]
 
 [dependencies]
 # The CMSIS-DAP engine seams this crate implements (`swd::Swd`, `swj::Dependencies`,
 # `jtag::Jtag`) plus the pin/delay traits it is generic over; same revision as the tree.
 dap-rs = { git = "https://github.com/probe-rs/dap-rs.git", rev = "a867ca7b41547b24aaad52b913528575685a5df5" }
+daplink-core = { path = "../daplink-core" }
+
+[dev-dependencies]
+# dap-rs as the reference for the engine, both against one simulated target.
+dap-differential = { package = "dap-conformance", path = "../dap-conformance", features = ["differential"] }
+# The probe facade the firmwares put in front of the engine.
+daplink-rs = { path = "../daplink-rs" }

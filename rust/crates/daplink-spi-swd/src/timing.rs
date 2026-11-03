@@ -1,6 +1,6 @@
 //! Prepared GPIO timing plans for SWD and JTAG transfer kernels.
 
-use crate::proto::half_period_cycles;
+use crate::session::half_period_cycles;
 use core::num::NonZeroU32;
 
 /// Low- and high-half residual cycle counts.
@@ -58,6 +58,29 @@ impl PacingProfile {
             fast_half_cycles,
             scaled,
         }
+    }
+}
+
+/// Fast-path request-frequency threshold and scaled half-cycle preparation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FrequencyPacing {
+    fast_min_hz: u32,
+    scaled: HalfCycleProfile,
+}
+
+impl FrequencyPacing {
+    /// Select fast pacing for requests at or above `fast_min_hz`; zero keeps scaled pacing.
+    pub const fn new(fast_min_hz: u32, scaled: HalfCycleProfile) -> Self {
+        Self {
+            fast_min_hz,
+            scaled,
+        }
+    }
+
+    /// The half-cycle profile that selects the same pacing for `request_hz`.
+    pub const fn at(self, request_hz: u32) -> PacingProfile {
+        let fast = self.fast_min_hz != 0 && request_hz >= self.fast_min_hz;
+        PacingProfile::new(if fast { u32::MAX } else { 0 }, self.scaled)
     }
 }
 
@@ -329,6 +352,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.read(), PacingPlan::Scaled(HalfCycles::new(1, 7)));
+    }
+
+    fn assert_jtag_handoff(cpu_hz: u32, fast_min_hz: u32) {
+        let pacing = FrequencyPacing::new(fast_min_hz, HalfCycleProfile::new(0, 0, 6, 6));
+        let plan = |hz: u32| {
+            let p = pacing.at(hz);
+            prepare_jtag_timing(cpu_hz, hz, 7, NONE, p, p, p).unwrap()
+        };
+        let below = plan(fast_min_hz - 1);
+        assert!(matches!(below.read(), PacingPlan::Scaled(_)));
+        assert!(matches!(below.write(), PacingPlan::Scaled(_)));
+        assert!(matches!(below.ir(), PacingPlan::Scaled(_)));
+
+        let boundary = plan(fast_min_hz);
+        let above = plan(u32::MAX);
+        assert_eq!(boundary.read(), PacingPlan::Fast);
+        assert_eq!(boundary.write(), PacingPlan::Fast);
+        assert_eq!(boundary.ir(), PacingPlan::Fast);
+        assert_eq!(above.read(), boundary.read());
+        assert_eq!(boundary.sequence_half_cycles(), 7);
+        assert_eq!(above.sequence_half_cycles(), 7);
+    }
+
+    #[test]
+    fn mculink_150mhz_jtag_hands_off_at_its_frequency_threshold() {
+        assert_jtag_handoff(150_000_000, 14_285_715);
+    }
+
+    #[test]
+    fn mculink_96mhz_jtag_hands_off_at_its_frequency_threshold() {
+        assert_jtag_handoff(96_000_000, 12_500_000);
+    }
+
+    #[test]
+    fn a_zero_frequency_threshold_keeps_scaled_pacing() {
+        let p = FrequencyPacing::new(0, NONE).at(u32::MAX);
+        let plan = prepare_jtag_timing(150_000_000, u32::MAX, 0, NONE, p, p, p).unwrap();
+        assert_eq!(plan.read(), PacingPlan::Scaled(HalfCycles::symmetric(1)));
+        assert_eq!(plan.write(), PacingPlan::Scaled(HalfCycles::symmetric(1)));
+        assert_eq!(plan.ir(), PacingPlan::Scaled(HalfCycles::symmetric(1)));
     }
 
     #[test]

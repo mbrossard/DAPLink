@@ -15,6 +15,19 @@ pub struct PioSwdPins {
     pub nreset: Option<u8>,
 }
 
+/// The four JTAG signals, by GPIO number; TCK and TMS must form one side-set range.
+#[derive(Copy, Clone)]
+pub struct PioJtagPins {
+    /// Test clock, the least-significant side-set pin.
+    pub tck: u8,
+    /// Test-mode select, immediately above TCK in the side-set range.
+    pub tms: u8,
+    /// Test data input, the one-bit `OUT` range.
+    pub tdi: u8,
+    /// Test data output, the one-bit `IN` range.
+    pub tdo: u8,
+}
+
 impl PioSwdPins {
     /// The readback pad: the separate one where the wiring splits, else the driven pad itself.
     pub const fn readback(&self) -> u8 {
@@ -74,6 +87,67 @@ impl PioSwdPins {
     }
 }
 
+impl PioJtagPins {
+    /// Whether the JTAG pads are distinct, in range, and share the SWJ pads as TCK/TMS.
+    pub const fn valid_with(&self, swd: &PioSwdPins) -> bool {
+        self.valid_with_gpio_count(swd, 32)
+    }
+
+    /// Check a combined SWJ mapping against the selected RP family's GPIO count.
+    pub(crate) const fn valid_with_gpio_count(&self, swd: &PioSwdPins, gpio_count: u8) -> bool {
+        self.valid_for_gpio_count(gpio_count)
+            && self.tck == swd.swclk
+            && self.tms == swd.swdio_out
+            && swd.swdio_in.is_none()
+            && swd.oen.is_none()
+            && match swd.nreset {
+                Some(pin) => pin < gpio_count && pin != self.tdi && pin != self.tdo,
+                None => true,
+            }
+    }
+
+    /// Check the independent JTAG pin ranges against a GPIO count.
+    pub(crate) const fn valid_for_gpio_count(&self, gpio_count: u8) -> bool {
+        gpio_count >= 2
+            && gpio_count <= 32
+            && self.tck < gpio_count - 1
+            && self.tms == self.tck + 1
+            && self.tdi < gpio_count
+            && self.tdo < gpio_count
+            && self.tdi != self.tck
+            && self.tdi != self.tms
+            && self.tdo != self.tck
+            && self.tdo != self.tms
+            && self.tdo != self.tdi
+    }
+}
+
+/// The JTAG state machine's independent pin ranges.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct JtagPinMap {
+    /// `OUT` base for TDI.
+    pub out_base: u8,
+    /// `IN` base for TDO.
+    pub in_base: u8,
+    /// Side-set base for contiguous `{TCK, TMS}`.
+    pub sideset_base: u8,
+    /// Two data bits plus the optional-side-set enable bit.
+    pub sideset_count: u8,
+}
+
+impl JtagPinMap {
+    /// Derive the JTAG mapping after checking it against the shared SWJ wiring.
+    pub const fn new(swd: &PioSwdPins, jtag: &PioJtagPins) -> Self {
+        assert!(jtag.valid_with(swd));
+        Self {
+            out_base: jtag.tdi,
+            in_base: jtag.tdo,
+            sideset_base: jtag.tck,
+            sideset_count: 3,
+        }
+    }
+}
+
 /// The state machine's pin mapping; only the bases vary, and `sideset_count` includes `opt`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PinMap {
@@ -112,7 +186,6 @@ mod tests {
     use super::*;
     use crate::program::{select_program, Variant, DIRECT};
 
-    /// The Pico wiring: one bidirectional pad, no shifter.
     const PICO: PioSwdPins = PioSwdPins {
         swclk: 2,
         swdio_out: 3,
@@ -121,7 +194,6 @@ mod tests {
         nreset: Some(1),
     };
 
-    /// The Debug Probe wiring: SWCLK GP12, SWDIO driven on GP14, read back on GP13, no OE pad.
     const DEBUGPROBE: PioSwdPins = PioSwdPins {
         swclk: 12,
         swdio_out: 14,
@@ -166,12 +238,18 @@ mod tests {
 
     #[test]
     fn split_wiring_runs_the_direct_program() {
-        // Splitting readback is a mapping fact, not an instruction one: no OE pad, no OEN program.
         assert_eq!(
-            select_program(DEBUGPROBE.oen.is_some()).variant,
+            select_program(DEBUGPROBE.oen.is_some(), 125_000_000)
+                .unwrap()
+                .variant,
             Variant::Direct
         );
-        assert_eq!(select_program(PICO.oen.is_some()).variant, Variant::Direct);
+        assert_eq!(
+            select_program(PICO.oen.is_some(), 125_000_000)
+                .unwrap()
+                .variant,
+            Variant::Direct
+        );
     }
 
     #[test]
@@ -183,7 +261,7 @@ mod tests {
             oen: Some(2),
             nreset: None,
         };
-        let prog = select_program(true);
+        let prog = select_program(true, 125_000_000).unwrap();
         assert_eq!(prog.variant, Variant::Oen);
         assert_eq!(
             PinMap::new(&shifted, prog.side_set_bits),
@@ -224,6 +302,70 @@ mod tests {
             ..valid_oen
         };
         assert!(!overflowing_oen.valid_side_set_layout(2));
+    }
+
+    #[test]
+    fn pico_jtag_uses_independent_out_in_and_side_set_ranges() {
+        let jtag = PioJtagPins {
+            tck: 2,
+            tms: 3,
+            tdi: 6,
+            tdo: 7,
+        };
+        assert!(jtag.valid_with(&PICO));
+        assert_eq!(
+            JtagPinMap::new(&PICO, &jtag),
+            JtagPinMap {
+                out_base: 6,
+                in_base: 7,
+                sideset_base: 2,
+                sideset_count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn combined_jtag_rejects_rp235x_only_pads_for_rp2040() {
+        let rp235x_only = PioJtagPins {
+            tck: PICO.swclk,
+            tms: PICO.swdio_out,
+            tdi: 30,
+            tdo: 31,
+        };
+        assert!(rp235x_only.valid_with_gpio_count(&PICO, 32));
+        assert!(!rp235x_only.valid_with_gpio_count(&PICO, 30));
+
+        let rp235x_reset = PioSwdPins {
+            nreset: Some(30),
+            ..PICO
+        };
+        let ordinary_jtag = PioJtagPins {
+            tck: PICO.swclk,
+            tms: PICO.swdio_out,
+            tdi: 6,
+            tdo: 7,
+        };
+        assert!(ordinary_jtag.valid_with_gpio_count(&rp235x_reset, 32));
+        assert!(!ordinary_jtag.valid_with_gpio_count(&rp235x_reset, 30));
+    }
+
+    #[test]
+    fn jtag_layout_rejects_noncontiguous_or_aliased_pads() {
+        let valid = PioJtagPins {
+            tck: 2,
+            tms: 3,
+            tdi: 6,
+            tdo: 7,
+        };
+        for invalid in [
+            PioJtagPins { tms: 4, ..valid },
+            PioJtagPins { tdi: 3, ..valid },
+            PioJtagPins { tdo: 6, ..valid },
+            PioJtagPins { tdi: 32, ..valid },
+        ] {
+            assert!(!invalid.valid_with(&PICO));
+        }
+        assert!(!valid.valid_with(&DEBUGPROBE));
     }
 
     #[test]

@@ -39,7 +39,6 @@ impl Prng {
         self.pos
     }
 
-    /// The next byte of the stream.
     pub fn next_byte(&mut self) -> u8 {
         // `state` holds the word covering the current position; a new one is drawn every 4 bytes.
         let phase = self.pos & 3;
@@ -50,7 +49,6 @@ impl Prng {
         (self.state >> (8 * phase)) as u8
     }
 
-    /// Fill `buf` with the next bytes of the stream.
     pub fn fill(&mut self, buf: &mut [u8]) {
         for slot in buf {
             *slot = self.next_byte();
@@ -96,8 +94,6 @@ impl Iterator for Prng {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- generator vectors, pinned: host and DUT streams must agree byte for byte ---
 
     const SEED_1_HEAD: [u8; 16] = [
         0x21, 0x20, 0x04, 0x00, 0x01, 0x06, 0x08, 0x04, 0xC5, 0xA8, 0xCC, 0x9D, 0x4F, 0x99, 0x55,

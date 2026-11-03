@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use dap_conformance::cmsis_dap::{self, Context, Counting, Finding, Link, Status};
+
 /// `DAP_Info`: query probe capabilities and identity strings.
 pub const DAP_INFO: u8 = 0x00;
 /// `DAP_Connect`: select the wire protocol (SWD or JTAG) and connect.
@@ -16,8 +18,7 @@ pub const DAP_TRANSFER_BLOCK: u8 = 0x06;
 pub const DAP_WRITE_ABORT: u8 = 0x08;
 /// `DAP_SWJ_Clock`: set the SWJ (SWD/JTAG) clock frequency.
 pub const DAP_SWJ_CLOCK: u8 = 0x11;
-/// `DAP_SWJ_Sequence`: shift an arbitrary bit sequence out on SWDIO/TMS (line reset, SWD/JTAG
-/// select, idle cycles, TAP reset).
+/// `DAP_SWJ_Sequence`: shift an arbitrary bit sequence out on SWDIO/TMS.
 pub const DAP_SWJ_SEQUENCE: u8 = 0x12;
 /// `DAP_JTAG_Configure`: describe the JTAG scan chain (per-TAP IR lengths).
 pub const DAP_JTAG_CONFIGURE: u8 = 0x15;
@@ -41,6 +42,8 @@ pub enum DecodeError {
     },
     /// A status/ack byte carried a value outside the set the layout defines.
     InvalidStatus(u8),
+    /// The reply does not fit the layout its request gives it.
+    Layout(Finding),
 }
 
 impl fmt::Display for DecodeError {
@@ -54,11 +57,49 @@ impl fmt::Display for DecodeError {
                 )
             }
             DecodeError::InvalidStatus(v) => write!(f, "invalid status byte 0x{v:02X}"),
+            DecodeError::Layout(finding) => {
+                write!(f, "reply does not fit its request: {finding:?}")
+            }
         }
     }
 }
 
 impl std::error::Error for DecodeError {}
+
+/// How a probe may count a failed transfer: as Arm's firmware on either link, or as dap-rs.
+const COUNTINGS: [Context; 4] = [
+    Context {
+        link: Link::Swd,
+        transfer: Counting::Arm,
+        block: Counting::Arm,
+    },
+    Context {
+        link: Link::Jtag,
+        transfer: Counting::Arm,
+        block: Counting::Arm,
+    },
+    Context {
+        link: Link::Swd,
+        transfer: Counting::DapRs,
+        block: Counting::Arm,
+    },
+    Context {
+        link: Link::Swd,
+        transfer: Counting::DapRs,
+        block: Counting::DapRs,
+    },
+];
+
+/// Check `resp` against its `request`, a failure counted as Arm's firmware or dap-rs counts it.
+pub fn check_reply(request: &[u8], resp: &[u8]) -> Result<(), DecodeError> {
+    let findings = |c| cmsis_dap::exchange(request, resp, c).findings;
+    match findings(COUNTINGS[0]).first() {
+        Some(&f) if COUNTINGS[1..].iter().all(|&c| !findings(c).is_empty()) => {
+            Err(DecodeError::Layout(f))
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Check `resp` against `command` and `min_len`, returning the bytes after the command id.
 fn expect_command(resp: &[u8], command: u8, min_len: usize) -> Result<&[u8], DecodeError> {
@@ -75,8 +116,6 @@ fn expect_command(resp: &[u8], command: u8, min_len: usize) -> Result<&[u8], Dec
     Ok(rest)
 }
 
-// --- DAP_Info ----------------------------------------------------------------------------------
-
 /// `DAP_Info` info-id selector (the second request byte).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -89,6 +128,8 @@ pub enum InfoId {
     SerialNumber = 0x03,
     /// Firmware version string.
     FirmwareVersion = 0x04,
+    /// The product firmware version, which a daplink-rs image uses for its firmware row.
+    FirmwareRow = firmware_row::DAP_INFO_ID,
     /// Maximum number of packets the probe can queue at once (1 byte), i.e. `DAP_PACKET_COUNT`.
     PacketCount = 0xFE,
     /// Maximum packet size in bytes (2 bytes LE), i.e. `DAP_PACKET_SIZE`.
@@ -133,8 +174,6 @@ pub fn decode_info_packet_size(resp: &[u8]) -> Result<u16, DecodeError> {
     Ok(u16::from_le_bytes(bytes))
 }
 
-// --- DAP_Connect -------------------------------------------------------------------------------
-
 /// The wire protocol requested by `DAP_Connect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -161,8 +200,6 @@ pub fn decode_connect(resp: &[u8]) -> Result<Option<Port>, DecodeError> {
     }
 }
 
-// --- DAP_TransferConfigure ---------------------------------------------------------------------
-
 /// `DAP_TransferConfigure` parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferConfigureRequest {
@@ -174,8 +211,7 @@ pub struct TransferConfigureRequest {
     pub match_retry: u16,
 }
 
-/// Encodes a `DAP_TransferConfigure` request:
-/// `[0x04, idle_cycles, wait_retry(2 LE), match_retry(2 LE)]`.
+/// Encodes `[0x04, idle_cycles, wait_retry(2 LE), match_retry(2 LE)]`.
 pub fn encode_transfer_configure(cfg: TransferConfigureRequest) -> Vec<u8> {
     let mut buf = Vec::with_capacity(6);
     buf.push(DAP_TRANSFER_CONFIGURE);
@@ -194,8 +230,6 @@ pub fn decode_transfer_configure(resp: &[u8]) -> Result<(), DecodeError> {
         Err(DecodeError::InvalidStatus(rest[0]))
     }
 }
-
-// --- DAP_Transfer / DAP_TransferBlock request-byte and ack modeling ----------------------------
 
 const TRANSFER_APNDP: u8 = 1 << 0;
 const TRANSFER_RNW: u8 = 1 << 1;
@@ -244,7 +278,7 @@ pub enum Ack {
     Fault,
     /// No response on the wire at all.
     NoAck,
-    /// An ack value the spec does not define.
+    /// Bits `[2:0]` outside the four, or the whole byte when it carries no ACK.
     Unknown(u8),
 }
 
@@ -260,8 +294,7 @@ impl Ack {
     }
 }
 
-/// A `DAP_Transfer`/`DAP_TransferBlock` status byte: the ACK phase plus the protocol-error and
-/// value-mismatch flags.
+/// A transfer status byte, read as [`Status`] decodes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferStatus {
     bits: u8,
@@ -273,24 +306,59 @@ impl TransferStatus {
         TransferStatus { bits }
     }
 
-    /// The SWD ACK phase (bits `[2:0]`).
+    /// The byte decoded whole.
+    pub fn status(self) -> Status {
+        Status::transfer(self.bits)
+    }
+
+    /// The ACK; [`Ack::Unknown`] with the whole byte on a protocol error or a malformed byte.
     pub fn ack(self) -> Ack {
-        Ack::from_bits(self.bits & 0b111)
+        match self.status().ack() {
+            Some(ack) => Ack::from_bits(ack.bits()),
+            None => Ack::Unknown(self.bits),
+        }
     }
 
-    /// Bit 3: a protocol error (parity error on the data phase) occurred.
-    pub const fn protocol_error(self) -> bool {
-        self.bits & (1 << 3) != 0
+    /// Bit 3, a protocol error: a read parity error, an invalid ACK or an engine fault.
+    pub fn protocol_error(self) -> bool {
+        matches!(self.status(), Status::ProtocolError { .. })
     }
 
-    /// True when the ACK phase was `OK` and no error flag is set.
+    /// `OK` with no value mismatch.
     pub fn is_ok(self) -> bool {
-        matches!(self.ack(), Ack::Ok) && !self.protocol_error()
+        self.status().is_ok()
     }
 }
 
-/// One transfer to append to a `DAP_Transfer` request: the request byte, plus the data word for
-/// a write (`None` for a plain read).
+/// Raw byte first, so a protocol error is never read as the ACK field it sets.
+impl fmt::Display for TransferStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "status 0x{:02X}", self.bits)?;
+        let mismatch = match self.status() {
+            Status::ProtocolError {
+                raw_ack_bits,
+                mismatch,
+            } => {
+                write!(f, " (protocol error, ACK bits 0b{raw_ack_bits:03b}")?;
+                mismatch
+            }
+            Status::Ack { mismatch, .. } => {
+                write!(f, " (ACK {:?}", self.ack())?;
+                mismatch
+            }
+            Status::Malformed(_) => {
+                f.write_str(" (malformed")?;
+                false
+            }
+        };
+        if mismatch {
+            f.write_str(", value mismatch")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// One `DAP_Transfer` item: the request byte, plus the data word for a write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferItem {
     /// The packed request byte.
@@ -299,8 +367,7 @@ pub struct TransferItem {
     pub data: Option<u32>,
 }
 
-/// Encodes a `DAP_Transfer` request:
-/// `[0x05, dap_index, transfer_count, (request_byte, [data(4 LE)])...]`.
+/// Encodes `[0x05, dap_index, transfer_count, (request_byte, [data(4 LE)])...]`.
 pub fn encode_transfer(dap_index: u8, items: &[TransferItem]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(3 + items.len() * 5);
     buf.push(DAP_TRANSFER);
@@ -346,8 +413,7 @@ pub fn decode_transfer(resp: &[u8]) -> Result<TransferResponse, DecodeError> {
     })
 }
 
-/// Encodes a `DAP_TransferBlock` request: `[0x06, dap_index, transfer_count(2 LE),
-/// request_byte, write_data(4*N LE)...]`, `write_data` empty for a block read.
+/// Encodes `[0x06, dap_index, count(2 LE), request_byte, write_data(4*N LE)...]`.
 pub fn encode_transfer_block(
     dap_index: u8,
     transfer_count: u16,
@@ -376,8 +442,7 @@ pub struct TransferBlockResponse {
     pub read_data: Vec<u32>,
 }
 
-/// Decodes a `DAP_TransferBlock` response:
-/// `[0x06, transfer_count(2 LE), status, read_data(4*N LE)...]`.
+/// Decodes `[0x06, transfer_count(2 LE), status, read_data(4*N LE)...]`.
 pub fn decode_transfer_block(resp: &[u8]) -> Result<TransferBlockResponse, DecodeError> {
     let rest = expect_command(resp, DAP_TRANSFER_BLOCK, 4)?;
     let transfer_count = u16::from_le_bytes(rest[0..2].try_into().unwrap());
@@ -396,8 +461,6 @@ pub fn decode_transfer_block(resp: &[u8]) -> Result<TransferBlockResponse, Decod
         read_data,
     })
 }
-
-// --- DAP_WriteABORT ----------------------------------------------------------------------------
 
 /// Encodes a `DAP_WriteABORT` request: `[0x08, dap_index, abort_word(4 LE)]`.
 pub fn encode_write_abort(dap_index: u8, abort_word: u32) -> Vec<u8> {
@@ -418,8 +481,6 @@ pub fn decode_write_abort(resp: &[u8]) -> Result<(), DecodeError> {
     }
 }
 
-// --- DAP_SWJ_Clock / DAP_SWJ_Sequence ----------------------------------------------------------
-
 /// Encodes a `DAP_SWJ_Clock` request: `[0x11, clock_hz(4 LE)]`.
 pub fn encode_swj_clock(clock_hz: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(5);
@@ -438,8 +499,7 @@ pub fn decode_swj_clock(resp: &[u8]) -> Result<(), DecodeError> {
     }
 }
 
-/// Encodes a `DAP_SWJ_Sequence` request: `[0x12, bit_count, data(ceil(bits/8))...]`.
-/// `bit_count == 0` means 256 bits per spec; `data.len()` must match.
+/// Encodes `[0x12, bit_count, data...]`; `bit_count == 0` means 256 bits.
 pub fn encode_swj_sequence(bit_count: u8, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(2 + data.len());
     buf.push(DAP_SWJ_SEQUENCE);
@@ -458,10 +518,7 @@ pub fn decode_swj_sequence(resp: &[u8]) -> Result<(), DecodeError> {
     }
 }
 
-// --- DAP_JTAG_Configure ------------------------------------------------------------------------
-
-/// Encodes a `DAP_JTAG_Configure` request: `[0x15, count, ir_length...]`, one IR bit length per
-/// TAP with index 0 closest to TDO -- the index space every later command selects TAPs in.
+/// Encodes `[0x15, count, ir_length...]`, TAP index 0 closest to TDO.
 pub fn encode_jtag_configure(ir_lengths: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(2 + ir_lengths.len());
     buf.push(DAP_JTAG_CONFIGURE);
@@ -499,18 +556,31 @@ pub fn decode_jtag_idcode(resp: &[u8]) -> Result<u32, DecodeError> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-// --- Per-packet transfer capacity --------------------------------------------------------------
-
-/// Max words that fit a `DAP_TransferBlock` read response in one `packet_size`-byte packet (4
-/// bytes of framing: command, transfer_count(2), status; 4 bytes per word).
+/// Max words in one `DAP_TransferBlock` read response of `packet_size` bytes.
 pub const fn transfer_block_read_capacity(packet_size: u16) -> usize {
     (packet_size as usize).saturating_sub(4) / 4
 }
 
-/// Max words that fit a `DAP_TransferBlock` write request in one `packet_size`-byte packet (5
-/// bytes of framing: command, dap_index, transfer_count(2), request_byte; 4 bytes per word).
+/// Max words in one `DAP_TransferBlock` write request of `packet_size` bytes.
 pub const fn transfer_block_write_capacity(packet_size: u16) -> usize {
     (packet_size as usize).saturating_sub(5) / 4
+}
+
+/// Max AP reads a mixed `DAP_Transfer` carries beside its TAR write, in one packet.
+pub const fn mixed_read_capacity(packet_size: u16) -> usize {
+    let ps = packet_size as usize;
+    let by_request = ps.saturating_sub(8);
+    let by_response = ps.saturating_sub(3) / 4;
+    if by_request < by_response {
+        by_request
+    } else {
+        by_response
+    }
+}
+
+/// Max AP writes a mixed `DAP_Transfer` carries beside its TAR write, in one packet.
+pub const fn mixed_write_capacity(packet_size: u16) -> usize {
+    (packet_size as usize).saturating_sub(8) / 5
 }
 
 #[cfg(test)]
@@ -679,6 +749,53 @@ mod tests {
     }
 
     #[test]
+    fn transfer_status_display_names_protocol_error() {
+        assert_eq!(
+            TransferStatus::from_byte(0x0F).to_string(),
+            "status 0x0F (protocol error, ACK bits 0b111)"
+        );
+        assert_eq!(
+            TransferStatus::from_byte(0x07).to_string(),
+            "status 0x07 (ACK NoAck)"
+        );
+        assert_eq!(
+            TransferStatus::from_byte(0x11).to_string(),
+            "status 0x11 (ACK Ok, value mismatch)"
+        );
+    }
+
+    #[test]
+    fn a_status_without_an_ack_reads_as_none_of_the_four() {
+        assert_eq!(TransferStatus::from_byte(0x0A).ack(), Ack::Unknown(0x0A));
+        assert!(!TransferStatus::from_byte(0x11).is_ok());
+        assert_eq!(
+            TransferStatus::from_byte(0x22).to_string(),
+            "status 0x22 (malformed)"
+        );
+    }
+
+    #[test]
+    fn a_reply_must_fit_its_request() {
+        let read = |address| TransferItem {
+            request: TransferRequest::new(false, true, address),
+            data: None,
+        };
+        let request = encode_transfer(0, &[read(0), read(1)]);
+        let ok = [0x05, 2, 0x01, 1, 0, 0, 0, 2, 0, 0, 0];
+        assert_eq!(check_reply(&request, &ok), Ok(()));
+        // A NO_ACK on the second read, counted as Arm's firmware and as dap-rs count it.
+        assert_eq!(check_reply(&request, &[0x05, 1, 0x07, 1, 0, 0, 0]), Ok(()));
+        assert_eq!(check_reply(&request, &[0x05, 2, 0x07, 1, 0, 0, 0]), Ok(()));
+        assert_eq!(
+            check_reply(&request, &ok[..7]),
+            Err(DecodeError::Layout(Finding::Truncated {
+                expected: 11,
+                got: 7
+            }))
+        );
+    }
+
+    #[test]
     fn encode_transfer_block_read_carries_no_write_data() {
         let req = TransferRequest::new(true, true, 0);
         let bytes = encode_transfer_block(0, 4, req, &[]);
@@ -744,7 +861,6 @@ mod tests {
 
     #[test]
     fn encode_swj_sequence_line_reset() {
-        // 50+ ones (JTAG-to-SWD line reset uses 56 SWDIO=1 clocks in the CMSIS-DAP examples).
         let data = [0xFFu8; 7]; // 56 bits
         let bytes = encode_swj_sequence(56, &data);
         let mut expected = vec![0x12, 56];
@@ -802,6 +918,15 @@ mod tests {
         assert_eq!(transfer_block_read_capacity(64), 15);
         assert_eq!(transfer_block_read_capacity(512), 127);
         assert_eq!(transfer_block_read_capacity(1024), 255);
+    }
+
+    #[test]
+    fn mixed_capacity_is_bounded_by_the_request_and_the_response() {
+        // 64-byte packets: reads are response-bound at fifteen, writes request-bound at eleven.
+        assert_eq!(mixed_read_capacity(64), 15);
+        assert_eq!(mixed_write_capacity(64), 11);
+        assert_eq!(mixed_read_capacity(512), 127);
+        assert_eq!(mixed_write_capacity(512), 100);
     }
 
     #[test]

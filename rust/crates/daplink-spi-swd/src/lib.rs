@@ -1,23 +1,25 @@
-//! SPI-session SWD transport plus direct-GPIO JTAG for SPI blocks whose frame geometry is
-//! write-protected while enabled: each SWD transfer phase runs as its own short session with its
-//! own width, count, and half-duplex direction. HAL-free; the chip's half arrives through the
-//! [`SpiPortOps`] and [`JtagPortOps`] register seams.
+//! SPI-session SWD plus GPIO JTAG, and the framing, pacing and scan toolkit other engines share.
 
 #![no_std]
 #![deny(missing_docs)]
 
 mod engine;
+pub mod pace;
 mod port;
-mod proto;
 mod scan;
 pub mod session;
 mod timing;
 
+#[cfg(test)]
+mod differential_tests;
+
 pub use engine::{SpiJtag, SpiSwd, SpiSwdDeps};
-pub use port::{nops, JtagPacing, JtagPortOps, NoFastJtag, SpiPortOps};
-pub use scan::JtagScan;
-pub use session::{choose_prescaler, ladder_rung, Dir, Prescaler, Session};
+pub use port::{nops, spin, JtagPacing, JtagPortOps, NoFastJtag, PortResult, SpiFault, SpiPortOps};
+pub use scan::{
+    scan_shift_ir_word, scan_transfer_word, FastScan, JtagScan, JtagScanState, KeptAck, ScaledScan,
+};
+pub use session::{choose_prescaler, ladder_rung, Dir, Prescaler, Session, SpiClock, SpiLadder};
 pub use timing::{
-    prepare_jtag_timing, prepare_swd_timing, HalfCycleProfile, HalfCycles, JtagTimingPlan,
-    PacingPlan, PacingProfile, SwdTimingPlan,
+    prepare_jtag_timing, prepare_swd_timing, FrequencyPacing, HalfCycleProfile, HalfCycles,
+    JtagTimingPlan, PacingPlan, PacingProfile, SwdTimingPlan,
 };

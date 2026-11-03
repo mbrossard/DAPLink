@@ -7,14 +7,12 @@ use embassy_stm32::Peri;
 
 use crate::{DynCycleDelay, IoPin};
 
-/// The wired SWD+JTAG bit-bang dependencies the DAP engine is assembled from.
 pub type ProbeDeps = LateJtagDeps<IoPin, DynCycleDelay>;
 
 /// The wired SWD-only dependencies, for builds that compose no JTAG.
 pub type SwdDeps = SwdOnlyDeps<IoPin, DynCycleDelay>;
 
-/// Wire the SWD+JTAG bit-bang dependencies from any five GPIOs; call once per image. nRESET
-/// drives open-drain: it shares a wired-AND net with the target's own reset supervisor.
+/// Wire the SWD+JTAG dependencies from five GPIOs, nRESET open-drain; call once per image.
 pub fn swd_jtag_deps(
     nreset: Peri<'static, impl Pin>,
     tdi: Peri<'static, impl Pin>,
@@ -35,7 +33,7 @@ pub fn swd_jtag_deps(
     )
 }
 
-/// Wire the SWD-only dependencies from three GPIOs, TDI/TDO as no-connects; call once per image.
+/// Wire the SWD-only dependencies, TDI/TDO as no-connects; call once per image.
 pub fn swd_only_deps(
     nreset: Peri<'static, impl Pin>,
     swdio: Peri<'static, impl Pin>,

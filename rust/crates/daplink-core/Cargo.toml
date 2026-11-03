@@ -5,7 +5,6 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Zero-dependency daplink-rs foundation"
 
-# Own workspace: resolves independently of any root. Host tests run with `cargo test` here.
 [workspace]
 
 [features]
@@ -13,3 +12,6 @@ description = "Zero-dependency daplink-rs foundation"
 bot-fixtures = []
 
 [dependencies]
+
+[dev-dependencies]
+dap-conformance = { path = "../dap-conformance" }

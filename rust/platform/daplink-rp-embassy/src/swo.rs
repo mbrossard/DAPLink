@@ -1,6 +1,7 @@
 //! DMA-backed PL011 UART-RX SWO capture for the Pico layout (UART0 RX on GP13).
 
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, RefCell, UnsafeCell};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use daplink_rp_dma_uart::seq::DmaChannel;
 use daplink_rs::{Activity, DmaRxChannel, DmaRxRing, RingSwo, SwoBackend, SwoSource};
@@ -12,7 +13,7 @@ use embassy_rp::pac::uart::Uart as UartRegs;
 use embassy_rp::Peri;
 use static_cell::ConstStaticCell;
 
-/// SWO capture ring size, sized against the host's poll interval rather than the FIFO.
+/// SWO capture ring capacity in bytes.
 const RING_LEN: usize = 8192;
 
 /// `log2(RING_LEN)`, the DMA write-address wrap width; the buffer is aligned to match.
@@ -21,9 +22,7 @@ const RING_SIZE_LOG2: u8 = 13;
 // One fact: a mismatch would wrap the controller somewhere other than the buffer.
 const _: () = assert!(RING_LEN == 1 << RING_SIZE_LOG2);
 
-/// `FUNCSEL` for a UART pin on RP2040 (function 2).
 const FUNCSEL_UART: u8 = 2;
-/// 8-bit word length code for `UARTLCR_H.WLEN`.
 const WLEN_8BIT: u8 = 3;
 /// Placeholder divisor baud; the host reprograms the real rate via `DAP_SWO_Baudrate`.
 const INIT_BAUD: u32 = 115_200;
@@ -34,28 +33,26 @@ const RP2040_COUNT: u32 = u32::MAX;
 /// The Pico SWO slot: the raw UART0-RX mechanism paired with its DMA ring.
 pub type Uart0Swo = RingSwo<UartSwoHw, DmaSwoRx>;
 
-/// The one DMA channel that fills the capture ring. `Copy`, because the mechanism half arms it
-/// and the source half reads its counter.
+/// The one DMA channel filling the capture ring; `Copy` so the mechanism and the source both hold it.
 #[derive(Clone, Copy)]
 pub struct DmaCapture {
     ch: usize,
     /// Ring buffer base address, aligned to [`RING_LEN`].
     base: u32,
-    /// The UART data register the channel reads.
     src: u32,
 }
 
 impl DmaCapture {
     fn chan(&self) -> DmaChannel {
-        DmaChannel::new(self.ch)
+        // SAFETY: uart0_swo consumes the token; mechanism and source serialize their copies.
+        unsafe { DmaChannel::new(self.ch) }
     }
 
-    /// The channel's register block.
     fn regs(&self) -> pac::dma::Channel {
-        self.chan().regs()
+        // SAFETY: all configuration stays in this module's serialized capture lifecycle.
+        unsafe { self.chan().regs() }
     }
 
-    /// Whether the transfer is armed.
     fn enabled(&self) -> bool {
         self.chan().enabled()
     }
@@ -63,8 +60,10 @@ impl DmaCapture {
     /// Arm at the ring's base: byte-wide, wrapping, paced by the UART0 RX DREQ, chained to nothing.
     fn start(&self) {
         let ch = self.regs();
-        self.chan().set_addrs(self.src, self.base);
+        // SAFETY: stopped claimed channel, owned UART0 source and static aligned byte ring.
+        unsafe { self.chan().set_addrs(self.src, self.base) };
         self.load_count();
+        compiler_fence(Ordering::SeqCst);
         ch.ctrl_trig().write(|w| {
             w.set_en(true);
             w.set_incr_read(false);
@@ -77,11 +76,15 @@ impl DmaCapture {
             w.set_chain_to(self.ch as u8);
             w.set_irq_quiet(true);
         });
+        compiler_fence(Ordering::SeqCst);
     }
 
-    /// Stop the transfer and flush anything in flight, leaving the ring memory alone.
+    /// Stop capture; abort timeout permanently halts without releasing or rebasing the ring.
     fn halt(&self) {
-        self.chan().abort();
+        // SAFETY: both capture halves retain the channel and its static ring during abort.
+        if !unsafe { self.chan().abort() } {
+            crate::dma_tx::abort_failed();
+        }
     }
 }
 
@@ -90,7 +93,8 @@ impl DmaCapture {
 impl DmaCapture {
     /// Arm one lap in self-triggering mode: count a ring down, re-trigger, reload.
     fn load_count(&self) {
-        self.chan().set_count_retriggering(RING_LEN as u32);
+        // SAFETY: start configures only the stopped channel and preserves the ring extent.
+        unsafe { self.chan().set_count_retriggering(RING_LEN as u32) };
     }
 
     /// Units left in the current lap, straight off the reloading counter.
@@ -108,19 +112,26 @@ impl DmaCapture {
 impl DmaCapture {
     /// Arm the counter at its maximum: with no self-trigger, one long count carries the ring.
     fn load_count(&self) {
-        self.chan().set_count(RP2040_COUNT);
+        // SAFETY: start configures only the stopped channel; address wrapping bounds the run.
+        unsafe { self.chan().set_count(RP2040_COUNT) };
     }
 
     /// Units left in the current lap, derived from how far the one long count has run.
     fn lap_remaining(&self) -> usize {
-        let written = RP2040_COUNT.wrapping_sub(self.chan().remaining()) as usize;
-        RING_LEN - (written & (RING_LEN - 1))
+        rp2040_lap_remaining(self.chan().remaining())
     }
 
     /// Whether the count ran out and the channel stopped mid-session.
     fn exhausted(&self) -> bool {
         self.enabled() && self.chan().remaining() == 0
     }
+}
+
+/// Units left in the lap once the long count has `remaining` transfers to go.
+#[cfg(feature = "rp2040")]
+fn rp2040_lap_remaining(remaining: u32) -> usize {
+    let written = RP2040_COUNT.wrapping_sub(remaining) as usize;
+    RING_LEN - (written & (RING_LEN - 1))
 }
 
 impl DmaRxChannel for DmaCapture {
@@ -138,8 +149,7 @@ impl DmaRxChannel for DmaCapture {
     }
 }
 
-/// Raw UART0 SWO mechanism: PL011 fixed-point baud programming, plus arming and halting the
-/// capture channel. The pad is muxed to the UART once at construction and never switched back.
+/// Raw UART0 SWO mechanism: PL011 baud programming and capture arming; the pad is muxed once.
 pub struct UartSwoHw {
     uart: UartRegs,
     /// The `clk_peri` rate the divisors are computed against, sampled once at construction.
@@ -150,8 +160,6 @@ pub struct UartSwoHw {
 
 impl SwoBackend for UartSwoHw {
     fn set_baudrate(&mut self, baud: u32) -> u32 {
-        // Trace capture can refuse: a rate the lattice cannot serve reports 0 and programs
-        // nothing, leaving the previous divisors in place.
         let Some(dx64) = pl011_baud::div_x64(self.peri_hz, baud) else {
             return 0;
         };
@@ -184,13 +192,12 @@ impl SwoBackend for UartSwoHw {
     }
 }
 
-/// Consumer half of the capture ring. Interior mutability, because `DAP_SWO_Status` asks for the
-/// byte count through `&self` and the count is only knowable by folding the transfer counter in.
+/// Consumer half of the capture ring; interior mutability because `DAP_SWO_Status` counts via `&self`.
 pub struct DmaSwoRx {
     /// Cursor and lap detection over the capture channel.
     ring: RefCell<DmaRxRing<DmaCapture>>,
     /// The buffer the controller fills; read volatile, never written here.
-    mem: &'static [u8],
+    mem: &'static RingMem,
     /// The capture channel, for the counter-exhaustion check the cursor cannot make.
     cap: DmaCapture,
     /// Sticky overrun, set by a lap or by a counter that ran out mid-session.
@@ -207,10 +214,15 @@ impl DmaSwoRx {
 
     /// Re-arm a counter that ran out mid-session; it discards the ring, so it is an overrun.
     fn rearm_if_exhausted(&self, ring: &mut DmaRxRing<DmaCapture>) {
-        if self.cap.exhausted() {
-            ring.restart();
-            self.overrun.set(true);
-        }
+        rearm_if(self.cap.exhausted(), ring, &self.overrun);
+    }
+}
+
+#[inline(always)]
+fn rearm_if<C: DmaRxChannel>(exhausted: bool, ring: &mut DmaRxRing<C>, overrun: &Cell<bool>) {
+    if exhausted {
+        ring.restart();
+        overrun.set(true);
     }
 }
 
@@ -232,7 +244,7 @@ impl SwoSource for DmaSwoRx {
         let n = {
             let ring = &mut *self.ring.borrow_mut();
             self.rearm_if_exhausted(ring);
-            let (n, lost) = ring.read(self.mem, buf);
+            let (n, lost) = ring.read_with(buf, |index| Some(self.mem.read(index)));
             if lost > 0 {
                 self.overrun.set(true);
             }
@@ -259,19 +271,26 @@ impl SwoSource for DmaSwoRx {
 
 /// Capture ring memory, aligned to its own size so the write-address wrap lands inside it.
 #[repr(C, align(8192))]
-struct RingMem([u8; RING_LEN]);
+struct RingMem(UnsafeCell<[u8; RING_LEN]>);
+
+impl RingMem {
+    fn read(&self, index: usize) -> u8 {
+        assert!(index < RING_LEN);
+        // SAFETY: static initialized storage; no references to DMA-written bytes are formed.
+        unsafe { self.0.get().cast::<u8>().add(index).read_volatile() }
+    }
+}
 
 // The alignment attribute takes a literal, so only this ties it to the wrap width.
 const _: () = assert!(core::mem::align_of::<RingMem>() == RING_LEN);
 
-/// Bring UART0 up as an RX-only SWO capture, permanently routing `rx` (GP13) to it and handing
-/// `dma` to the capture ring. Call once per image.
+/// Bring UART0 up as RX-only SWO capture on GP13 with `dma` filling the ring; call once per image.
 pub fn uart0_swo<P: Pin, D: ChannelInstance>(
-    uart: UartRegs,
+    _uart: Peri<'static, embassy_rp::peripherals::UART0>,
     rx: Peri<'static, P>,
     dma: Peri<'static, D>,
 ) -> Uart0Swo {
-    // Bring UART0 out of reset and wait for it to be ready.
+    let uart = pac::UART0;
     pac::RESETS.reset().modify(|w| w.set_uart0(false));
     while !pac::RESETS.reset_done().read().uart0() {}
 
@@ -291,7 +310,6 @@ pub fn uart0_swo<P: Pin, D: ChannelInstance>(
         w.set_iso(false);
     });
 
-    // Disable while configuring, then program the placeholder divisor.
     uart.uartcr().write(|_w| {});
     let peri_hz = embassy_rp::clocks::clk_peri_freq();
     let (ibrd, fbrd) = pl011_baud::split(
@@ -305,7 +323,6 @@ pub fn uart0_swo<P: Pin, D: ChannelInstance>(
         w.set_wlen(WLEN_8BIT);
         w.set_fen(true);
     });
-    // Enable UART + RX only (RX-only SWO capture; TX stays off).
     uart.uartcr().write(|w| {
         w.set_uarten(true);
         w.set_rxe(true);
@@ -315,10 +332,11 @@ pub fn uart0_swo<P: Pin, D: ChannelInstance>(
     // Whole-register write, leaving DMAONERR clear: a framing error must not gate RX requests off.
     uart.uartdmacr().write(|w| w.set_rxdmae(true));
 
-    static RING_MEM: ConstStaticCell<RingMem> = ConstStaticCell::new(RingMem([0; RING_LEN]));
+    static RING_MEM: ConstStaticCell<RingMem> =
+        ConstStaticCell::new(RingMem(UnsafeCell::new([0; RING_LEN])));
     let mem = RING_MEM.take();
-    let base = mem.0.as_ptr() as u32;
-    let mem: &'static [u8] = &mem.0;
+    let base = mem.0.get() as u32;
+    let mem: &'static RingMem = mem;
 
     // The channel index comes from the `Peripherals` singleton, so no other owner can hold it.
     let _ = dma;
@@ -340,4 +358,74 @@ pub fn uart0_swo<P: Pin, D: ChannelInstance>(
             led: None,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "rp2040")]
+    #[test]
+    fn rp2040_lap_wraps_with_the_write_address() {
+        assert_eq!(rp2040_lap_remaining(RP2040_COUNT), RING_LEN);
+        assert_eq!(rp2040_lap_remaining(RP2040_COUNT - 1), RING_LEN - 1);
+        assert_eq!(
+            rp2040_lap_remaining(RP2040_COUNT - (RING_LEN as u32 - 1)),
+            1
+        );
+        assert_eq!(
+            rp2040_lap_remaining(RP2040_COUNT - RING_LEN as u32),
+            RING_LEN
+        );
+        // An exhausted count has written u32::MAX bytes, leaving the address one short of a lap.
+        assert_eq!(rp2040_lap_remaining(0), 1);
+        for remaining in [0, 1, 7, 8191, 8192, 8193, 1 << 20, RP2040_COUNT] {
+            let written = RP2040_COUNT.wrapping_sub(remaining) as usize;
+            assert_eq!(
+                RING_LEN - rp2040_lap_remaining(remaining),
+                written % RING_LEN
+            );
+        }
+    }
+
+    struct Chan<'a> {
+        remaining: &'a Cell<usize>,
+        reloads: &'a Cell<u32>,
+    }
+
+    impl DmaRxChannel for Chan<'_> {
+        fn remaining(&self) -> usize {
+            self.remaining.get()
+        }
+
+        fn reload(&mut self, len: usize) {
+            self.remaining.set(len);
+            self.reloads.set(self.reloads.get() + 1);
+        }
+    }
+
+    #[test]
+    fn an_exhausted_count_restarts_the_ring_and_flags_an_overrun() {
+        let (remaining, reloads, overrun) = (Cell::new(11), Cell::new(0), Cell::new(false));
+        let mut ring = DmaRxRing::new(
+            Chan {
+                remaining: &remaining,
+                reloads: &reloads,
+            },
+            16,
+        );
+        ring.observe();
+        assert_eq!(ring.available(), 5);
+        rearm_if(false, &mut ring, &overrun);
+        assert_eq!(
+            (ring.available(), reloads.get(), overrun.get()),
+            (5, 0, false)
+        );
+        rearm_if(true, &mut ring, &overrun);
+        assert_eq!(
+            (ring.available(), reloads.get(), overrun.get()),
+            (0, 1, true)
+        );
+        assert_eq!(ring.write_pos(), 0);
+    }
 }

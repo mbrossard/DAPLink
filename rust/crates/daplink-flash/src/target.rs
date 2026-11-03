@@ -26,8 +26,7 @@ pub enum DpWake {
     DormantToSwd,
 }
 
-/// How access ports are addressed on the debug port: ADIv5 (8-bit `APSEL`) or ADIv6 (a full AP
-/// base address programmed into `SELECT`).
+/// How access ports are addressed: an ADIv5 `APSEL` or an ADIv6 base address in `SELECT`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ApAddressing {
@@ -40,8 +39,7 @@ pub enum ApAddressing {
     },
 }
 
-/// Data-driven debug-port connection policy: how to wake the DP, whether a multidrop target
-/// selection is required, and how access ports are addressed.
+/// Debug-port connection policy: wake, multidrop selection and AP addressing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DebugPort {
@@ -85,8 +83,7 @@ pub enum TargetState {
     PostFlashReset,
 }
 
-/// Static description of a debuggable target: its flash, RAM and sector layout. Object-safe, so a
-/// `&dyn Target` can be stored generically.
+/// Static description of a debuggable target; object-safe.
 pub trait Target {
     /// A short, human-readable name for this target (e.g. `"RP2040"`); defaults to `""`.
     fn name(&self) -> &'static str {
@@ -105,14 +102,12 @@ pub trait Target {
         ResetType::Hardware
     }
 
-    /// The reset/halt strategy this target uses; defaults to the generic sequence dispatched on
-    /// [`reset_type`](Self::reset_type).
+    /// The reset/halt strategy; defaults to the generic sequence for [`reset_type`](Self::reset_type).
     fn reset_sequence(&self) -> &dyn ResetSequence {
         &GENERIC_RESET_SEQUENCE
     }
 
-    /// Access-port selector for the debug AP (defaults to 0). Used only under ADIv5 addressing;
-    /// under ADIv6 the AP is chosen by [`DebugPort::ap`]'s base address instead.
+    /// Debug AP selector under ADIv5 addressing (defaults to 0).
     fn apsel(&self) -> u32 {
         0
     }
@@ -125,16 +120,6 @@ pub trait Target {
     /// Whether a flash algorithm is available for this target; defaults to `true`.
     fn flash_algorithm_available(&self) -> bool {
         true
-    }
-
-    /// Whether the target must be reset after erase (defaults to `false`).
-    fn erase_reset(&self) -> bool {
-        false
-    }
-
-    /// TAR auto-increment page size in bytes (defaults to 1024).
-    fn auto_increment_size(&self) -> u32 {
-        1024
     }
 
     /// Preferred SWD clock in Hz, or 0 for the probe default.
@@ -151,10 +136,14 @@ pub trait Target {
     fn uf2_family(&self) -> Option<u32> {
         None
     }
+
+    /// Whether this device takes a UF2 block of `family`.
+    fn accepts_uf2_family(&self, family: u32) -> bool {
+        self.uf2_family() == Some(family)
+    }
 }
 
-/// Whether a callback handled a [`TargetState`] transition itself, or wants the caller to
-/// fall through to the generic reset sequence.
+/// Whether a callback handled a [`TargetState`] transition or defers to the generic sequence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum StateOutcome {
@@ -171,7 +160,7 @@ pub trait TargetCallbacks<S, D> {
         Ok(())
     }
 
-    /// Called before running the algorithm, to apply any pre-run configuration.
+    /// Apply pre-run configuration; runs after the init reset-and-halt and before each `Init`.
     fn prerun_config(&self, _swd: &mut S, _delay: &mut D) -> Result<(), crate::Error> {
         Ok(())
     }
@@ -181,8 +170,7 @@ pub trait TargetCallbacks<S, D> {
         false
     }
 
-    /// Drive the target into `state`; return [`StateOutcome::Handled`] to claim the transition,
-    /// otherwise the caller applies the generic reset sequence.
+    /// Drive the target into `state`, or return `NotHandled` to use the generic sequence.
     fn set_target_state(
         &self,
         _swd: &mut S,

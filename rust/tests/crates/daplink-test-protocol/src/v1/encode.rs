@@ -13,12 +13,9 @@ pub struct TxCounters {
     pub frames: u32,
     /// Cumulative grant the transmitter obeys; 0 unless credit-limited.
     pub credit: u64,
-    /// The budget was met and the end-of-stream frame has left the encoder.
-    pub complete: bool,
 }
 
-/// Marker-framed transmitter, resumable at any byte boundary: [`Encoder::fill`] stops early on
-/// the budget, a credit grant or a burst gap, and ends the run with one end-of-stream frame.
+/// Marker-framed transmitter, resumable at any byte boundary, ending with one end-of-stream frame.
 #[derive(Debug, Clone)]
 pub struct Encoder {
     dir: Direction,
@@ -46,8 +43,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Arm a transmitter for `budget` payload bytes ([`super::UNBOUNDED`] runs until aborted);
-    /// an interval below one frame is raised to [`FRAME_LEN`], so both ends agree on any input.
+    /// Arm a transmitter for `budget` payload bytes; an interval below one frame is raised to [`FRAME_LEN`].
     pub fn new(dir: Direction, seed: u32, interval: u32, budget: u64) -> Self {
         let interval = if interval < FRAME_LEN as u32 {
             FRAME_LEN as u32
@@ -135,13 +131,11 @@ impl Encoder {
         *self = fresh;
     }
 
-    /// The run's ledger.
     pub fn counters(&self) -> TxCounters {
         TxCounters {
             payload: self.payload,
             frames: self.frames,
             credit: self.grant.unwrap_or(0),
-            complete: self.done && self.frame_pos == FRAME_LEN,
         }
     }
 
@@ -150,8 +144,7 @@ impl Encoder {
         self.done && self.frame_pos == FRAME_LEN
     }
 
-    /// Write the next bytes into `buf`: a short return means idle, out of credit, or finished,
-    /// never that the buffer was too small.
+    /// Write the next bytes into `buf`; a short return means idle, out of credit, or finished.
     pub fn fill(&mut self, buf: &mut [u8], now_us: u32) -> usize {
         let mut written = 0;
         while written < buf.len() {
@@ -325,7 +318,6 @@ mod tests {
                 payload: 200,
                 frames: 4,
                 credit: 0,
-                complete: true,
             }
         );
 

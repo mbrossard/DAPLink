@@ -1,5 +1,4 @@
-//! VCOM conservation-counter query (`0x9D`): echoed id, nine free-running `u32` LE counters,
-//! then the `valid`, `grade` and `units` mask words.
+//! VCOM conservation-counter query (`0x9D`): echoed id, LE counters, `valid`, `grade`, `units`.
 
 use daplink_core::vendor::VendorHandler;
 
@@ -9,10 +8,9 @@ pub const VCOM_STATS_CMD_ID: u8 = 0x9D;
 /// Counters in the response, in wire order.
 pub const VCOM_STATS_FIELDS: usize = 9;
 
-/// Total response length: the echoed id, the little-endian counters, then `valid`, `grade` and
-/// `units`.
+/// Total response length: echoed id, counters, then `valid`, `grade` and `units`.
 pub const VCOM_STATS_RESPONSE_LEN: usize = 1 + 4 * VCOM_STATS_FIELDS + 12;
-// The reply must stay one full-speed DAP packet; re-check this before assuming a slot is free.
+// The reply must stay one full-speed DAP packet.
 const _: () = assert!(VCOM_STATS_RESPONSE_LEN == 49 && VCOM_STATS_RESPONSE_LEN <= 64);
 
 /// Counter slots, in wire order; the first six are the v1 prefix an older host still reads.
@@ -39,8 +37,7 @@ pub const VCOM_VALID_IDENTITY: u32 =
     VCOM_VALID_UART_RX | VCOM_VALID_CDC_IN | VCOM_VALID_HOST_DROPPED;
 pub const VCOM_VALID_ALL: u32 = (1 << VCOM_STATS_FIELDS) - 1;
 
-/// `grade` values, two bits per slot and meaningful only where `valid` is set: how good the
-/// evidence behind a sourced counter is, never how much care went into it.
+/// `grade` values, two bits per slot, meaningful only where `valid` is set.
 pub const VCOM_GRADE_LOWER_BOUND: u32 = 1;
 pub const VCOM_GRADE_EXACT: u32 = 2;
 
@@ -54,16 +51,12 @@ pub const fn vcom_episodes(slot: usize) -> u32 {
     1 << slot
 }
 
-/// The VCOM bridge's byte ledger, holding `uart_rx == cdc_in + host_dropped` on the receive leg
-/// and `cdc_out >= uart_tx` on the transmit leg. A counter the firmware cannot observe reads zero
-/// with its `valid` bit clear, so the wire format never varies.
+/// The VCOM bridge's byte ledger; an unobservable counter reads zero with its `valid` bit clear.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct VcomCounters {
     /// Bytes the bridge took off the UART seam.
     pub uart_rx: u32,
-    /// Bytes the CDC IN endpoint accepted for the host. A bridge that stages toward the endpoint
-    /// credits them when it hands them to the CDC stream, and moves the credit to `host_dropped`
-    /// if the stream discards the stage, so the field is exact once the stage drains.
+    /// Bytes the CDC IN endpoint accepted for the host; exact once any staged bytes drain.
     pub cdc_in: u32,
     /// Bytes taken off the seam that the host would not take, a discarded stage included.
     pub host_dropped: u32,
@@ -108,8 +101,7 @@ impl VcomCounters {
     }
 }
 
-/// Answers [`VCOM_STATS_CMD_ID`] from the injected reader and declines everything else, so it
-/// chains with the other vendor commands in the one vendor slot.
+/// Answers [`VCOM_STATS_CMD_ID`] from the injected reader and declines everything else.
 pub struct VcomStatsVendor {
     counters: fn() -> VcomCounters,
 }
@@ -142,7 +134,6 @@ impl VendorHandler for VcomStatsVendor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daplink_core::vendor::VendorChain;
 
     fn sample() -> VcomCounters {
         VcomCounters {
@@ -184,8 +175,7 @@ mod tests {
 
     #[test]
     fn the_v1_prefix_survives_the_bump() {
-        // An old host reads the first six counters and the byte after them was the valid word;
-        // both must keep their positions, which the slot constants pin.
+        // The first six counters retain their positions; the validity word moved in v2.
         assert_eq!(VCOM_SLOT_UART_RX, 0);
         assert_eq!(VCOM_SLOT_OVERRUN, 5);
         let mut v = VcomStatsVendor::new(sample);
@@ -239,7 +229,7 @@ mod tests {
 
     #[test]
     fn chains_beside_the_realized_baud_query_without_shadowing_it() {
-        let mut chain = VendorChain::new(
+        let mut chain = (
             crate::VcomBaudVendor::new(|| crate::VcomBaudState::deferred(115_207, 115_200, true)),
             VcomStatsVendor::new(sample),
         );

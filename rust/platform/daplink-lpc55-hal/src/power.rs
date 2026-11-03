@@ -18,7 +18,6 @@ const FLASHTIM_150MHZ: u8 = 11;
 /// Flash controller command: set the internal read mode from `DATAW[0]`.
 const FLASH_CMD_SET_READ_MODE: u32 = 2;
 
-/// Every `FLASH.INT_STATUS` flag, for the clear-before-command write.
 const FLASH_INT_STATUS_ALL: u32 = 0x1f;
 
 /// `FLASH.INT_STATUS` bits: `FAIL`, `ERR`, `DONE`, `ECC_ERR`.
@@ -30,7 +29,6 @@ const FLASH_STATUS_ECC_ERR: u32 = 1 << 3;
 /// Poll budget for flash `SET_READ_MODE`: bounded, so a wedged controller faults, not hangs.
 const FLASH_CMD_POLL_LIMIT: u32 = 100_000;
 
-/// `SYSCON.PLL0STAT`: the `LOCK` bit.
 const PLL0STAT_LOCK: u32 = 1 << 0;
 
 /// Poll budget for `PLL0STAT.LOCK`: far past the specified settling time, and still bounded.
@@ -43,8 +41,7 @@ const PLL0_150MHZ_P: u8 = 1;
 const PLL0_150MHZ_SELP: u8 = 31;
 const PLL0_150MHZ_SELI: u8 = 53;
 
-/// Why the 150 MHz path refused. Every variant leaves the mux untouched: the core is still on
-/// FRO12, running and debuggable.
+/// A refused 150 MHz transition, fatal to boot: unsupported silicon stays on FRO96, others FRO12.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerError {
     /// `SYSCON.DIEID.REV_ID` (carried) is not [`REV_ID_1B`]; the die is not rated for 150 MHz.
@@ -57,13 +54,11 @@ pub enum PowerError {
     Pll0NoLock(u32),
 }
 
-/// Bring-up status word for the 150 MHz path, readable over SWD by symbol name. Bits 31:24 name
-/// the step (the `STATUS_*` constants); the low bits carry the raw register value.
+/// Bring-up status word, read over SWD by symbol: bits 31:24 name the step, low bits a register.
 #[no_mangle]
 pub static CORE_150MHZ_STATUS: AtomicU32 = AtomicU32::new(STATUS_START);
 
-/// Clock readback for the 150 MHz path. Word 0: post-switch summary; words 1-4: PLL0 registers
-/// as programmed; words 5-6: the pre-mux snapshot.
+/// Clock readback: word 0 summary, words 1-4 PLL0 registers, words 5-6 pre-mux snapshot.
 #[no_mangle]
 pub static CORE_150MHZ_READBACK: [AtomicU32; 7] = [
     AtomicU32::new(0),
@@ -75,8 +70,7 @@ pub static CORE_150MHZ_READBACK: [AtomicU32; 7] = [
     AtomicU32::new(0),
 ];
 
-/// [`CORE_150MHZ_READBACK`] word 0, bit 25: the PLL0 registers read back after the switch
-/// differ from the ones [`prelock_pll0_150mhz`] programmed.
+/// Readback word 0, bit 25: the PLL0 registers read back after the switch differ from the recipe.
 pub const READBACK_PLL_RECIPE_DRIFT: u32 = 1 << 25;
 
 /// [`CORE_150MHZ_STATUS`]: the preflight has not run yet.
@@ -102,8 +96,7 @@ pub const STATUS_MUX_SWITCH: u32 = 0x4500_0000;
 /// [`CORE_150MHZ_STATUS`]: the main clock is on PLL0 and the core survived the switch.
 pub const STATUS_RUNNING: u32 = 0x5000_0000;
 
-/// Raise the core supply and both flash-timing controls for 150 MHz, in UM11126's
-/// upward-transition order, re-selecting the reset FRO12 clock first. Refuses non-1B silicon.
+/// Raise supply and flash timing for 150 MHz in UM11126's upward order; refuses non-1B silicon.
 pub fn preflight_150mhz(
     flash: &hal::raw::FLASH,
     syscon: &mut hal::Syscon,
@@ -114,8 +107,7 @@ pub fn preflight_150mhz(
         return Err(PowerError::UnsupportedRevision(rev));
     }
 
-    // SAFETY: the `&mut Syscon` proves no other owner writes the block; the HAL keeps its raw
-    // field crate-private, so the registers are reached through the PAC block pointer.
+    // SAFETY: `&mut Syscon` proves exclusive ownership; the HAL keeps its raw field private.
     let sc = unsafe { &*hal::raw::SYSCON::PTR };
 
     // Guarantee the starting point the upward sequence assumes: main clock on FRO12, AHB /1.
@@ -123,9 +115,8 @@ pub fn preflight_150mhz(
     sc.mainclkselb.modify(|_, w| w.sel().enum_0x0());
     sc.ahbclkdiv.modify(|_, w| unsafe { w.div().bits(0) });
 
-    // SAFETY: the linked routine takes one `u32` and touches only the PMC and read-only factory
-    // flash, which no Rust code in this image aliases; called on FRO12 as UM11126 requires.
-    unsafe { POWER_SetVoltageForFreq(crate::clocks::CPU_HZ) };
+    // SAFETY: touches only the PMC and read-only factory flash; called on FRO12 as required.
+    unsafe { POWER_SetVoltageForFreq(crate::clocks::ClockProfile::MHZ_150.cpu_hz()) };
 
     set_flash_access_cycles(flash, sc, FLASHTIM_150MHZ)?;
 
@@ -133,8 +124,7 @@ pub fn preflight_150mhz(
     Ok(())
 }
 
-/// Program the flash controller's internal read mode, then `SYSCON.FMCCR.FLASHTIM`, to the same
-/// encoding: both must be raised before the clock, and `FMCCR` alone can fault the first fetch.
+/// Set flash read mode, then `FMCCR.FLASHTIM`: both must rise before the clock, or a fetch faults.
 fn set_flash_access_cycles(
     flash: &hal::raw::FLASH,
     syscon: &hal::raw::syscon::RegisterBlock,
@@ -177,8 +167,7 @@ fn set_flash_access_cycles(
     Ok(())
 }
 
-/// Program PLL0 with the 150 MHz recipe and wait, bounded, for `PLL0STAT.LOCK` without moving
-/// the mux, so a recipe that cannot lock leaves the core on FRO12 rather than on a dead clock.
+/// Program PLL0 for 150 MHz and wait, bounded, for lock without moving the mux.
 pub(crate) fn prelock_pll0_150mhz() -> Result<(), PowerError> {
     // SAFETY: as in `preflight_150mhz`; the caller holds the Syscon and Pmc singletons across it.
     let sc = unsafe { &*hal::raw::SYSCON::PTR };
@@ -252,8 +241,7 @@ pub(crate) fn prelock_pll0_150mhz() -> Result<(), PowerError> {
     Ok(())
 }
 
-/// Snapshot the PLL0 registers into [`CORE_150MHZ_READBACK`] words 1-4 and return the three
-/// recipe words (status excluded so post-switch comparison ignores `PLL0STAT` churn).
+/// Snapshot PLL0 into readback words 1-4; returns the recipe words, without `PLL0STAT`.
 fn latch_pll0_registers(
     sc: &hal::raw::syscon::RegisterBlock,
     pmc: &hal::raw::pmc::RegisterBlock,
@@ -276,8 +264,7 @@ fn latch_pll0_registers(
     recipe
 }
 
-/// Latch [`STATUS_MUX_SWITCH`] and the pre-mux clock-tree snapshot (readback words 5-6): the only
-/// record a boot that dies at the switch leaves.
+/// Latch the mux-switch status and pre-mux snapshot: all a boot dying at the switch leaves.
 pub(crate) fn latch_mux_switch() {
     CORE_150MHZ_STATUS.store(STATUS_MUX_SWITCH, Ordering::Relaxed);
 
@@ -298,8 +285,7 @@ pub(crate) fn latch_mux_switch() {
     CORE_150MHZ_READBACK[6].store(sc.pll0ctrl.read().bits(), Ordering::Relaxed);
 }
 
-/// Move the main clock mux onto PLL0 with AHB /1; the A-side selector is pointed at FRO12 first so
-/// the mux has a live fallback source. Call only after a successful [`prelock_pll0_150mhz`].
+/// Move the main clock onto PLL0, FRO12 as the fallback; only after a successful prelock.
 pub(crate) fn switch_main_clock_to_pll0() {
     // SAFETY: as in `preflight_150mhz`; the caller holds the Syscon singleton across this call.
     let sc = unsafe { &*hal::raw::SYSCON::PTR };
@@ -309,8 +295,7 @@ pub(crate) fn switch_main_clock_to_pll0() {
     sc.ahbclkdiv.modify(|_, w| unsafe { w.div().bits(0) });
 }
 
-/// Latch the post-switch summary into [`CORE_150MHZ_READBACK`] word 0, separating "running at
-/// 150 MHz" from "still on FRO12", and flag [`READBACK_PLL_RECIPE_DRIFT`] on a recipe mismatch.
+/// Latch the post-switch summary into readback word 0, flagging recipe drift.
 pub(crate) fn latch_readback() {
     // SAFETY: as in `latch_mux_switch` -- a snapshot from the owning bring-up path.
     let sc = unsafe { &*hal::raw::SYSCON::PTR };

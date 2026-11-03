@@ -49,7 +49,7 @@ impl RxCounters {
         self.eos && self.accounted() == self.eos_total
     }
 
-    /// Nothing was lost, duplicated, corrupted, or left unattributed.
+    /// Nothing was lost, duplicated, corrupted, or left unattributed; completion is [`Self::reconciles`].
     pub const fn clean(&self) -> bool {
         self.corrupt == 0 && self.missing == 0 && self.duplicate == 0 && self.unresolved == 0
     }
@@ -69,8 +69,7 @@ enum State {
     Done,
 }
 
-/// Marker-framed receiver: [`Verifier::arm`] before the sender starts, [`Verifier::feed`] for
-/// every received byte, [`Verifier::counters`] for the ledger.
+/// Marker-framed receiver: `arm` before the sender starts, then `feed` every received byte.
 #[derive(Debug, Clone)]
 pub struct Verifier {
     dir: Direction,
@@ -104,7 +103,7 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// Expect a stream of `dir` from `seed`, framed every `interval` bytes, ending at `budget`.
+    /// Expect `dir` from `seed`, framed every `interval` bytes (raised to [`FRAME_LEN`]), ending at `budget`.
     pub fn new(dir: Direction, seed: u32, interval: u32, budget: u64) -> Self {
         let interval = if interval < FRAME_LEN as u32 {
             FRAME_LEN as u32
@@ -168,7 +167,6 @@ impl Verifier {
         *self = fresh;
     }
 
-    /// The run's ledger.
     pub fn counters(&self) -> RxCounters {
         self.counters
     }
@@ -627,7 +625,6 @@ mod tests {
                 payload: BYTES,
                 frames: 4,
                 credit: 0,
-                complete: true,
             }
         );
     }
@@ -858,7 +855,7 @@ mod tests {
         assert!(counters.reconciles() && counters.clean());
     }
 
-    /// One whole run at the interval the rigs actually use, into a caller-sized buffer.
+    /// One whole run at the default interval, into a caller-sized buffer.
     fn wide_run(out: &mut [u8], budget: u64) -> usize {
         let mut encoder = Encoder::new(Direction::DutToHost, SEED, DEFAULT_INTERVAL, budget);
         let mut written = 0;

@@ -1,13 +1,12 @@
-//! Transport-agnostic Bulk-Only Transport plumbing: the CBW-to-CSW data phase over an abstract
-//! bulk pair, plus the millisecond clock the class loop feeds the volume.
+//! Transport-agnostic Bulk-Only Transport: the CBW-to-CSW cycle over an abstract bulk pair.
 
 use core::future::poll_fn;
 use core::task::Poll;
 
 use daplink_core::msc_proto::{
     build_csw, clamp_reply_len, dispatch, is_test_unit_ready, reconcile_cbw, should_clear_sense,
-    BotVerdict, Cbw, ScsiAction, Sense, CSW_FAILED, CSW_PASSED, SENSE_LUN_NOT_SUPPORTED,
-    SENSE_MEDIUM_CHANGED, SENSE_NONE,
+    start_stop_load, BotVerdict, Cbw, ScsiAction, Sense, CSW_FAILED, CSW_PASSED,
+    SENSE_LUN_NOT_SUPPORTED, SENSE_MEDIUM_CHANGED, SENSE_NONE, SENSE_NO_MEDIUM,
 };
 use daplink_core::MSC_SECTOR_SIZE;
 
@@ -28,6 +27,22 @@ pub trait BulkOut {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()>;
 }
 
+/// A wait to an absolute microsecond deadline, on the clock the sink's `wake_at_us` uses.
+#[allow(async_fn_in_trait)]
+pub trait DeadlineSleep {
+    /// Wait until wall-clock `wake_us`; return promptly if it has already passed.
+    async fn sleep_until_us(&mut self, wake_us: u64);
+}
+
+/// The default sleeper for a transport with no deadline clock: a bare executor yield.
+pub struct YieldSleep;
+
+impl DeadlineSleep for YieldSleep {
+    async fn sleep_until_us(&mut self, _wake_us: u64) {
+        yield_once().await;
+    }
+}
+
 /// Yield to the executor once, so a pending sector poll does not starve the other tasks.
 async fn yield_once() {
     let mut yielded = false;
@@ -43,8 +58,7 @@ async fn yield_once() {
     .await
 }
 
-/// Millisecond wall clock over a monotonic tick counter, scaling by `NUM`/`DEN` ms per tick and
-/// carrying the sub-millisecond remainder, so sub-millisecond readings still advance it.
+/// Millisecond clock over a tick counter at `NUM`/`DEN` ms per tick, carrying the remainder.
 #[derive(Default)]
 pub struct MsClock {
     last_ticks: u64,
@@ -73,16 +87,24 @@ impl MsClock {
     }
 }
 
-/// Run one CBW-to-CSW cycle over the bulk pair, for a bulk packet size of `EP`. Returns without a
-/// CSW only when the host tears the connection down, and ends an empty data-IN phase with a ZLP.
+/// One CBW-to-CSW cycle for packet size `EP`; returns without a CSW only on host teardown.
+/// `ejected` is the host's eject, which the caller clears on a remount or a bus reset.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_command<IN: BulkIn, OUT: BulkOut, IO: SectorIo, const EP: usize>(
+pub async fn run_command<
+    IN: BulkIn,
+    OUT: BulkOut,
+    IO: SectorIo,
+    SL: DeadlineSleep,
+    const EP: usize,
+>(
     ep_in: &mut IN,
     ep_out: &mut OUT,
     io: &mut IO,
+    sleeper: &mut SL,
     sector: &mut [u8; MSC_SECTOR_SIZE],
     sense: &mut Sense,
     ua_pending: &mut bool,
+    ejected: &mut bool,
     cbw: &Cbw,
 ) {
     // Single-LUN device (GET MAX LUN reports 0): any other LUN targets a unit that does not exist.
@@ -96,8 +118,13 @@ pub async fn run_command<IN: BulkIn, OUT: BulkOut, IO: SectorIo, const EP: usize
             .await;
         return;
     }
-    // One declaring a data phase is a BOT case 4/9 violation, and must reach the reject below.
-    if *ua_pending && is_test_unit_ready(cbw.cb[0]) && cbw.data_len == 0 {
+    let action = dispatch(&cbw.cb, cbw.cb_len, io.media_ready() && !*ejected, *sense);
+    // Only a validated TEST UNIT READY with no data phase may consume the latch.
+    if *ua_pending
+        && is_test_unit_ready(cbw.cb[0])
+        && cbw.data_len == 0
+        && matches!(action, ScsiAction::Ok | ScsiAction::Fail(SENSE_NO_MEDIUM))
+    {
         *ua_pending = false;
         *sense = SENSE_MEDIUM_CHANGED;
         let _ = ep_in
@@ -105,7 +132,6 @@ pub async fn run_command<IN: BulkIn, OUT: BulkOut, IO: SectorIo, const EP: usize
             .await;
         return;
     }
-    let action = dispatch(&cbw.cb, io.media_ready(), *sense);
     // Before either endpoint: a direction mismatch would wedge this task awaiting the host.
     if let BotVerdict::Reject {
         status,
@@ -175,14 +201,23 @@ pub async fn run_command<IN: BulkIn, OUT: BulkOut, IO: SectorIo, const EP: usize
                     }
                 }
                 while io.write(lba + i, sector) != SectorPoll::Ready {
-                    yield_once().await;
+                    // A long backend stall is slept through so the DAP task runs; an immediate park yields.
+                    match io.next_wake_us() {
+                        Some(wake) => sleeper.sleep_until_us(wake).await,
+                        None => yield_once().await,
+                    }
                 }
             }
             // Closed before the CSW, so a detach armed mid-command lands on this boundary.
             io.set_data_phase(false);
             CSW_PASSED
         }
-        ScsiAction::Ok => CSW_PASSED,
+        ScsiAction::Ok => {
+            if let Some(load) = start_stop_load(&cbw.cb) {
+                *ejected = !load;
+            }
+            CSW_PASSED
+        }
         ScsiAction::Fail(s) => {
             *sense = s;
             // An unknown opcode reaches here un-rejected, so it needs the same terminator.
@@ -203,8 +238,10 @@ mod tests {
     use core::future::Future;
     use core::pin::pin;
     use core::task::{Context, Waker};
-    use daplink_core::msc_bot_cases::{BotCase, BOT_CASES};
-    use daplink_core::msc_proto::{CSW_LEN, CSW_PHASE_ERROR, CSW_SIGNATURE, SENSE_LBA_RANGE};
+    use daplink_core::msc_bot_cases::{truncated_cases, BotCase, BOT_CASES, EJECT_SEQUENCE};
+    use daplink_core::msc_proto::{
+        CSW_LEN, CSW_PHASE_ERROR, CSW_SIGNATURE, SENSE_INVALID_CDB, SENSE_LBA_RANGE,
+    };
     use daplink_core::{SCSI_PRODUCT_ID, SCSI_VENDOR_ID, VFS_TOTAL_SECTORS};
     use std::collections::BTreeMap;
     use std::vec::Vec;
@@ -220,7 +257,6 @@ mod tests {
         }
     }
 
-    /// Captures every byte written to the bulk IN endpoint.
     struct MockIn {
         written: Vec<u8>,
         /// Length of each write in order: a ZLP is only observable as packet framing.
@@ -256,7 +292,6 @@ mod tests {
         }
     }
 
-    /// Feeds queued host-to-device packets in order.
     struct MockOut {
         packets: Vec<Vec<u8>>,
         idx: usize,
@@ -286,12 +321,18 @@ mod tests {
     struct RamDisk {
         sectors: BTreeMap<u32, [u8; 512]>,
         ready: bool,
+        reads: usize,
+        writes: usize,
+        phases: Vec<bool>,
     }
     impl RamDisk {
         fn new() -> Self {
             Self {
                 sectors: BTreeMap::new(),
                 ready: true,
+                reads: 0,
+                writes: 0,
+                phases: Vec::new(),
             }
         }
     }
@@ -300,12 +341,17 @@ mod tests {
             self.ready
         }
         fn read(&mut self, lba: u32, buf: &mut [u8; 512]) -> SectorPoll {
+            self.reads += 1;
             *buf = *self.sectors.get(&lba).unwrap_or(&[0u8; 512]);
             SectorPoll::Ready
         }
         fn write(&mut self, lba: u32, buf: &[u8; 512]) -> SectorPoll {
+            self.writes += 1;
             self.sectors.insert(lba, *buf);
             SectorPoll::Ready
+        }
+        fn set_data_phase(&mut self, open: bool) {
+            self.phases.push(open);
         }
     }
 
@@ -347,18 +393,191 @@ mod tests {
         ua_pending: &mut bool,
         c: &Cbw,
     ) -> MockIn {
+        run_ua_at::<64>(disk, out, sense, ua_pending, c)
+    }
+
+    fn run_ua_at<const EP: usize>(
+        disk: &mut RamDisk,
+        out: &mut MockOut,
+        sense: &mut Sense,
+        ua_pending: &mut bool,
+        c: &Cbw,
+    ) -> MockIn {
         let mut ep_in = MockIn::new();
         let mut sector = [0u8; MSC_SECTOR_SIZE];
-        block_on(run_command::<_, _, _, 64>(
+        block_on(run_command::<_, _, _, _, EP>(
             &mut ep_in,
             out,
             disk,
+            &mut YieldSleep,
             &mut sector,
             sense,
             ua_pending,
+            &mut false,
             c,
         ));
         ep_in
+    }
+
+    #[test]
+    fn truncated_write_has_no_sector_effects() {
+        for len in 1..10 {
+            let mut disk = RamDisk::new();
+            disk.sectors.insert(5, [0xA5; 512]);
+            let mut c = cbw(0xAA, 512, false, cb(0x2A, &rw10(5, 1)));
+            c.cb_len = len;
+            let mut wire = [0; daplink_core::msc_proto::CBW_LEN];
+            wire[..4].copy_from_slice(&daplink_core::msc_proto::CBW_SIGNATURE.to_le_bytes());
+            wire[4..8].copy_from_slice(&c.tag.to_le_bytes());
+            wire[8..12].copy_from_slice(&c.data_len.to_le_bytes());
+            wire[14] = len;
+            wire[15..].copy_from_slice(&c.cb);
+            let c = daplink_core::msc_proto::parse_cbw(&wire).unwrap();
+            let mut out = MockOut::new(std::vec![std::vec![0x5A; 64]; 8]);
+            let mut sense = SENSE_NONE;
+            let input = run(&mut disk, &mut out, &mut sense, &c);
+            assert_eq!((disk.reads, disk.writes), (0, 0));
+            assert!(disk.phases.is_empty());
+            assert_eq!(disk.sectors[&5], [0xA5; 512]);
+            assert_eq!(out.idx, 0);
+            assert_eq!(input.csw(), (0xAA, 512, CSW_FAILED));
+            assert_eq!(
+                sense,
+                Sense {
+                    key: 5,
+                    asc: 0x24,
+                    ascq: 0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_tur_preserves_unit_attention() {
+        for ready in [false, true] {
+            let mut disk = RamDisk::new();
+            disk.ready = ready;
+            let mut sense = SENSE_NONE;
+            let mut ua = true;
+            let mut c = cbw(1, 0, false, cb(0, &[]));
+            c.cb_len = 1;
+            let input = run_ua(&mut disk, &mut MockOut::empty(), &mut sense, &mut ua, &c);
+            assert!(ua);
+            assert_eq!(input.csw(), (1, 0, CSW_FAILED));
+            assert_eq!(
+                sense,
+                Sense {
+                    key: 5,
+                    asc: 0x24,
+                    ascq: 0
+                }
+            );
+            c.cb_len = 6;
+            c.tag = 2;
+            let input = run_ua(&mut disk, &mut MockOut::empty(), &mut sense, &mut ua, &c);
+            assert!(!ua);
+            assert_eq!(sense, SENSE_MEDIUM_CHANGED);
+            assert_eq!(input.csw(), (2, 0, CSW_FAILED));
+        }
+    }
+
+    #[test]
+    fn absent_lun_precedes_truncated_tur_and_preserves_attention() {
+        let mut disk = RamDisk::new();
+        let mut sense = SENSE_NONE;
+        let mut ua = true;
+        let mut command = cbw(1, 0, false, cb(0, &[]));
+        command.cb_len = 1;
+        command.lun = 1;
+        let input = run_ua(
+            &mut disk,
+            &mut MockOut::empty(),
+            &mut sense,
+            &mut ua,
+            &command,
+        );
+        assert_eq!(input.csw(), (1, 0, CSW_FAILED));
+        assert_eq!(sense, SENSE_LUN_NOT_SUPPORTED);
+        assert!(ua);
+        assert_eq!((disk.reads, disk.writes), (0, 0));
+        assert!(disk.phases.is_empty());
+    }
+
+    fn rejected_then_valid_at<const EP: usize>() {
+        for (dir_in, data_len) in [(false, 0), (true, 18), (false, 512)] {
+            let mut disk = RamDisk::new();
+            let mut sense = SENSE_NONE;
+            let mut ua = false;
+            let mut input = MockIn::new();
+            let mut out = MockOut::empty();
+            let mut sector = [0; MSC_SECTOR_SIZE];
+            let mut short = cbw(1, data_len, dir_in, cb(0x03, &[0, 0, 0, 18]));
+            short.cb_len = 1;
+            let payload = [0x5A; MSC_SECTOR_SIZE];
+            let commands = [
+                short,
+                cbw(2, 18, true, cb(0x03, &[0, 0, 0, 18])),
+                cbw(3, 0, false, cb(0, &[])),
+                cbw(4, 512, false, cb(0x2A, &rw10(5, 1))),
+                cbw(5, 512, true, cb(0x28, &rw10(5, 1))),
+            ];
+            for (index, command) in commands.iter().enumerate() {
+                input.written.clear();
+                input.packets.clear();
+                if index == 3 {
+                    out.packets = payload.chunks(EP).map(<[u8]>::to_vec).collect();
+                    out.idx = 0;
+                }
+                block_on(run_command::<_, _, _, _, EP>(
+                    &mut input,
+                    &mut out,
+                    &mut disk,
+                    &mut YieldSleep,
+                    &mut sector,
+                    &mut sense,
+                    &mut ua,
+                    &mut false,
+                    command,
+                ));
+                let status = if index == 0 { CSW_FAILED } else { CSW_PASSED };
+                let residue = if index == 0 { data_len } else { 0 };
+                assert_eq!(input.csw(), (command.tag, residue, status));
+                match index {
+                    0 => {
+                        assert!(input.data().is_empty());
+                        assert_eq!(out.idx, 0);
+                        assert_eq!((disk.reads, disk.writes), (0, 0));
+                        assert!(disk.phases.is_empty());
+                        assert_eq!(
+                            sense,
+                            Sense {
+                                key: 5,
+                                asc: 0x24,
+                                ascq: 0
+                            }
+                        );
+                    }
+                    1 => {
+                        assert_eq!(input.data()[2], 5);
+                        assert_eq!(input.data()[12], 0x24);
+                        assert_eq!(input.data()[13], 0);
+                        assert_eq!(sense, SENSE_NONE);
+                    }
+                    3 => assert_eq!(disk.writes, 1),
+                    4 => {
+                        assert_eq!(input.data(), payload);
+                        assert_eq!(disk.reads, 1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_request_sense_then_valid_commands_share_state() {
+        rejected_then_valid_at::<64>();
+        rejected_then_valid_at::<512>();
     }
 
     #[test]
@@ -447,8 +666,7 @@ mod tests {
         assert_eq!(clock.frac, 296);
     }
 
-    /// Check after every reading that the milliseconds reported so far are exactly
-    /// `floor(ticks * 1000 / hz)`, computed in `u128`.
+    /// Check after every reading that reported ms equal `floor(ticks * 1000 / hz)`.
     fn matches_oracle<const NUM: u32, const DEN: u32>(hz: u64, steps: usize) {
         let mut clock = MsClock::new(0);
         let mut now = 0u64;
@@ -836,16 +1054,15 @@ mod tests {
         assert_eq!(ep_in.csw(), (0x62, 512, CSW_PHASE_ERROR));
     }
 
-    /// The IN packet lengths a case must produce: a ZLP where a stalling transport would stall
-    /// IN, then the data-phase chunks, then the CSW.
-    fn want_packets(case: &BotCase) -> Vec<usize> {
+    /// The IN packet lengths a case must produce: ZLP where a stall would be, data, then CSW.
+    fn want_packets<const EP: usize>(case: &BotCase) -> Vec<usize> {
         let mut want = Vec::new();
         if case.ends_with_zlp() {
             want.push(0);
         }
         let mut left = case.data_len;
         while left > 0 {
-            let n = core::cmp::min(left, 64);
+            let n = core::cmp::min(left, EP);
             want.push(n);
             left -= n;
         }
@@ -855,16 +1072,23 @@ mod tests {
 
     #[test]
     fn bot_case_table_is_answered_as_the_shared_expectations_say() {
+        bot_case_table_at::<64>();
+        bot_case_table_at::<512>();
+    }
+
+    fn bot_case_table_at<const EP: usize>() {
         // This transport cannot stall, so a stall-IN row ends the phase with a ZLP instead.
-        for case in BOT_CASES {
+        let truncated: Vec<_> = truncated_cases().collect();
+        for case in BOT_CASES.iter().chain(&truncated) {
             let name = case.name;
             let mut disk = RamDisk::new();
+            disk.ready = case.media_ready;
             let mut sense = SENSE_NONE;
             let mut ua = case.ua_before;
             let parsed = daplink_core::msc_proto::parse_cbw(&case.cbw).expect(name);
             let packets: Vec<Vec<u8>> = (0..case.out_packets).map(|_| [0u8; 64].to_vec()).collect();
             let mut out = MockOut::new(packets);
-            let ep_in = run_ua(&mut disk, &mut out, &mut sense, &mut ua, &parsed);
+            let ep_in = run_ua_at::<EP>(&mut disk, &mut out, &mut sense, &mut ua, &parsed);
 
             assert_eq!(ep_in.data().len(), case.data_len, "{name}: data bytes");
             assert_eq!(
@@ -876,10 +1100,47 @@ mod tests {
             assert_eq!(ua, case.ua_after, "{name}: pending unit attention");
             assert_eq!(
                 ep_in.packets,
-                want_packets(case),
+                want_packets::<EP>(case),
                 "{name}: IN packet framing"
             );
             assert_eq!(out.idx, case.out_packets, "{name}: host packets consumed");
+            if case.sense == SENSE_INVALID_CDB {
+                assert_eq!((disk.reads, disk.writes), (0, 0), "{name}");
+                assert!(disk.phases.is_empty(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_eject_leaves_the_medium_absent_until_a_load() {
+        let (mut ua, mut ejected) = (false, false);
+        for case in EJECT_SEQUENCE {
+            let name = case.name;
+            let mut sense = SENSE_NONE;
+            let parsed = daplink_core::msc_proto::parse_cbw(&case.cbw).expect(name);
+            let mut ep_in = MockIn::new();
+            block_on(run_command::<_, _, _, _, 64>(
+                &mut ep_in,
+                &mut MockOut::empty(),
+                &mut RamDisk::new(),
+                &mut YieldSleep,
+                &mut [0u8; MSC_SECTOR_SIZE],
+                &mut sense,
+                &mut ua,
+                &mut ejected,
+                &parsed,
+            ));
+            assert_eq!(
+                ep_in.csw(),
+                (case.tag(), case.residue, case.status),
+                "{name}: CSW"
+            );
+            assert_eq!(sense, case.sense, "{name}: latched sense");
+            assert_eq!(
+                ep_in.packets,
+                want_packets::<64>(case),
+                "{name}: IN packets"
+            );
         }
     }
 
@@ -971,13 +1232,15 @@ mod tests {
         let mut ep_in = MockIn::new();
         let mut sector = [0u8; MSC_SECTOR_SIZE];
         let mut ua = false;
-        block_on(run_command::<_, _, _, 64>(
+        block_on(run_command::<_, _, _, _, 64>(
             &mut ep_in,
             &mut ea_in,
             &mut disk,
+            &mut YieldSleep,
             &mut sector,
             &mut sense,
             &mut ua,
+            &mut false,
             &c,
         ));
         assert_eq!(ep_in.data(), &expect[..]);
@@ -998,13 +1261,15 @@ mod tests {
         let mut ep_in = MockIn::new();
         let mut sector = [0u8; MSC_SECTOR_SIZE];
         let mut ua = false;
-        block_on(run_command::<_, _, _, 64>(
+        block_on(run_command::<_, _, _, _, 64>(
             &mut ep_in,
             &mut ep_out,
             &mut disk,
+            &mut YieldSleep,
             &mut sector,
             &mut sense,
             &mut ua,
+            &mut false,
             &c,
         ));
         assert_eq!(disk.sectors.get(&11), Some(&payload));
@@ -1027,13 +1292,15 @@ mod tests {
         let mut ep_in = MockIn::new();
         let mut sector = [0u8; MSC_SECTOR_SIZE];
         let mut ua = false;
-        block_on(run_command::<_, _, _, 64>(
+        block_on(run_command::<_, _, _, _, 64>(
             &mut ep_in,
             &mut ep_out,
             &mut disk,
+            &mut YieldSleep,
             &mut sector,
             &mut sense,
             &mut ua,
+            &mut false,
             &c,
         ));
         assert_eq!(ep_in.csw(), (0x82, 0, CSW_PASSED));

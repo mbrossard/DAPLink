@@ -1,4 +1,4 @@
-//! DUT control over probe-rs and RTT: trace-pin routing and the emitting firmware's stream.
+//! DUT control over probe-rs and RTT: reset, trace baud and the emitting firmware's stream.
 
 use std::time::{Duration, Instant};
 
@@ -7,7 +7,7 @@ use daplink_test_protocol as proto;
 use probe_rs::probe::list::Lister;
 use probe_rs::probe::DebugProbeSelector;
 use probe_rs::rtt::{Rtt, ScanRegion};
-use probe_rs::{Core, MemoryInterface, Permissions, Session};
+use probe_rs::{Core, Permissions, Session};
 
 /// Bound on one RTT request/response exchange.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -50,8 +50,7 @@ impl Dut {
         })
     }
 
-    /// Put the DUT back to its boot state. A tier measured against whatever the previous
-    /// instrument left running is not a measurement of this one.
+    /// Put the DUT back to its boot state.
     pub fn reset(&mut self) -> Result<()> {
         self.session
             .core(0)
@@ -71,23 +70,13 @@ impl Dut {
             .context("the DUT did not answer PING after a reset")
     }
 
-    /// Assert asynchronous SWO routing on the debug-domain register `reg`: an attach rewrites
-    /// debugger-domain state, so the DUT's own boot-time write cannot be relied on.
-    pub fn route_trace(&mut self, reg: u64) -> Result<()> {
-        let mut core = self.session.core(0)?;
-        let cr = core
-            .read_word_32(reg)
-            .context("reading the trace route failed")?;
-        core.write_word_32(reg, (cr & !(0b11 << 6)) | (1 << 5))
-            .context("routing the trace pin failed")?;
-        Ok(())
-    }
-
-    /// Reprogram the DUT's TPIU baud. The reply carries the rate the divisor realizes, which for a
-    /// rate the trace clock does not divide exactly is not the rate that was asked for.
-    pub fn set_swo_baud(&mut self, baud: u32) -> Result<()> {
-        self.exchange(&format!("SWO CFG {baud}\n"), "OK SWO CFG")
-            .with_context(|| format!("DUT refused a {baud} baud trace rate"))
+    /// Reprogram the DUT's TPIU baud, returning the rate its reply says the divisor realizes.
+    pub fn set_swo_baud(&mut self, baud: u32) -> Result<u32> {
+        let text = self
+            .request(&format!("SWO CFG {baud}\n"), "OK SWO CFG")
+            .with_context(|| format!("DUT refused a {baud} baud trace rate"))?;
+        realized_baud(&text)
+            .ok_or_else(|| anyhow!("no realized rate in the DUT's SWO CFG reply {text:?}"))
     }
 
     /// Start or stop the DUT's continuous sequence-tagged stream.
@@ -97,8 +86,21 @@ impl Dut {
             .with_context(|| format!("DUT did not acknowledge SWO STREAM {n}"))
     }
 
+    /// Read the DUT's SWO emission ledger, zeroed when the tier's stream started.
+    pub fn swo_stats(&mut self) -> Result<proto::SwoStats> {
+        let text = self.request("SWO STATS\n", "OK SWO STATS")?;
+        text.lines()
+            .find_map(proto::swo_stats_reported)
+            .ok_or_else(|| anyhow!("could not parse the DUT's SWO STATS reply from {text:?}"))
+    }
+
     /// Send one protocol line and wait for its marker in the up channel.
     fn exchange(&mut self, line: &str, marker: &str) -> Result<()> {
+        self.request(line, marker).map(|_| ())
+    }
+
+    /// Send one line and return the text through its marker; `ERR unimplemented` fails at once.
+    fn request(&mut self, line: &str, marker: &str) -> Result<String> {
         let elf = self.elf.clone();
         let mut core = self.session.core(0)?;
         let mut rtt = attach_rtt(&mut core, elf.as_deref())?;
@@ -117,8 +119,8 @@ impl Dut {
             let n = channel.read(&mut core, &mut buf)?;
             seen.extend_from_slice(&buf[..n]);
             let text = String::from_utf8_lossy(&seen);
-            if text.contains(marker) {
-                return Ok(());
+            if let Some(reply) = through_marker_line(&text, marker) {
+                return Ok(reply.to_owned());
             }
             if text.contains(proto::ERR_UNIMPLEMENTED) {
                 bail!("DUT answered `{}`", proto::ERR_UNIMPLEMENTED);
@@ -132,8 +134,19 @@ impl Dut {
     }
 }
 
-/// Attach RTT at the ELF's `_SEGGER_RTT` symbol when a DUT image is at hand; a full target-RAM
-/// scan takes seconds on a slow wire.
+/// `text` through the end of the first line holding `marker`, once that line is complete.
+fn through_marker_line<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let at = text.find(marker)?;
+    let end = at + text[at..].find('\n')?;
+    Some(&text[..=end])
+}
+
+/// The realized rate in the last `SWO CFG` reply line of `text`.
+fn realized_baud(text: &str) -> Option<u32> {
+    text.lines().rev().find_map(proto::swo_cfg_realized)
+}
+
+/// Attach RTT at the ELF's `_SEGGER_RTT` symbol when given, avoiding a slow RAM scan.
 fn attach_rtt(core: &mut Core, elf: Option<&str>) -> Result<Rtt> {
     let region = elf
         .and_then(rtt_symbol)
@@ -159,4 +172,32 @@ fn rtt_symbol(elf: &str) -> Option<u64> {
     file.symbols()
         .find(|s| s.name() == Ok("_SEGGER_RTT"))
         .map(|s| s.address())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_is_complete_only_once_its_marker_line_ends() {
+        assert_eq!(
+            through_marker_line("noise\nOK SWO CFG 11", "OK SWO CFG"),
+            None
+        );
+        assert_eq!(
+            through_marker_line("noise\nOK SWO CFG 115226\nlater", "OK SWO CFG"),
+            Some("noise\nOK SWO CFG 115226\n")
+        );
+        assert_eq!(through_marker_line("OK PONG\n", "OK SWO CFG"), None);
+    }
+
+    #[test]
+    fn the_realized_rate_is_read_from_the_dut_reply() {
+        assert_eq!(
+            realized_baud("OK SWO STREAM 0\nOK SWO CFG 115226\n"),
+            Some(115_226)
+        );
+        assert_eq!(realized_baud("OK SWO CFG\n"), None);
+        assert_eq!(realized_baud("ERR unimplemented\n"), None);
+    }
 }

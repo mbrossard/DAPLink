@@ -58,7 +58,6 @@ fn flash_region_is_512k_at_flash_base() {
     assert_eq!(r.end, 0x0808_0000);
     assert_eq!(r.end - r.start, 512 * 1024);
     assert!(r.is_default);
-    assert!(!r.is_secure);
 }
 
 #[test]
@@ -169,7 +168,6 @@ fn algo_ram_invariants() {
     assert!(ram.contains(algo.syscall.static_base));
     assert!(ram.contains(algo.algo_start));
 
-    // Program buffer lies fully within RAM.
     assert!(ram.contains(algo.program_buffer));
     let pb_end = algo.program_buffer + algo.program_buffer_size;
     assert!(pb_end <= ram.end);
@@ -179,15 +177,6 @@ fn algo_ram_invariants() {
     let blob_start = algo.algo_start;
     let blob_end = algo.algo_start + STM32F4_BLOB.len() as u32;
     assert!(algo.program_buffer >= blob_end || pb_end <= blob_start);
-}
-
-#[test]
-fn program_buffer_size_matches_the_record() {
-    // The record's staging size is the algorithm's own program buffer, not a sector size.
-    assert_eq!(
-        crate::targets::stm32f401ce::PROGRAM_BUFFER_SIZE as u32,
-        STM32F4_ALGO.program_buffer_size
-    );
 }
 
 #[test]

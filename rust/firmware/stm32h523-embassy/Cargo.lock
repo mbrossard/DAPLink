@@ -191,6 +191,7 @@ version = "0.1.0"
 name = "daplink-embassy-usb"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "daplink-rs",
  "daplink-vfs",
  "embassy-futures",
@@ -231,6 +232,7 @@ name = "daplink-spi-swd"
 version = "0.1.0"
 dependencies = [
  "dap-rs",
+ "daplink-core",
 ]
 
 [[package]]
@@ -239,6 +241,7 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "critical-section",
+ "daplink-core",
  "daplink-embassy-usb",
  "daplink-rs",
  "daplink-spi-swd",
@@ -246,6 +249,7 @@ dependencies = [
  "embassy-stm32",
  "embassy-sync",
  "embassy-time",
+ "embassy-usb-driver",
  "static_cell",
 ]
 
@@ -263,6 +267,7 @@ dependencies = [
  "critical-section",
  "daplink-core",
  "daplink-decoder",
+ "defmt 1.1.1",
  "heapless 0.8.0",
  "portable-atomic",
  "static_cell",
@@ -1164,7 +1169,6 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-stm32",
- "embassy-sync",
  "embassy-time",
  "embassy-usb",
  "panic-halt",

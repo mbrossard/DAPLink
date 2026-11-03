@@ -6,8 +6,7 @@ use daplink_rs::{BootloaderEntry, DelayNs, KIND_UF2};
 
 use crate::delay::CycleDelay;
 
-/// Latched by [`RpUsbBoot::arm`], observed by [`reboot_watch`]. Plain load/store only (no CAS),
-/// so it is sound on the RP2040's thumbv6m core without `portable-atomic`.
+/// Latched by [`RpUsbBoot::arm`]; plain load/store only, since thumbv6m has no CAS.
 static REBOOT: AtomicBool = AtomicBool::new(false);
 
 /// Grace before entering the ROM, so the host reads the acknowledgement before USB resets.
@@ -37,11 +36,10 @@ impl BootloaderEntry for RpUsbBoot {
     }
 }
 
-/// Idle-loop reboot trigger: call once per `#[idle]` iteration. The vendor handler runs in the USB
-/// ISR and must not enter the ROM there; once armed this waits the grace out and never returns.
-pub fn reboot_watch() {
+/// Call once per idle iteration; once armed, waits the grace out and enters the ROM (never in the ISR).
+pub fn reboot_watch<const CPU_HZ: u32>() {
     if reboot_armed() {
-        CycleDelay.delay_ns(REBOOT_GRACE_NS);
+        CycleDelay::<CPU_HZ>.delay_ns(REBOOT_GRACE_NS);
         RpUsbBoot.enter();
     }
 }

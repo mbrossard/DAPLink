@@ -6,8 +6,7 @@ use daplink_core::{DAP_FW_REVISION, DAP_FW_VERSION};
 
 use crate::dap;
 
-/// Read the probe's firmware-version string; call before probe-rs opens the probe, since this
-/// claims the same vendor interface.
+/// Read the probe's firmware-version string, before probe-rs claims the same interface.
 pub(crate) fn read(selector: &DebugProbeSelector) -> Result<String, String> {
     let mut raw = dap::open(selector)?;
     let bytes = raw.dap_info(0x04)?;
@@ -19,8 +18,17 @@ pub(crate) fn read(selector: &DebugProbeSelector) -> Result<String, String> {
     Ok(version.to_string())
 }
 
-/// The run-header warning when the probe's version differs from the harness's, or `None` when
-/// they match or the harness has no revision to judge against.
+/// What the probe's image says its firmware row is; a failed read is the same as no answer.
+pub(crate) fn read_row(selector: &DebugProbeSelector) -> Option<String> {
+    let bytes = dap::open(selector)
+        .ok()?
+        .dap_info(firmware_row::DAP_INFO_ID)
+        .ok()?;
+    let row = core::str::from_utf8(&bytes).ok()?;
+    Some(row.trim_end_matches('\0').to_string())
+}
+
+/// A warning when the probe's version differs from the harness's, if the harness knows its revision.
 pub(crate) fn staleness_warning(probe_version: &str) -> Option<String> {
     staleness_warning_against(probe_version, DAP_FW_VERSION, DAP_FW_REVISION)
 }

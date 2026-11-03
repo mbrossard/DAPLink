@@ -4,22 +4,28 @@ mod bootsel;
 // The scan runs only as a test; nothing in the built tool reaches it.
 #[cfg(test)]
 mod debug_assert;
+mod dep_pins;
 mod elf;
+mod gate;
+mod install;
+mod manifest_facts;
 mod matrix;
 mod reattach;
 mod registry;
 mod revision;
+mod sources;
+mod stack;
+mod tree;
 mod usb;
 mod workspaces;
 
-use registry::{Bootloader, Firmware};
-use std::path::{Path, PathBuf};
+use clap::{Args, Parser, Subcommand};
+use install::{build, install, put_selector, route};
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
-use std::time::Duration;
-use workspaces::Workspace;
 
-/// Resolve a registry row by name, accepting the bare basename as well as the full `firmware/...`
-/// path. An ambiguous basename names its candidates rather than guessing.
+/// Resolve a registry row by full path or unambiguous basename.
 fn find_firmware(name: &str) -> Option<&'static registry::Firmware> {
     if let Some(fw) = registry::FIRMWARE.iter().find(|f| f.name == name) {
         return Some(fw);
@@ -40,7 +46,6 @@ fn find_firmware(name: &str) -> Option<&'static registry::Firmware> {
     }
 }
 
-/// Report an unresolvable row, suggesting rows whose basename contains the typed name.
 fn unknown_firmware(name: &str) {
     eprintln!("unknown firmware `{name}`; `cargo xtask list` names them");
     let near: Vec<&str> = registry::FIRMWARE
@@ -57,873 +62,514 @@ fn unknown_firmware(name: &str) {
     }
 }
 
-/// The `rust/` tree root; registry paths resolve against it, not the invocation directory.
+/// The `rust/` tree root; registry paths resolve against it.
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
+    tree::checked()
+        .expect("checked first in main")
         .to_path_buf()
 }
 
-fn build(fw: &Firmware) -> bool {
-    println!("building {} for {}", fw.name, fw.target);
-    let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release", "--target", fw.target]);
-    // Absolute: the build runs in the crate directory, and output belongs under `rust/target/`.
-    cmd.arg("--target-dir").arg(root().join(fw.target_dir()));
-    if fw.no_default_features {
-        cmd.arg("--no-default-features");
+/// `list`: firmware rows, shapes, targets and the gate tables; a closed reader ends it cleanly.
+fn list(out: &mut impl Write) -> ExitCode {
+    let shapes = match matrix::shapes(&root()) {
+        Ok(shapes) => shapes,
+        Err(error) => {
+            eprintln!("could not read feature matrix: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Columns align within each table, so long shape labels do not widen the others.
+    let firmware: Vec<[String; 3]> = registry::FIRMWARE
+        .iter()
+        .map(|fw| [fw.name.into(), fw.target.into(), fw.chip.into()])
+        .collect();
+    let mut shaped = Vec::new();
+    for shape in shapes {
+        shaped.push([
+            format!("shape  {}", shape.label()),
+            shape.base.target.into(),
+            shape.features.join(","),
+        ]);
     }
-    if !fw.features.is_empty() {
-        cmd.args(["--features", &fw.features.join(",")]);
+    let mut targets = Vec::new();
+    for t in registry::TARGETS {
+        let dut_chip = registry::FIRMWARE
+            .iter()
+            .find(|f| f.name == t.dut)
+            .map(|f| f.chip)
+            .unwrap_or("?");
+        targets.push([format!("target {}", t.name), dut_chip.into(), t.dut.into()]);
     }
-    revision::stamp(&mut cmd, &root());
-    let ok = cmd
-        .current_dir(root().join(fw.path))
+    let mut gate = Vec::new();
+    for ws in workspaces::WORKSPACES {
+        gate.push([
+            format!("workspace {}", ws.name),
+            ws.path.into(),
+            ws.features.join(","),
+        ]);
+    }
+    for ws in workspaces::embedded() {
+        gate.push([
+            format!("embedded  {}", ws.name),
+            ws.path.into(),
+            String::new(),
+        ]);
+    }
+    for c in workspaces::CROSS {
+        gate.push([
+            format!("cross     {}", c.name),
+            c.path.into(),
+            c.target.into(),
+        ]);
+    }
+    for ex in workspaces::EXCLUDED {
+        gate.push([
+            format!("excluded  {}", ex.path),
+            String::new(),
+            ex.reason.into(),
+        ]);
+    }
+    let written = [firmware, shaped, targets, gate]
+        .iter()
+        .try_for_each(|rows| write_columns(out, rows));
+    match written {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+            eprintln!("could not write the list: {error}");
+            ExitCode::FAILURE
+        }
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Each column but the last padded to its widest cell.
+fn write_columns(out: &mut impl Write, rows: &[[String; 3]]) -> std::io::Result<()> {
+    let width = |i: usize| rows.iter().map(|r| r[i].len()).max().unwrap_or(0);
+    let (first, second) = (width(0), width(1));
+    for [a, b, c] in rows {
+        let line = format!("{a:<first$} {b:<second$} {c}");
+        writeln!(out, "{}", line.trim_end())?;
+    }
+    out.flush()
+}
+
+/// Build orchestration for the firmware fleet.
+#[derive(Parser)]
+#[command(name = "cargo xtask", bin_name = "cargo xtask")]
+struct Cli {
+    #[command(subcommand)]
+    verb: Verb,
+}
+
+#[derive(Subcommand)]
+enum Verb {
+    /// Print the firmware rows, feature shapes, targets and gate tables
+    List,
+    /// Release-build one row, or with no name the default compositions
+    Build { name: Option<String> },
+    /// Build every row, then the feature shapes
+    BuildAll,
+    /// Compile-check the feature shapes alone
+    Matrix {
+        /// Build instead, catching section overflows and duplicate symbols
+        #[arg(long)]
+        link: bool,
+    },
+    /// Print dependencies pinned in several workspaces; fail when their revisions differ
+    Pins,
+    /// Check tracked lockfiles and pins, then run fmt, clippy and tests in every workspace row
+    Test {
+        /// Also run build-all
+        #[arg(long)]
+        build: bool,
+    },
+    /// Build a row, flash it and reset
+    Flash(FlashArgs),
+    /// Build a probe row and the target's DUT image, flash the probe, run the HIL cases
+    Hil(HilArgs),
+}
+
+#[derive(Args)]
+struct FlashArgs {
+    /// Registry path or unambiguous basename
+    name: String,
+    /// Transport probe, as vid:pid:serial
+    #[arg(long, alias = "probe")]
+    via: Option<String>,
+    /// The flashed board's own USB identity, as vid:pid:serial
+    #[arg(long)]
+    put: Option<String>,
+    /// Where the row's BOOTSEL drive is mounted
+    #[arg(long)]
+    bootsel_mount: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct HilArgs {
+    /// Registry path or unambiguous basename
+    name: String,
+    /// Transport probe, as vid:pid:serial
+    #[arg(long)]
+    via: Option<String>,
+    /// Probe under test, as vid:pid:serial
+    #[arg(long, alias = "probe")]
+    put: String,
+    /// Wired target; `cargo xtask list` names them
+    #[arg(long)]
+    target: String,
+    /// Where the row's BOOTSEL drive is mounted
+    #[arg(long)]
+    bootsel_mount: Option<PathBuf>,
+    /// Test the image the probe already holds
+    #[arg(long)]
+    no_put_flash: bool,
+    /// Run only this case, in the order given; repeatable
+    #[arg(long = "case", value_name = "NAME")]
+    cases: Vec<String>,
+    /// Passed to the harness's speed cases
+    #[arg(long)]
+    speed_extended: bool,
+    /// Passed to the harness's speed cases; repeatable
+    #[arg(long, value_name = "BYTES[,BYTES...]")]
+    speed_access: Vec<String>,
+}
+
+impl HilArgs {
+    /// What follows the harness's own arguments: its options, then the cases.
+    fn harness_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.speed_extended {
+            args.push("--speed-extended".to_string());
+        }
+        for access in &self.speed_access {
+            args.extend(["--speed-access".to_string(), access.clone()]);
+        }
+        args.extend(self.cases.iter().cloned());
+        args
+    }
+}
+
+fn exit_code(ok: bool) -> ExitCode {
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn build_verb(name: Option<&str>) -> ExitCode {
+    let Some(name) = name else {
+        let mut ok = true;
+        for fw in registry::FIRMWARE.iter().filter(|f| f.name == f.path) {
+            if !build(fw) {
+                println!("{:<40} FAILED", fw.name);
+                ok = false;
+            }
+        }
+        return exit_code(ok);
+    };
+    let Some(fw) = find_firmware(name) else {
+        unknown_firmware(name);
+        return ExitCode::FAILURE;
+    };
+    exit_code(build(fw))
+}
+
+fn flash(args: &FlashArgs) -> ExitCode {
+    let name = args.name.as_str();
+    let Some(fw) = find_firmware(name) else {
+        unknown_firmware(name);
+        return ExitCode::FAILURE;
+    };
+    let put_sel = match put_selector(fw, args.put.as_deref()) {
+        Ok(sel) => sel,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let via = args.via.as_deref();
+    let route = match route(fw, via, put_sel.as_ref(), args.bootsel_mount.as_deref()) {
+        Ok(route) => route,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    exit_code(build(fw) && install(fw, route, put_sel.as_ref()))
+}
+
+fn hil(args: &HilArgs) -> ExitCode {
+    let (name, target) = (args.name.as_str(), args.target.as_str());
+    let Some(fw) = find_firmware(name) else {
+        unknown_firmware(name);
+        return ExitCode::FAILURE;
+    };
+    let Some(tgt) = registry::TARGETS.iter().find(|t| t.name == target) else {
+        eprintln!("unknown target `{target}`; `cargo xtask list` names them");
+        return ExitCode::FAILURE;
+    };
+    let Some(dut) = registry::FIRMWARE.iter().find(|f| f.name == tgt.dut) else {
+        eprintln!("target `{target}` names an unregistered DUT `{}`", tgt.dut);
+        return ExitCode::FAILURE;
+    };
+    let Some(profile) = fw.profile else {
+        eprintln!("firmware `{name}` is a DUT image with no rig profile; it cannot be a PUT");
+        return ExitCode::FAILURE;
+    };
+    let put_sel = match put_selector(fw, Some(args.put.as_str())) {
+        Ok(sel) => sel,
+        Err(e) => {
+            eprintln!("cannot follow the PUT on the bus: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let via = args.via.as_deref();
+    let route = if args.no_put_flash {
+        None
+    } else {
+        match route(fw, via, put_sel.as_ref(), args.bootsel_mount.as_deref()) {
+            Ok(route) => Some(route),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    if !((route.is_none() || build(fw)) && build(dut)) {
+        return ExitCode::FAILURE;
+    }
+    if let Some(route) = route {
+        if !install(fw, route, put_sel.as_ref()) {
+            return ExitCode::FAILURE;
+        }
+    }
+    let dut_elf = root().join(dut.elf());
+    let mut hil_args = vec![
+        "run".to_string(),
+        "--quiet".to_string(),
+        // The speed cases time the host's probe-rs as much as the probe.
+        "--release".to_string(),
+        "--locked".to_string(),
+        "--".to_string(),
+        "--probe".to_string(),
+        args.put.clone(),
+        "--target".to_string(),
+        tgt.name.to_string(),
+        "--dut-elf".to_string(),
+        dut_elf.to_str().unwrap_or_default().to_string(),
+        "--profile".to_string(),
+        profile.to_string(),
+        "--firmware-row".to_string(),
+        fw.name.to_string(),
+    ];
+    if dut.uf2_family.is_some() {
+        let dut_uf2 = PathBuf::from(format!("{}.uf2", dut_elf.display()));
+        hil_args.push("--dut-uf2".to_string());
+        hil_args.push(dut_uf2.to_str().unwrap_or_default().to_string());
+    }
+    hil_args.extend(args.harness_args());
+    let ok = Command::new("cargo")
+        .args(hil_args)
+        .current_dir(root().join("tests/daplink-test"))
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    ok && emit_uf2(fw)
+    exit_code(ok)
 }
 
-/// For a row that names a uf2 family, write the uf2-encoded flash image beside the built ELF;
-/// a no-op for every other row.
-fn emit_uf2(fw: &Firmware) -> bool {
-    let Some(family) = fw.uf2_family else {
-        return true;
-    };
-    let elf_path = root().join(fw.elf());
-    let elf_bytes = match std::fs::read(&elf_path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{}: could not read {}: {e}", fw.name, elf_path.display());
-            return false;
-        }
-    };
-    let (base, image) = match elf::flash_image(&elf_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{}: could not extract flash image: {e}", fw.name);
-            return false;
-        }
-    };
-    let uf2 = daplink_decoder::encode::bin_to_uf2(&image, base, family);
-    let uf2_path = PathBuf::from(format!("{}.uf2", elf_path.display()));
-    if let Err(e) = std::fs::write(&uf2_path, &uf2) {
-        eprintln!("{}: could not write {}: {e}", fw.name, uf2_path.display());
-        return false;
-    }
-    println!(
-        "wrote {} ({} bytes, {} blocks)",
-        uf2_path.display(),
-        uf2.len(),
-        uf2.len() / 512
-    );
-    true
-}
-
-/// Compile one generated feature shape for its row's target. `check` is the default: what the
-/// matrix asks is whether the combination compiles, and every shape of a crate shares one
-/// directory, so the cost is one dependency graph per crate rather than one per shape. `link`
-/// runs the full build instead, which is the only way a section overflow or a symbol collision
-/// in a shape nobody flashes is reached.
-fn check_shape(shape: &matrix::Shape, link: bool) -> bool {
-    let fw = shape.base;
-    println!("checking {} for {}", shape.label(), fw.target);
-    let mut cmd = Command::new("cargo");
-    cmd.args([if link { "build" } else { "check" }, "--release"]);
-    cmd.args(["--target", fw.target]);
-    cmd.arg("--target-dir")
-        .arg(root().join("target/matrix").join(fw.path));
-    if shape.no_default_features {
-        cmd.arg("--no-default-features");
-    }
-    if !shape.features.is_empty() {
-        cmd.args(["--features", &shape.features.join(",")]);
-    }
-    revision::stamp(&mut cmd, &root());
-    cmd.current_dir(root().join(fw.path))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Build every registry row, then compile-check every shape the matrix generates on top of them.
-/// Returns whether all of it passed; a failure does not stop the rest.
-fn build_all() -> bool {
-    let mut ok = true;
-    for fw in registry::FIRMWARE {
-        let built = build(fw);
-        ok &= built;
-        println!("{:<40} {}", fw.name, if built { "ok" } else { "FAILED" });
-    }
-    for shape in matrix::shapes(&root()) {
-        let checked = check_shape(&shape, false);
-        ok &= checked;
-        println!(
-            "{:<40} {}",
-            shape.label(),
-            if checked { "ok" } else { "FAILED" }
-        );
-    }
-    ok
-}
-
-/// Allow-by-default lint every row denies on top of `-D warnings`: a side-effecting call inside
-/// `debug_assert!` is dropped entirely in release, so the statement ships as dead code.
-const EXTRA_LINTS: &str = "clippy::debug_assert_with_mut_call";
-
-/// Run one check (`fmt`, `clippy`, or `test`) for a workspace row, in its own directory. Prints
-/// a single status line and returns whether it passed.
-fn check(ws: &Workspace, label: &str, mut cmd: Command) -> bool {
-    // One directory for all rows: they run sequentially, so nothing contends, and they share one
-    // dependency graph instead of building it per row. Set through the environment rather than
-    // `--target-dir`, which `cargo fmt` rejects outright and which lands after the `--` of a
-    // clippy row and reaches rustc instead of cargo. An explicit `CARGO_TARGET_DIR` still wins.
-    if std::env::var_os("CARGO_TARGET_DIR").is_none() {
-        cmd.env("CARGO_TARGET_DIR", root().join("target/workspace"));
-    }
-    let ok = cmd
-        .current_dir(root().join(ws.path))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    println!(
-        "{:<24} {:<8} {}",
-        ws.name,
-        label,
-        if ok { "ok" } else { "FAILED" }
-    );
-    ok
-}
-
-/// The triple `cargo` builds for by default here, from `rustc -vV`.
-fn host_triple() -> Option<String> {
-    let out = Command::new("rustc").arg("-vV").output().ok()?;
-    String::from_utf8(out.stdout)
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("host: "))
-        .map(str::to_string)
-}
-
-/// The `--target` a host row needs. A crate that pins an embedded target in its own
-/// `.cargo/config.toml` would otherwise cross-compile the test harness instead of running it, and
-/// only an explicit `--target` on the invocation outranks that pin.
-fn host_target(ws: &Workspace) -> Option<String> {
-    let cfg = std::fs::read_to_string(root().join(ws.path).join(".cargo/config.toml")).ok()?;
-    if !cfg.lines().any(|l| l.starts_with("target = ")) {
-        return None;
-    }
-    host_triple()
-}
-
-/// `fmt --check`, `clippy -D warnings`, then `test` for one row, returning the labels that
-/// failed; a failing check does not stop the others.
-fn test_workspace(ws: &Workspace) -> Vec<&'static str> {
-    let mut failed = Vec::new();
-    let host = host_target(ws);
-
-    let mut fmt = Command::new("cargo");
-    fmt.args(["fmt", "--check"]);
-    if !check(ws, "fmt", fmt) {
-        failed.push("fmt");
-    }
-
-    let mut clippy = Command::new("cargo");
-    clippy.args(["clippy", "--all-targets"]);
-    if !ws.features.is_empty() {
-        clippy.args(["--features", &ws.features.join(",")]);
-    }
-    if let Some(target) = &host {
-        clippy.args(["--target", target]);
-    }
-    clippy.args(["--", "-W", EXTRA_LINTS, "-D", "warnings"]);
-    if !check(ws, "clippy", clippy) {
-        failed.push("clippy");
-    }
-
-    let mut test = Command::new("cargo");
-    test.arg("test");
-    if !ws.features.is_empty() {
-        test.args(["--features", &ws.features.join(",")]);
-    }
-    if let Some(target) = &host {
-        test.args(["--target", target]);
-    }
-    if !check(ws, "test", test) {
-        failed.push("test");
-    }
-
-    failed
-}
-
-/// `fmt --check` then `clippy -D warnings` for an embedded row, built for the crate's own pinned
-/// target; there is no `test` crate there, so test targets are neither linted nor run.
-fn lint_workspace(ws: &Workspace) -> Vec<&'static str> {
-    let mut failed = Vec::new();
-
-    let mut fmt = Command::new("cargo");
-    fmt.args(["fmt", "--check"]);
-    if !check(ws, "fmt", fmt) {
-        failed.push("fmt");
-    }
-
-    let mut clippy = Command::new("cargo");
-    clippy.arg("clippy");
-    if !ws.features.is_empty() {
-        clippy.args(["--features", &ws.features.join(",")]);
-    }
-    clippy.args(["--", "-W", EXTRA_LINTS, "-D", "warnings"]);
-    revision::stamp(&mut clippy, &root());
-    if !check(ws, "clippy", clippy) {
-        failed.push("clippy");
-    }
-
-    failed
-}
-
-fn probe_rs(args: &[&str]) -> bool {
-    Command::new("probe-rs")
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn probe_rs_owned(args: &[String]) -> bool {
-    Command::new("probe-rs")
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// 32-bit words per `probe-rs write` invocation in the [`zero_via_write_loop`] fallback --
-/// enough to make real progress without stretching the command line unreasonably.
-const ZERO_CHUNK_WORDS: u32 = 64;
-
-/// Zero `size` bytes at `addr` through a bounded loop of `probe-rs write` calls (RAM-only, but
-/// works on a target whose `download` command refuses a `--base-address` outside flash).
-fn zero_via_write_loop(fw: &Firmware, probe: &str, addr: u32, size: u32) -> bool {
-    let base = ["write", "b32", "--chip", fw.chip, "--probe", probe].map(String::from);
-    let whole_words = size / 4;
-    let mut word = 0;
-    while word < whole_words {
-        let n = ZERO_CHUNK_WORDS.min(whole_words - word);
-        let mut args = base.to_vec();
-        args.push(format!("{:#x}", addr + word * 4));
-        args.extend(std::iter::repeat_n("0".to_string(), n as usize));
-        if !probe_rs_owned(&args) {
-            return false;
-        }
-        word += n;
-    }
-    let tail = size % 4;
-    if tail > 0 {
-        let mut args: Vec<String> = ["write", "b8", "--chip", fw.chip, "--probe", probe]
-            .map(String::from)
-            .to_vec();
-        args.push(format!("{:#x}", addr + whole_words * 4));
-        args.extend(std::iter::repeat_n("0".to_string(), tail as usize));
-        if !probe_rs_owned(&args) {
-            return false;
+fn pins() -> ExitCode {
+    let mismatched = dep_pins::check(&root());
+    for group in dep_pins::GROUPS {
+        for path in group.manifests {
+            let manifest = root().join(path).join("Cargo.toml");
+            let pin = dep_pins::pin(&manifest, group.dep);
+            let rendered = match &pin {
+                Ok(Some(identity)) => identity.to_string(),
+                Ok(None) => "absent".to_string(),
+                Err(error) => format!("ERROR: {error}"),
+            };
+            println!("{:<40} {:<12} {}", path, group.dep, rendered);
         }
     }
-    true
-}
-
-/// Zero the built ELF's `.uninit` region, so a reset-surviving RAM region boots clean; an absent
-/// section is fine, and a target refusing a RAM `--base-address` falls back to a write loop.
-fn zero_uninit(fw: &Firmware, elf: &Path, probe: &str) -> bool {
-    let bytes = match std::fs::read(elf) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{}: could not read {}: {e}", fw.name, elf.display());
-            return false;
-        }
-    };
-    let (addr, size) = match elf::uninit_range(&bytes) {
-        Ok(Some(range)) => range,
-        Ok(None) => return true,
-        Err(e) => {
-            eprintln!("{}: could not read .uninit section: {e}", fw.name);
-            return false;
-        }
-    };
-    println!("zeroing .uninit @{addr:#010x}+{size:#x}");
-
-    let zeros_path =
-        std::env::temp_dir().join(format!("xtask-uninit-zero-{}.bin", std::process::id()));
-    if let Err(e) = std::fs::write(&zeros_path, vec![0u8; size as usize]) {
-        eprintln!("{}: could not write zero-fill scratch file: {e}", fw.name);
-        return false;
+    for line in &mismatched {
+        println!("MISMATCH: {line}");
     }
-    let downloaded = probe_rs(&[
-        "download",
-        "--binary-format",
-        "bin",
-        "--base-address",
-        &format!("{addr:#x}"),
-        "--chip",
-        fw.chip,
-        "--probe",
-        probe,
-        zeros_path.to_str().unwrap_or_default(),
-    ]);
-    let _ = std::fs::remove_file(&zeros_path);
-
-    downloaded || zero_via_write_loop(fw, probe, addr, size)
-}
-
-/// Flash a built row over the transport `probe` selects, zero its `.uninit` RAM, then reset it;
-/// `--preverify` skips flashing content already byte-identical.
-fn flash(fw: &Firmware, probe: &str) -> bool {
-    let elf = root().join(fw.elf());
-    println!("flashing {} ({})", fw.name, fw.chip);
-    probe_rs(&[
-        "download",
-        "--preverify",
-        "--chip",
-        fw.chip,
-        "--probe",
-        probe,
-        elf.to_str().unwrap_or_default(),
-    ]) && zero_uninit(fw, &elf, probe)
-        && probe_rs(&["reset", "--chip", fw.chip, "--probe", probe])
-}
-
-/// Flash a built row by its `bootloader` disposition, then leave the PUT enumerated under its
-/// own identity: `via` is the transport, `put` the flashed board's own USB selector. A DUT image
-/// has no USB role of its own and passes `None`.
-fn install(
-    fw: &Firmware,
-    via: Option<&str>,
-    put: Option<&usb::Selector>,
-    bootsel_mount: Option<&Path>,
-) -> bool {
-    let flashed = match fw.bootloader {
-        Bootloader::Probe => flash(fw, via.expect("a probe row without --via is rejected")),
-        Bootloader::BootselUf2 => {
-            let elf = root().join(fw.elf());
-            let uf2 = PathBuf::from(format!("{}.uf2", elf.display()));
-            bootsel::flash_bootsel(
-                &uf2,
-                put.expect("a bootsel row without --probe is rejected"),
-                bootsel_mount,
-            )
-        }
-    };
-    if !flashed {
-        return false;
-    }
-    let Some(put) = put else {
-        return true;
-    };
-    // Without a re-attach the host keeps the pre-flash descriptors, and an interface the new
-    // image gained would be absent -- which a capability case reads as firmware that does not
-    // compose it.
-    if fw.bootloader == Bootloader::Probe
-        && reattach::applies(fw.chip)
-        && !reattach::run(fw, via.expect("a probe row without --via is rejected"), put)
-    {
-        return false;
-    }
-    wait_for_put(put)
-}
-
-/// The flashed board's own USB identity, for the rows that have one. A DUT image is not on the
-/// bus at all, so `None` there is right; a PUT without one cannot be followed across the reflash
-/// and is refused rather than slept through.
-/// `flag` differs per verb: `flash` names the board `--put` and keeps `--probe` for the
-/// transport, as probe-rs does; `hil` has always named the board `--probe`.
-fn put_selector(
-    fw: &Firmware,
-    spec: Option<&str>,
-    flag: &str,
-) -> Result<Option<usb::Selector>, String> {
-    match (spec, fw.profile) {
-        (Some(spec), _) => usb::parse_selector(spec).map(Some),
-        (None, None) => Ok(None),
-        (None, Some(_)) => Err(format!(
-            "firmware `{}` is a probe under test; pass {flag} <vid:pid:serial> so the reflash \
-             can be followed on the bus",
-            fw.name
-        )),
-    }
-}
-
-/// How long the reflashed PUT must hold its place on the bus before the harness may open it.
-const PUT_SETTLE: Duration = Duration::from_millis(750);
-/// How long to wait for it to get there. The enumeration delay is the host's and varies.
-const PUT_REENUM_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Wait for the reflashed PUT to be back on the bus under its own serial. A fixed sleep either
-/// runs long or loses the race, and losing it reports a probe that is merely late as absent.
-fn wait_for_put(sel: &usb::Selector) -> bool {
-    println!("waiting for the PUT to settle on the bus: {sel}");
-    if usb::wait_settled(sel, PUT_SETTLE, PUT_REENUM_TIMEOUT) {
-        return true;
-    }
-    eprintln!("PUT {sel} did not settle on the bus within {PUT_REENUM_TIMEOUT:?}");
-    false
+    exit_code(mismatched.is_empty())
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("list") => {
-            for fw in registry::FIRMWARE {
-                println!("{:<40} {:<21} {}", fw.name, fw.target, fw.chip);
-            }
-            for shape in matrix::shapes(&root()) {
-                println!(
-                    "shape  {:<33} {:<21} {}",
-                    shape.label(),
-                    shape.base.target,
-                    shape.features.join(",")
-                );
-            }
-            for t in registry::TARGETS {
-                let dut_chip = registry::FIRMWARE
-                    .iter()
-                    .find(|f| f.name == t.dut)
-                    .map(|f| f.chip)
-                    .unwrap_or("?");
-                println!("target {:<33} {:<21} {}", t.name, dut_chip, t.dut);
-            }
-            for ws in workspaces::WORKSPACES {
-                let features = ws.features.join(",");
-                println!("workspace {:<27} {:<21} {}", ws.name, ws.path, features);
-            }
-            for ws in workspaces::EMBEDDED {
-                println!("embedded  {:<27} {}", ws.name, ws.path);
-            }
-            for ex in workspaces::EXCLUDED {
-                println!("excluded  {:<27} {}", ex.path, ex.reason);
-            }
-            ExitCode::SUCCESS
-        }
-        Some("build") => {
-            let Some(name) = args.get(1) else {
-                let mut ok = true;
-                for fw in registry::FIRMWARE.iter().filter(|f| f.name == f.path) {
-                    if !build(fw) {
-                        println!("{:<40} FAILED", fw.name);
-                        ok = false;
-                    }
-                }
-                return if ok {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                };
-            };
-            let Some(fw) = find_firmware(name) else {
-                unknown_firmware(name);
-                return ExitCode::FAILURE;
-            };
-            if build(fw) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Some("flash") => {
-            let usage = || {
-                eprintln!(
-                    "usage: cargo xtask flash <name> [--probe <transport-sel>] \
-                     [--put <vid:pid:serial>] [--bootsel-mount <path>]"
-                );
-                ExitCode::FAILURE
-            };
-            let Some(name) = args.get(1) else {
-                return usage();
-            };
-            let (mut via, mut put, mut bootsel_mount) = (None, None, None);
-            let mut it = args[2..].iter();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    // The transport, as `--probe` means for probe-rs, which this verb wraps.
-                    "--probe" => via = it.next(),
-                    "--put" => put = it.next(),
-                    "--bootsel-mount" => bootsel_mount = it.next(),
-                    _ => return usage(),
-                }
-            }
-            let Some(fw) = find_firmware(name) else {
-                unknown_firmware(name);
-                return ExitCode::FAILURE;
-            };
-            if fw.bootloader == Bootloader::Probe && via.is_none() {
-                eprintln!("firmware `{name}` flashes over a probe transport; pass --probe <sel>");
-                return usage();
-            }
-            let put_sel = match put_selector(fw, put.map(String::as_str), "--put") {
-                Ok(sel) => sel,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let mount = bootsel_mount.map(PathBuf::from);
-            if build(fw)
-                && install(
-                    fw,
-                    via.map(String::as_str),
-                    put_sel.as_ref(),
-                    mount.as_deref(),
-                )
-            {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Some("hil") => {
-            let usage = || {
-                eprintln!(
-                    "usage: cargo xtask hil <name> [--via <transport-sel>] --probe <put-sel> \
-                     --target <name> [--bootsel-mount <path>]"
-                );
-                ExitCode::FAILURE
-            };
-            let Some(name) = args.get(1) else {
-                return usage();
-            };
-            let (mut via, mut put, mut target, mut bootsel_mount) = (None, None, None, None);
-            let mut it = args[2..].iter();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--via" => via = it.next(),
-                    "--probe" => put = it.next(),
-                    "--target" => target = it.next(),
-                    "--bootsel-mount" => bootsel_mount = it.next(),
-                    _ => return usage(),
-                }
-            }
-            let (Some(put), Some(target)) = (put, target) else {
-                return usage();
-            };
-            let Some(fw) = find_firmware(name) else {
-                unknown_firmware(name);
-                return ExitCode::FAILURE;
-            };
-            if fw.bootloader == Bootloader::Probe && via.is_none() {
-                eprintln!("firmware `{name}` flashes over a probe transport; pass --via <sel>");
-                return usage();
-            }
-            let Some(tgt) = registry::TARGETS.iter().find(|t| t.name == target) else {
-                eprintln!("unknown target `{target}`; `cargo xtask list` names them");
-                return ExitCode::FAILURE;
-            };
-            let Some(dut) = registry::FIRMWARE.iter().find(|f| f.name == tgt.dut) else {
-                eprintln!("target `{target}` names an unregistered DUT `{}`", tgt.dut);
-                return ExitCode::FAILURE;
-            };
-            let Some(profile) = fw.profile else {
-                eprintln!(
-                    "firmware `{name}` is a DUT image with no rig profile; it cannot be a PUT"
-                );
-                return ExitCode::FAILURE;
-            };
-            let put_sel = match put_selector(fw, Some(put.as_str()), "--probe") {
-                Ok(sel) => sel,
-                Err(e) => {
-                    eprintln!("cannot follow the PUT on the bus: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            if !(build(fw) && build(dut)) {
-                return ExitCode::FAILURE;
-            }
-            let mount = bootsel_mount.map(PathBuf::from);
-            if !install(
-                fw,
-                via.map(String::as_str),
-                put_sel.as_ref(),
-                mount.as_deref(),
-            ) {
-                return ExitCode::FAILURE;
-            }
-            let dut_elf = root().join(dut.elf());
-            let mut hil_args = vec![
-                "run".to_string(),
-                "--quiet".to_string(),
-                "--".to_string(),
-                "--probe".to_string(),
-                put.clone(),
-                "--target".to_string(),
-                tgt.name.to_string(),
-                "--dut-elf".to_string(),
-                dut_elf.to_str().unwrap_or_default().to_string(),
-                "--profile".to_string(),
-                profile.to_string(),
-            ];
-            if dut.uf2_family.is_some() {
-                let dut_uf2 = PathBuf::from(format!("{}.uf2", dut_elf.display()));
-                hil_args.push("--dut-uf2".to_string());
-                hil_args.push(dut_uf2.to_str().unwrap_or_default().to_string());
-            }
-            let ok = Command::new("cargo")
-                .args(hil_args)
-                .current_dir(root().join("tests/daplink-test"))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Some("build-all") => {
-            if build_all() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Some("matrix") => {
-            let link = args.get(1).map(String::as_str) == Some("--link");
-            let mut ok = true;
-            for shape in matrix::shapes(&root()) {
-                let checked = check_shape(&shape, link);
-                ok &= checked;
-                println!(
-                    "{:<40} {}",
-                    shape.label(),
-                    if checked { "ok" } else { "FAILED" }
-                );
-            }
-            for i in matrix::INCOMPATIBLE {
-                println!(
-                    "{:<40} skipped: {}",
-                    format!("{} +{}", i.path, i.added.join(",")),
-                    i.reason
-                );
-            }
-            for u in matrix::UNREACHED {
-                println!(
-                    "{:<40} unreached: {}",
-                    format!("{} {}", u.path, u.feature),
-                    u.reason
-                );
-            }
-            for (path, feat) in matrix::unreached(&root()) {
-                println!("{:<40} compiled by nothing", format!("{path} {feat}"));
-                ok = false;
-            }
-            if ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Some("test") => {
-            let with_build = args.get(1).map(String::as_str) == Some("--build");
-            let mut failures: Vec<(&str, &str)> = Vec::new();
-            for ws in workspaces::WORKSPACES {
-                for label in test_workspace(ws) {
-                    failures.push((ws.name, label));
-                }
-            }
-            for ws in workspaces::EMBEDDED {
-                for label in lint_workspace(ws) {
-                    failures.push((ws.name, label));
-                }
-            }
-            let mut build_failed = false;
-            if with_build {
-                println!("--- build-all ---");
-                build_failed = !build_all();
-            }
-            println!("--- summary ---");
-            if failures.is_empty() && !build_failed {
-                println!(
-                    "all {} workspaces clean",
-                    workspaces::WORKSPACES.len() + workspaces::EMBEDDED.len()
-                );
-                ExitCode::SUCCESS
-            } else {
-                for (name, label) in &failures {
-                    println!("FAILED: {name} {label}");
-                }
-                if build_failed {
-                    println!("FAILED: build-all");
-                }
-                ExitCode::FAILURE
-            }
-        }
-        _ => {
-            eprintln!(
-                "usage: cargo xtask <list | build [<name>] | build-all | \
-                 matrix [--link] | test [--build] | \
-                 flash <name> --probe <sel> [--put <sel>] | \
-                 hil <name> --via <sel> --probe <sel> --target <name>>"
-            );
-            ExitCode::FAILURE
-        }
+    let cli = Cli::parse();
+    if let Err(error) = tree::checked() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+    match cli.verb {
+        Verb::List => list(&mut std::io::stdout().lock()),
+        Verb::Build { name } => build_verb(name.as_deref()),
+        Verb::BuildAll => exit_code(gate::build_all()),
+        Verb::Matrix { link } => gate::matrix(link),
+        Verb::Pins => pins(),
+        Verb::Test { build } => gate::test(build),
+        Verb::Flash(args) => flash(&args),
+        Verb::Hil(args) => hil(&args),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{find_firmware, put_selector};
-    use crate::registry;
-    use crate::workspaces;
-    use daplink_decoder::{detect_format, Decoder, DecoderContext, Error, Format, Uf2Decoder};
-    use std::path::Path;
+    use super::{list, write_columns, Cli, HilArgs, Verb};
+    use clap::{CommandFactory, Parser};
+    use std::io::{self, Write};
+    use std::process::ExitCode;
 
-    /// Crate directories under `dir` (relative to `rust/`), skipping build-artifact trees.
-    fn crate_dirs(dir: &Path, rel: &str, out: &mut Vec<String>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            if path.is_dir() {
-                if name == "target" || name.starts_with('.') {
-                    continue;
-                }
-                let rel = if rel.is_empty() {
-                    name
-                } else {
-                    format!("{rel}/{name}")
-                };
-                crate_dirs(&path, &rel, out);
-            } else if name == "Cargo.toml" {
-                out.push(if rel.is_empty() {
-                    ".".to_string()
-                } else {
-                    rel.to_string()
-                });
-            }
+    /// A reader that has gone away.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
         }
     }
 
-    /// Whether a registry entry (exact path, or a `<prefix>/*` glob) names this crate directory.
-    fn covers(entry: &str, dir: &str) -> bool {
-        match entry.strip_suffix("/*") {
-            Some(prefix) => dir.strip_prefix(prefix).is_some_and(|r| r.starts_with('/')),
-            None => entry == dir,
-        }
-    }
-
-    /// Every crate in the tree must hold a place in exactly one of the gate's lists, so a new
-    /// directory cannot land unreached by every check without failing here.
     #[test]
-    fn every_crate_is_named_by_the_gate_registry() {
-        let mut dirs = Vec::new();
-        crate_dirs(&crate::root(), "", &mut dirs);
-        dirs.sort();
-        assert!(dirs.len() > 30, "the walk found too few crates: {dirs:?}");
-        let entries: Vec<&str> = workspaces::WORKSPACES
-            .iter()
-            .chain(workspaces::EMBEDDED)
-            .map(|ws| ws.path)
-            .chain(workspaces::EXCLUDED.iter().map(|ex| ex.path))
-            .collect();
-        for dir in &dirs {
-            // `xtask` is the root workspace's only member and is gated through its row.
-            let dir = if dir == "xtask" { "." } else { dir };
-            let named: Vec<&&str> = entries.iter().filter(|e| covers(e, dir)).collect();
-            assert_eq!(
-                named.len(),
-                1,
-                "`{dir}` must be named by exactly one gate list, found {named:?}"
-            );
-        }
-        for entry in &entries {
-            let listed = entry.strip_suffix("/*").unwrap_or(entry);
-            assert!(
-                dirs.iter()
-                    .any(|d| covers(entry, d) || listed == d || *entry == "."),
-                "`{entry}` names no crate in the tree"
-            );
-        }
+    fn list_ends_cleanly_when_its_reader_closes() {
+        assert_eq!(list(&mut Closed), ExitCode::SUCCESS);
     }
 
-    /// Reassembles decoded fragments into a flat image starting at `base`, so the test can
-    /// check the payload landed back exactly where and as it started.
-    struct Rebuild {
-        base: u32,
-        image: Vec<u8>,
-        family: Option<u32>,
-    }
-
-    impl DecoderContext for Rebuild {
-        fn write_fragment(&mut self, addr: u32, data: &[u8]) -> Result<(), Error> {
-            let off = (addr - self.base) as usize;
-            if self.image.len() < off + data.len() {
-                self.image.resize(off + data.len(), 0);
-            }
-            self.image[off..off + data.len()].copy_from_slice(data);
-            Ok(())
-        }
-
-        fn set_uf2_family(&mut self, family: Option<u32>) {
-            self.family = family;
-        }
-    }
-
-    /// What `emit_uf2` writes must detect as uf2 and decode back to the exact image, base and
-    /// family id, which is what a flash case checks against the real files.
     #[test]
-    fn uf2_round_trips_through_daplink_decoder() {
-        let base = 0x1000_0000u32;
-        let bin: Vec<u8> = (0..2500u32).map(|i| (i * 31) as u8).collect();
-        let family = registry::UF2_FAMILY_RP2040;
+    fn the_widest_cell_sets_its_column() {
+        let rows = [
+            ["a".into(), "bb".into(), "c".into()],
+            ["aaaa".into(), "b".into(), String::new()],
+        ];
+        let mut out = Vec::new();
+        write_columns(&mut out, &rows).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "a    bb c\naaaa b\n");
+    }
 
-        let uf2 = daplink_decoder::encode::bin_to_uf2(&bin, base, family);
-        assert_eq!(uf2.len() % 512, 0);
-        assert_eq!(uf2.len() / 512, bin.len().div_ceil(256));
+    fn parse(args: &[&str]) -> Result<Verb, clap::Error> {
+        let argv = std::iter::once(&"cargo xtask").chain(args);
+        Cli::try_parse_from(argv).map(|cli| cli.verb)
+    }
 
-        assert_eq!(detect_format(None, &uf2), Format::Uf2);
-        assert_eq!(detect_format(Some("test-rp2040.uf2"), &[]), Format::Uf2);
+    fn parse_hil(args: &[&str]) -> HilArgs {
+        match parse(args).expect("valid options parse") {
+            Verb::Hil(hil) => hil,
+            _ => panic!("not hil"),
+        }
+    }
 
-        let mut dec = Uf2Decoder::new(None);
-        let mut sp = [0u8; 512];
-        let mut ctx = Rebuild {
-            base,
-            image: Vec::new(),
-            family: None,
+    #[test]
+    fn the_command_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    const HIL: [&str; 6] = ["hil", "fw", "--put", "P", "--target", "t"];
+
+    /// Harness options come before the cases, which keep the order given.
+    #[test]
+    fn hil_forwards_speed_options_and_cases_to_the_harness() {
+        let mut args = HIL.to_vec();
+        args.extend([
+            "--case",
+            "connect",
+            "--speed-access",
+            "4,64",
+            "--speed-extended",
+            "--case",
+            "vcom",
+            "--speed-access",
+            "508",
+        ]);
+        assert_eq!(
+            parse_hil(&args).harness_args(),
+            [
+                "--speed-extended",
+                "--speed-access",
+                "4,64",
+                "--speed-access",
+                "508",
+                "connect",
+                "vcom",
+            ]
+        );
+        assert!(parse_hil(&HIL).harness_args().is_empty());
+    }
+
+    #[test]
+    fn hil_needs_the_put_and_the_target() {
+        assert!(parse(&["hil", "fw", "--target", "t"]).is_err());
+        assert!(parse(&["hil", "fw", "--put", "P"]).is_err());
+        assert!(parse(&["hil", "--put", "P", "--target", "t"]).is_err());
+    }
+
+    #[test]
+    fn no_put_flash_defaults_off() {
+        assert!(!parse_hil(&HIL).no_put_flash);
+        let mut args = HIL.to_vec();
+        args.push("--no-put-flash");
+        assert!(parse_hil(&args).no_put_flash);
+    }
+
+    /// `--via` and `--put` mean the same in both verbs; `--probe` keeps each verb's older meaning.
+    #[test]
+    fn both_verbs_name_the_transport_and_the_put_alike() {
+        let Verb::Flash(flash) = parse(&["flash", "fw", "--probe", "T", "--put", "P"]).unwrap()
+        else {
+            panic!("not flash");
         };
-        dec.input(&uf2, &mut sp, &mut ctx).unwrap();
-        dec.finish(&mut sp, &mut ctx).unwrap();
-
-        assert_eq!(ctx.family, Some(family));
-        assert!(ctx.image.len() >= bin.len());
-        assert_eq!(&ctx.image[..bin.len()], &bin[..]);
+        assert_eq!(flash.via.as_deref(), Some("T"));
+        assert_eq!(flash.put.as_deref(), Some("P"));
+        let hil = parse_hil(&["hil", "fw", "--via", "T", "--probe", "P", "--target", "t"]);
+        assert_eq!(hil.via.as_deref(), Some("T"));
+        assert_eq!(hil.put, "P");
     }
 
-    /// Two rows sharing a build directory would evict each other's output every time the gate
-    /// alternated between them.
+    /// A flag given twice, under either spelling, or missing its value, is a usage error.
     #[test]
-    fn every_row_builds_in_its_own_directory() {
-        let mut seen = std::collections::BTreeSet::new();
-        for fw in registry::FIRMWARE {
-            assert!(
-                seen.insert(fw.target_dir()),
-                "{} shares a target dir",
-                fw.name
-            );
+    fn a_repeated_or_valueless_option_is_refused() {
+        assert!(parse(&["flash", "fw", "--probe", "A", "--via", "B"]).is_err());
+        assert!(parse(&["hil", "fw", "--target", "t", "--probe", "A", "--put", "B"]).is_err());
+        assert!(parse(&["flash", "fw", "--put"]).is_err());
+        let mut args = HIL.to_vec();
+        args.extend(["--no-put-flash", "--no-put-flash"]);
+        assert!(parse(&args).is_err());
+        let mut args = HIL.to_vec();
+        args.push("--case");
+        assert!(parse(&args).is_err());
+    }
+
+    #[test]
+    fn flash_refuses_hil_only_options() {
+        for opt in [
+            &["--target", "rp2040"][..],
+            &["--speed-extended"],
+            &["--speed-access", "4"],
+            &["--case", "vcom"],
+            &["--no-put-flash"],
+        ] {
+            let mut args = vec!["flash", "fw"];
+            args.extend(opt);
+            assert!(parse(&args).is_err(), "{opt:?}");
         }
     }
 
-    /// A PUT reflash that cannot be followed on the bus is refused, not slept through; a DUT
-    /// image has no USB identity to follow in the first place.
     #[test]
-    fn only_a_put_row_demands_its_own_selector() {
-        let put = find_firmware("firmware/rp2040-pico-rtic").expect("a registered PUT row");
-        let dut = find_firmware("tests/firmwares/test-rp2040").expect("a registered DUT row");
-        assert!(put_selector(put, None, "--put").is_err());
-        assert!(put_selector(dut, None, "--put")
-            .expect("a DUT needs none")
-            .is_none());
-        assert!(put_selector(put, Some("0d28:0204:SERIAL"), "--put")
-            .expect("a full selector parses")
-            .is_some());
-        // probe-rs accepts a serial-less selector; the bus wait cannot use one.
-        assert!(put_selector(put, Some("0d28:0204"), "--put").is_err());
+    fn a_verb_refuses_arguments_it_does_not_take() {
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["list", "extra"]).is_err());
+        assert!(parse(&["test", "--link"]).is_err());
+        assert!(matches!(
+            parse(&["matrix", "--link"]),
+            Ok(Verb::Matrix { link: true })
+        ));
+        assert!(matches!(
+            parse(&["test", "--build"]),
+            Ok(Verb::Test { build: true })
+        ));
     }
 }

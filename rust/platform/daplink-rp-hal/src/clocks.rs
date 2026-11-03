@@ -1,44 +1,36 @@
 //! Clock and USB-bus construction helpers for RP2040 firmware.
 
-#[cfg(not(feature = "clock-200mhz"))]
+use crate::UsbBus;
 use rp2040_hal::clocks::init_clocks_and_plls;
 use rp2040_hal::clocks::ClocksManager;
-#[cfg(feature = "clock-200mhz")]
 use rp2040_hal::fugit::RateExtU32;
 use rp2040_hal::pac::{
     CLOCKS, PLL_SYS, PLL_USB, RESETS, USBCTRL_DPRAM, USBCTRL_REGS, VREG_AND_CHIP_RESET, XOSC,
 };
-#[cfg(feature = "clock-200mhz")]
 use rp2040_hal::pll::{common_configs::PLL_USB_48MHZ, setup_pll_blocking, PLLConfig};
-use rp2040_hal::usb::UsbBus;
 use rp2040_hal::watchdog::Watchdog;
-#[cfg(feature = "clock-200mhz")]
 use rp2040_hal::xosc::setup_xosc_blocking;
 use usb_device::bus::UsbBusAllocator;
 
-/// Crystal oscillator frequency on RP2040 boards (12 MHz).
 pub const XOSC_HZ: u32 = 12_000_000;
 
-/// Bring the clock tree up (system PLL 125 MHz, USB PLL 48 MHz) from the crystal.
-///
-/// # Panics
-/// Panics if the PLL configuration fails; it is fixed and valid, so that is a hardware fault.
-#[cfg(not(feature = "clock-200mhz"))]
-pub fn clocks(
-    xosc: XOSC,
-    clocks: CLOCKS,
-    pll_sys: PLL_SYS,
-    pll_usb: PLL_USB,
-    _vreg: VREG_AND_CHIP_RESET,
-    resets: &mut RESETS,
-    watchdog: &mut Watchdog,
-) -> ClocksManager {
-    init_clocks_and_plls(XOSC_HZ, xosc, clocks, pll_sys, pll_usb, resets, watchdog)
-        .expect("the RP2040 clock/PLL configuration is valid")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockProfile(u32);
+
+impl ClockProfile {
+    pub const DEFAULT: Self = Self(125_000_000);
+    pub const MHZ_200: Self = Self(200_000_000);
+
+    pub const fn cpu_hz(self) -> u32 {
+        self.0
+    }
 }
 
-#[cfg(feature = "clock-200mhz")]
+/// Bring the clock tree up (system PLL 125 MHz, USB PLL 48 MHz) from the crystal.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub fn clocks(
+    profile: ClockProfile,
     xosc: XOSC,
     clocks: CLOCKS,
     pll_sys: PLL_SYS,
@@ -47,9 +39,14 @@ pub fn clocks(
     resets: &mut RESETS,
     watchdog: &mut Watchdog,
 ) -> ClocksManager {
+    if profile == ClockProfile::DEFAULT {
+        return init_clocks_and_plls(XOSC_HZ, xosc, clocks, pll_sys, pll_usb, resets, watchdog)
+            .expect("the RP2040 clock/PLL configuration is valid");
+    }
     let xosc = setup_xosc_blocking(xosc, XOSC_HZ.Hz()).expect("the crystal configuration is valid");
     watchdog.enable_tick_generation((XOSC_HZ / 1_000_000) as u8);
 
+    // Raise and verify core voltage before switching to the faster system PLL.
     vreg.vreg().modify(|_, w| w.vsel().voltage1_15());
     cortex_m::asm::delay(200_000);
     while vreg.vreg().read().rok().bit_is_clear() {}
@@ -91,5 +88,7 @@ pub fn usb_bus(
     usb_clock: rp2040_hal::clocks::UsbClock,
     resets: &mut RESETS,
 ) -> UsbBusAllocator<UsbBus> {
-    UsbBusAllocator::new(UsbBus::new(regs, dpram, usb_clock, true, resets))
+    UsbBusAllocator::new(UsbBus::new(rp2040_hal::usb::UsbBus::new(
+        regs, dpram, usb_clock, true, resets,
+    )))
 }

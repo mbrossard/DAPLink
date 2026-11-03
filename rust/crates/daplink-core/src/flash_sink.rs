@@ -25,8 +25,7 @@ pub enum FlashPhase {
     Uninit,
 }
 
-/// One flash window paired with one RAM window of the same device, each half-open `[start, end)`.
-/// The pairing is the point: a stack pointer and a reset vector from two parts match neither.
+/// One flash window paired with one RAM window of the same device, each `[start, end)`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TargetWindows {
     /// A programmable flash window of the device.
@@ -35,8 +34,22 @@ pub struct TargetWindows {
     pub ram: (u32, u32),
 }
 
-/// Sink that programs decoded image bytes into target flash: `begin` once, then `program` per
-/// in-range fragment, then `finish(success)` once.
+/// What one [`FlashBackend::step`] achieved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlashPoll {
+    /// Work remains until `wake_at_us`; one already passed means step again now.
+    Pending {
+        /// Absolute microsecond timestamp the caller should step the backend at.
+        wake_at_us: u64,
+    },
+    /// Nothing is outstanding.
+    Done,
+    /// The outstanding work failed in this phase.
+    Err(FlashPhase),
+}
+
+/// Programs decoded image bytes into target flash: `begin`, `program` per fragment, then `finish`.
+/// The stepped `*_start` and `program_chunk` forms default to those; `step` or `settle` drives the rest.
 pub trait FlashBackend {
     /// Begin a flashing session (init/erase as needed).
     fn begin(&mut self) -> Result<(), FlashPhase>;
@@ -50,15 +63,39 @@ pub trait FlashBackend {
     /// Program `data` at absolute `addr` (called only for in-range fragments).
     fn program(&mut self, addr: u32, data: &[u8]) -> Result<(), FlashPhase>;
 
+    /// Advance deferred work at caller-clock `now_us`; work per call is backend-defined. Default: done.
+    fn step(&mut self, now_us: u64) -> FlashPoll {
+        let _ = now_us;
+        FlashPoll::Done
+    }
+
+    /// Open a session driven by [`step`](Self::step); default [`begin_with_hint`](Self::begin_with_hint).
+    fn begin_start(&mut self, family: Option<u32>) -> Result<(), FlashPhase> {
+        self.begin_with_hint(family)
+    }
+
+    /// Accept a prefix of `data`; `0` means [`step`](Self::step) before retrying.
+    fn program_chunk(&mut self, addr: u32, data: &[u8]) -> Result<usize, FlashPhase> {
+        self.program(addr, data).map(|()| data.len())
+    }
+
+    /// Drive every deferred step to completion inline.
+    fn settle(&mut self) -> Result<(), FlashPhase> {
+        Ok(())
+    }
+
+    /// Open a teardown driven by [`step`](Self::step); default [`finish_with_reset`](Self::finish_with_reset).
+    fn finish_start(&mut self, success: bool, reset: bool) -> Result<(), FlashPhase> {
+        self.finish_with_reset(success, reset)
+    }
+
     /// Finish the session; `success = false` aborts.
     fn finish(&mut self, success: bool) -> Result<(), FlashPhase>;
 
-    /// Finish, additionally signaling whether a *successful* flash resets the target to run.
-    /// Required rather than defaulted, so a backend cannot drop the policy and still compile clean.
+    /// Finish with an explicit reset-to-run policy for success; abort retains the backend's policy.
     fn finish_with_reset(&mut self, success: bool, reset: bool) -> Result<(), FlashPhase>;
 
-    /// Select per-sector erase (`true`) or whole-chip erase (`false`) for sessions begun after
-    /// this call; mirrors the C firmware's `flash_manager_set_page_erase`.
+    /// Select per-sector (`true`) or whole-chip (`false`) erase for later sessions.
     fn set_sector_erase(&mut self, sector: bool) -> Result<(), FlashPhase> {
         // No capability: report the request as an erase-phase failure, never a silent success.
         let _ = sector;
@@ -67,15 +104,13 @@ pub trait FlashBackend {
 
     /// Mass-erase every programmable region, outside any image transfer.
     fn erase_all(&mut self) -> Result<(), FlashPhase> {
-        // No capability: report the request as an erase-phase failure, never a silent success.
         Err(FlashPhase::Erase)
     }
 
     /// Programmable `(start, end)` ranges used to range-check fragments.
     fn flash_ranges(&self) -> &[(u32, u32)];
 
-    /// The selected target's RAM `(start, end)` ranges, which an image's stack pointer is judged
-    /// against. Empty means "this backend cannot say", not "RAM is unconstrained".
+    /// The selected target's RAM `(start, end)` ranges; empty means unknown, not unconstrained.
     fn ram_ranges(&self) -> &[(u32, u32)] {
         &[]
     }
@@ -88,6 +123,21 @@ pub trait FlashBackend {
     /// The UF2 family id the selected target expects, or `None` if no cross-check applies.
     fn expected_uf2_family(&self) -> Option<u32> {
         None
+    }
+
+    /// Whether a block of `family` belongs to the open session's target.
+    fn accepts_uf2_family(&self, family: u32) -> bool {
+        self.expected_uf2_family().is_none_or(|e| e == family)
+    }
+
+    /// Whether a block of `family` could select a target, before a session opens.
+    fn can_select_uf2_family(&self, _family: u32) -> bool {
+        true
+    }
+
+    /// Whether every payload block must declare the selected target's UF2 family.
+    fn requires_uf2_family(&self) -> bool {
+        false
     }
 
     /// The name of the target the last/current session resolved.

@@ -7,13 +7,26 @@ pub const VENDOR_CMD_LAST: u8 = 0x9F;
 
 /// Handler for vendor-specific CMSIS-DAP commands.
 pub trait VendorHandler {
-    /// Whether this handler handles anything at all. [`NoVendor`] sets this `false` so the
-    /// vendor-routing branch compiles out entirely on probes without vendor commands.
+    /// Whether this handler handles anything; `false` compiles vendor routing out.
     const HANDLES: bool = true;
 
-    /// Handle one vendor command; `response[0]` is already the echoed id, so fill from `response[1]`
-    /// and return the TOTAL length (>= 1). `None` declines and falls through to the standard engine.
+    /// Handle one vendor command from `response[1]` on, returning the total length; `None` declines.
     fn handle(&mut self, report: &[u8], response: &mut [u8]) -> Option<usize>;
+
+    /// The host session ended: retire whatever it left open.
+    fn session_reset(&mut self) {}
+}
+
+impl<V: VendorHandler + ?Sized> VendorHandler for &mut V {
+    const HANDLES: bool = V::HANDLES;
+
+    fn handle(&mut self, report: &[u8], response: &mut [u8]) -> Option<usize> {
+        (**self).handle(report, response)
+    }
+
+    fn session_reset(&mut self) {
+        (**self).session_reset()
+    }
 }
 
 /// No vendor commands: everything falls through to the engine.
@@ -27,30 +40,30 @@ impl VendorHandler for NoVendor {
     }
 }
 
-/// Composes two [`VendorHandler`]s over disjoint command ids: `a` first, `b` only when `a` declines.
-/// A firmware nests these to fit several vendor commands into the engine's one vendor slot.
-pub struct VendorChain<A, B> {
-    a: A,
-    b: B,
+macro_rules! impl_vendor_tuple {
+    ($($handler:ident:$field:tt),+ $(,)?) => {
+        impl<$($handler: VendorHandler),+> VendorHandler for ($($handler,)+) {
+            const HANDLES: bool = false $(|| $handler::HANDLES)+;
+
+            fn handle(&mut self, report: &[u8], response: &mut [u8]) -> Option<usize> {
+                $(
+                    if let Some(len) = self.$field.handle(report, response) {
+                        return Some(len);
+                    }
+                )+
+                None
+            }
+
+            fn session_reset(&mut self) {
+                $(self.$field.session_reset();)+
+            }
+        }
+    };
 }
 
-impl<A, B> VendorChain<A, B> {
-    /// Chain `a` before `b`.
-    pub const fn new(a: A, b: B) -> Self {
-        Self { a, b }
-    }
-}
-
-impl<A: VendorHandler, B: VendorHandler> VendorHandler for VendorChain<A, B> {
-    // Compiles the routing branch out only when neither side handles anything.
-    const HANDLES: bool = A::HANDLES || B::HANDLES;
-
-    fn handle(&mut self, report: &[u8], response: &mut [u8]) -> Option<usize> {
-        self.a
-            .handle(report, response)
-            .or_else(|| self.b.handle(report, response))
-    }
-}
+impl_vendor_tuple!(A:0, B:1);
+impl_vendor_tuple!(A:0, B:1, C:2);
+impl_vendor_tuple!(A:0, B:1, C:2, D:3);
 
 #[cfg(test)]
 mod tests {
@@ -74,38 +87,55 @@ mod tests {
     }
 
     #[test]
-    fn first_handler_wins_when_it_answers() {
-        let mut chain =
-            VendorChain::new(Fixed { id: 0x9F, reply: 1 }, Fixed { id: 0x8A, reply: 2 });
+    fn tuple_dispatch_is_left_to_right() {
+        let mut handlers = (
+            Fixed { id: 0x9F, reply: 1 },
+            Fixed { id: 0x9F, reply: 2 },
+            Fixed { id: 0x8A, reply: 3 },
+        );
         let mut resp = [0u8; 4];
-        assert_eq!(chain.handle(&[0x9F], &mut resp), Some(2));
+        assert_eq!(handlers.handle(&[0x9F], &mut resp), Some(2));
         assert_eq!(resp[1], 1);
+        assert_eq!(handlers.handle(&[0x8A], &mut resp), Some(2));
+        assert_eq!(resp[1], 3);
+        assert_eq!(handlers.handle(&[0x00], &mut resp), None);
+    }
+
+    struct Resets(u32);
+
+    impl VendorHandler for Resets {
+        fn handle(&mut self, _report: &[u8], _response: &mut [u8]) -> Option<usize> {
+            None
+        }
+
+        fn session_reset(&mut self) {
+            self.0 += 1;
+        }
     }
 
     #[test]
-    fn falls_through_to_the_second_handler() {
-        let mut chain =
-            VendorChain::new(Fixed { id: 0x9F, reply: 1 }, Fixed { id: 0x8A, reply: 2 });
+    fn tuple_session_reset_reaches_every_handler() {
+        let mut handlers = (Resets(0), Resets(0));
+        handlers.session_reset();
+        assert_eq!((handlers.0 .0, handlers.1 .0), (1, 1));
+    }
+
+    #[test]
+    fn tuple_handles_is_the_union() {
+        let none: bool = <(NoVendor, NoVendor, NoVendor) as VendorHandler>::HANDLES;
+        let one: bool = <(NoVendor, Fixed, NoVendor, NoVendor) as VendorHandler>::HANDLES;
+        assert!(!none);
+        assert!(one);
+    }
+
+    #[test]
+    fn a_borrowed_handler_answers_as_its_referent() {
+        let borrowed: bool = <&mut NoVendor as VendorHandler>::HANDLES;
+        assert!(!borrowed);
+        let mut fixed = Fixed { id: 0x8A, reply: 7 };
+        let mut handlers = (NoVendor, &mut fixed);
         let mut resp = [0u8; 4];
-        assert_eq!(chain.handle(&[0x8A], &mut resp), Some(2));
-        assert_eq!(resp[1], 2);
-    }
-
-    #[test]
-    fn declines_when_neither_side_answers() {
-        let mut chain =
-            VendorChain::new(Fixed { id: 0x9F, reply: 1 }, Fixed { id: 0x8A, reply: 2 });
-        let mut resp = [0u8; 4];
-        assert_eq!(chain.handle(&[0x00], &mut resp), None);
-    }
-
-    #[test]
-    fn handles_is_true_whenever_either_side_handles() {
-        let neither: bool = <VendorChain<NoVendor, NoVendor> as VendorHandler>::HANDLES;
-        let first_only: bool = <VendorChain<Fixed, NoVendor> as VendorHandler>::HANDLES;
-        let second_only: bool = <VendorChain<NoVendor, Fixed> as VendorHandler>::HANDLES;
-        assert!(!neither);
-        assert!(first_only);
-        assert!(second_only);
+        assert_eq!(handlers.handle(&[0x8A], &mut resp), Some(2));
+        assert_eq!(resp[1], 7);
     }
 }

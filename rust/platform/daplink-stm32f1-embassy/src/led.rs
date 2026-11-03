@@ -1,10 +1,10 @@
-//! Tri-state driver for a bicolor two-LED package tapping one pin at the midpoint of a series pair.
+//! Tri-state driver for a bicolor LED pair tapped at its midpoint.
 
 use daplink_rs::dap_rs::dap::{DapLeds, HostStatus};
 use embassy_stm32::gpio::{Flex, Pin, Pull, Speed};
 use embassy_stm32::Peri;
 
-/// A bicolor LED on one tri-state pin: high is the activity color, low the idle color, floating off.
+/// A bicolor LED on one pin: high is activity, low idle, floating off.
 pub struct BicolorLed {
     pin: Flex<'static>,
     connected: bool,
@@ -12,7 +12,7 @@ pub struct BicolorLed {
 }
 
 impl BicolorLed {
-    /// Wrap the pin, starting floating (both colors off).
+    /// Wrap the pin, starting off.
     pub fn new(pin: Peri<'static, impl Pin>) -> Self {
         let mut pin = Flex::new(pin);
         pin.set_as_input(Pull::None);
@@ -23,19 +23,16 @@ impl BicolorLed {
         }
     }
 
-    /// Show the idle color (drive low).
     pub fn idle(&mut self) {
         self.pin.set_low();
         self.pin.set_as_output(Speed::Low);
     }
 
-    /// Show the activity color (drive high).
     pub fn activity(&mut self) {
         self.pin.set_high();
         self.pin.set_as_output(Speed::Low);
     }
 
-    /// Float the pin, turning both colors off.
     pub fn off(&mut self) {
         self.pin.set_as_input(Pull::None);
     }

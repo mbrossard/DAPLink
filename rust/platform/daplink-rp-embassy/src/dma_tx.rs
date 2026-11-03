@@ -1,7 +1,8 @@
 //! VCOM transmit over UART1 TX via a DMA byte ring, re-armed from its own completion.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU32, AtomicUsize, Ordering};
 
+use daplink_core::DmaTxCursor;
 use daplink_rp_dma_uart::seq::DmaChannel;
 use embassy_rp::dma::ChannelInstance;
 use embassy_rp::Peri;
@@ -14,10 +15,8 @@ use embassy_rp::pac::dma::vals::{DataSize, TreqSel};
 use embassy_time::{Duration, Timer};
 use static_cell::ConstStaticCell;
 
-use crate::dma_rx::RX_RING_LEN;
-
-/// Transmit ring capacity: matches the receive ring's.
-const TX_RING_LEN: usize = RX_RING_LEN;
+/// Transmit ring capacity, independent of the receive ring's.
+const TX_RING_LEN: usize = 2048;
 
 /// Channel claimed for transmit, taken from the peripheral token so the claim cannot disagree.
 static TX_CHAN_NUM: AtomicUsize = AtomicUsize::new(0);
@@ -36,32 +35,52 @@ static TX_HEAD: AtomicUsize = AtomicUsize::new(0);
 static TX_TAIL: AtomicUsize = AtomicUsize::new(0);
 /// Bytes the armed run covers, zero when idle; `TAIL` advances by this on reap.
 static TX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-/// Bytes reaped from completed bursts; load/store only (thumbv6m), written under the interrupt
-/// mask its site already holds.
+/// Bytes reaped from completed bursts; load/store only, written under the interrupt mask.
 static TX_SENT: AtomicU32 = AtomicU32::new(0);
 
 /// Ring base and the fixed `UARTDR` destination, set once by [`new`].
 static TX_BASE: AtomicU32 = AtomicU32::new(0);
 static TX_DST: AtomicU32 = AtomicU32::new(0);
 
-/// Bytes queued in the ring, sent and unsent both.
-fn queued(head: usize, tail: usize) -> usize {
-    (head + TX_RING_LEN - tail) % TX_RING_LEN
+/// Ring arithmetic over the three cursors above; one transfer, so no per-transfer cap.
+type Cursor = DmaTxCursor<TX_RING_LEN>;
+
+/// Never unwind or restore interrupts while a DMA memory lease is unresolved.
+pub(crate) fn abort_failed() -> ! {
+    cortex_m::interrupt::disable();
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Read the three cursors into a value the arithmetic works on. Caller holds the mask.
+fn cursor() -> Cursor {
+    Cursor::from_parts(
+        TX_HEAD.load(Ordering::Relaxed),
+        TX_TAIL.load(Ordering::Relaxed),
+        TX_INFLIGHT.load(Ordering::Relaxed),
+    )
 }
 
 fn chan() -> DmaChannel {
-    DmaChannel::new(tx_chan())
+    // SAFETY: new consumes the token; task and handler coordinate through the interrupt mask.
+    unsafe { DmaChannel::new(tx_chan()) }
 }
 
 /// Arm a one-shot burst of `len` bytes starting at ring offset `tail`.
 fn arm(tail: usize, len: usize) {
     let chan = chan();
-    chan.set_addrs(
-        TX_BASE.load(Ordering::Relaxed) + tail as u32,
-        TX_DST.load(Ordering::Relaxed),
-    );
-    chan.set_count(len as u32);
-    chan.regs().ctrl_trig().write(|w| {
+    // SAFETY: the cursor reserves this initialized contiguous run until completion or abort.
+    let regs = unsafe {
+        chan.set_addrs(
+            TX_BASE.load(Ordering::Relaxed) + tail as u32,
+            TX_DST.load(Ordering::Relaxed),
+        );
+        chan.set_count(len as u32);
+        chan.regs()
+    };
+    compiler_fence(Ordering::SeqCst);
+    regs.ctrl_trig().write(|w| {
         w.set_en(true);
         w.set_data_size(DataSize::SIZE_BYTE);
         w.set_incr_read(true);
@@ -71,23 +90,14 @@ fn arm(tail: usize, len: usize) {
         // Raise the completion the re-arm hangs off (RP2040 section 2.5.4, RP2350 section 12.6.5).
         w.set_irq_quiet(false);
     });
+    compiler_fence(Ordering::SeqCst);
 }
 
-/// Arm the queued run from `TAIL` up to `HEAD` or the ring's end, whichever comes first, if the
-/// channel is idle. Caller holds the interrupt mask.
+/// Arm the queued run from `TAIL` to `HEAD` or the ring's end if the channel is idle; caller holds the mask.
 fn kick() {
-    if TX_INFLIGHT.load(Ordering::Relaxed) != 0 {
+    let mut cursor = cursor();
+    let Some((tail, run)) = cursor.arm() else {
         return;
-    }
-    let head = TX_HEAD.load(Ordering::Relaxed);
-    let tail = TX_TAIL.load(Ordering::Relaxed);
-    if head == tail {
-        return;
-    }
-    let run = if head > tail {
-        head - tail
-    } else {
-        TX_RING_LEN - tail
     };
     TX_INFLIGHT.store(run, Ordering::Relaxed);
     arm(tail, run);
@@ -95,34 +105,29 @@ fn kick() {
 
 /// Stage as much of `data` as the ring holds, kicking an idle channel; returns the bytes taken.
 fn push(data: &[u8]) -> usize {
-    let head = TX_HEAD.load(Ordering::Relaxed);
-    let tail = TX_TAIL.load(Ordering::Relaxed);
-    let free = TX_RING_LEN - 1 - queued(head, tail);
-    let n = data.len().min(free);
-    if n == 0 {
+    let mut cursor = cursor();
+    let head = cursor.parts().0;
+    if data.is_empty() || cursor.free() == 0 {
         return 0;
     }
+    let taken = cursor.accept(data.len());
     let base = TX_BASE.load(Ordering::Relaxed) as *mut u8;
-    let first = (TX_RING_LEN - head).min(n);
-    // SAFETY: the bytes lie beyond `head` and within the free count, and the channel only ever
-    // reads between `TAIL` and `HEAD`.
+    // SAFETY: the copied free spans are disjoint from DMA's reserved TAIL-to-HEAD source.
     unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(head), first);
-        if n > first {
-            core::ptr::copy_nonoverlapping(data.as_ptr().add(first), base, n - first);
+        core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(head), taken.first);
+        if taken.second != 0 {
+            core::ptr::copy_nonoverlapping(data.as_ptr().add(taken.first), base, taken.second);
         }
     }
     // Together: a completion between them would re-arm against a `HEAD` short of the copy above.
     cortex_m::interrupt::free(|_| {
-        TX_HEAD.store((head + n) % TX_RING_LEN, Ordering::Relaxed);
+        TX_HEAD.store(cursor.parts().0, Ordering::Relaxed);
         kick();
     });
-    n
+    taken.taken
 }
 
-/// Bytes every reaped burst carried, free-running since boot. The channel reaps at `UARTDR`, so
-/// this runs ahead of the wire by at most 33 bytes -- the 32-entry PL011 transmit FIFO plus the
-/// shifter -- and is exact whenever the line is quiet.
+/// Bytes delivered to UARTDR since boot; FIFO and shifter may still hold up to 33 bytes.
 pub(crate) fn sent() -> u32 {
     TX_SENT.load(Ordering::Relaxed)
 }
@@ -134,16 +139,18 @@ fn service() {
     if ints & mask == 0 {
         return;
     }
-    pac::DMA.ints(IRQ_LINE).write_value(mask);
     cortex_m::interrupt::free(|_| {
-        let inflight = TX_INFLIGHT.load(Ordering::Relaxed);
-        if inflight != 0 {
-            let tail = TX_TAIL.load(Ordering::Relaxed);
-            TX_TAIL.store((tail + inflight) % TX_RING_LEN, Ordering::Relaxed);
+        if chan().busy() {
+            return;
+        }
+        pac::DMA.ints(IRQ_LINE).write_value(mask);
+        let mut cursor = cursor();
+        let reaped = cursor.reap();
+        if reaped != 0 {
+            let (_, tail, _) = cursor.parts();
+            TX_TAIL.store(tail, Ordering::Relaxed);
             TX_INFLIGHT.store(0, Ordering::Relaxed);
-            let sent = TX_SENT
-                .load(Ordering::Relaxed)
-                .wrapping_add(inflight as u32);
+            let sent = TX_SENT.load(Ordering::Relaxed).wrapping_add(reaped as u32);
             TX_SENT.store(sent, Ordering::Relaxed);
         }
         kick();
@@ -161,7 +168,10 @@ impl<I: Interrupt> Handler<I> for VcomDmaInterruptHandler {
 }
 
 /// Claim the transmit channel and ring, and enable completion; `uart_dr` is `UART1`'s `UARTDR`.
-pub(crate) fn new<T: ChannelInstance>(uart_dr: u32, _tx: Peri<'static, T>) {
+///
+/// # Safety
+/// The caller owns UART1 and binds DMA_IRQ_1 exclusively to VcomDmaInterruptHandler.
+pub(crate) unsafe fn new<T: ChannelInstance>(uart_dr: u32, _tx: Peri<'static, T>) {
     TX_CHAN_NUM.store(T::number() as usize, Ordering::Relaxed);
     static MEM: ConstStaticCell<[u8; TX_RING_LEN]> = ConstStaticCell::new([0; TX_RING_LEN]);
     let base = MEM.take().as_mut_ptr() as u32;
@@ -201,19 +211,23 @@ pub(crate) async fn drain() {
     }
 }
 
-/// Stop the channel and drop what it holds, for a baud change: it was framed at the old rate.
-/// Clears any completion the abort raised, so nothing re-arms against the discarded ring.
+/// Stop and discard TX for a baud change; abort timeout permanently halts without releasing the ring.
 pub(crate) fn halt_for_baud_change() {
     cortex_m::interrupt::free(|_| {
         pac::DMA
             .inte(IRQ_LINE)
             .modify(|v| *v &= !(1 << tx_chan() as u32));
-        // Completion disarmed first, because an abort can raise one (RP2040-E13, RP2350-E5).
-        chan().abort();
+        // SAFETY: completion is masked before abort can raise it; the static ring remains reserved.
+        if !unsafe { chan().abort() } {
+            abort_failed();
+        }
         pac::DMA.ints(IRQ_LINE).write_value(1 << tx_chan());
-        TX_HEAD.store(0, Ordering::Relaxed);
-        TX_TAIL.store(0, Ordering::Relaxed);
-        TX_INFLIGHT.store(0, Ordering::Relaxed);
+        let mut cursor = cursor();
+        cursor.reset();
+        let (head, tail, inflight) = cursor.parts();
+        TX_HEAD.store(head, Ordering::Relaxed);
+        TX_TAIL.store(tail, Ordering::Relaxed);
+        TX_INFLIGHT.store(inflight, Ordering::Relaxed);
         pac::DMA
             .inte(IRQ_LINE)
             .modify(|v| *v |= 1 << tx_chan() as u32);

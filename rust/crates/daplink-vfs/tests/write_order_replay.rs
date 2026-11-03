@@ -1,12 +1,4 @@
-//! Captured host write orders, replayed against the real transfer engine on every chip record.
-//!
-//! The engine is pure logic over sector writes, so every order a host can produce is reachable
-//! here. What the fragments are judged against is the composed target's flash geometry, so the
-//! orders are swept over the windows the chip records in `daplink-targets` actually carry rather
-//! than over one window literal transcribed here. A literal is how a case gets exercised in a
-//! configuration the probe never uses: it passes, and it clears nothing. A new chip record joins
-//! the sweep the day it lands. `macos_writes` covers the same path for one composition in the
-//! detail a real `msdosfs` sequence needs; this file asks the narrower question across the fleet.
+//! Host write orders replayed against the transfer engine over every chip record's geometry.
 
 use daplink_core::{FlashBackend, FlashPhase};
 use daplink_targets::{targets, Target};
@@ -20,8 +12,7 @@ fn fleet() -> [&'static dyn Target; 2] {
     [&targets::rp2040::RP2040, &targets::stm32f401ce::STM32F401CE]
 }
 
-/// One row's geometry, taken from the record rather than restated: the default flash region the
-/// dropped image is addressed for.
+/// One row's default flash region, taken from the record.
 struct Geometry {
     name: &'static str,
     flash: (u32, u32),
@@ -56,13 +47,14 @@ impl Geometry {
     }
 }
 
-/// A flash backend composing exactly one chip record's geometry, recording what it is asked to
-/// program. The window it reports is the record's own, which is what makes the sweep a sweep.
+/// A flash backend over one chip record's geometry, recording what it programs.
 struct RowBackend {
     ranges: [(u32, u32); 1],
     name: &'static str,
     writes: Vec<(u32, Vec<u8>)>,
     finished: Option<bool>,
+    /// How many times the session was closed, so an early release can be shown to happen once.
+    finishes: usize,
 }
 
 impl RowBackend {
@@ -72,6 +64,7 @@ impl RowBackend {
             name: g.name,
             writes: Vec::new(),
             finished: None,
+            finishes: 0,
         }
     }
 
@@ -91,6 +84,7 @@ impl FlashBackend for RowBackend {
     }
     fn finish(&mut self, success: bool) -> Result<(), FlashPhase> {
         self.finished = Some(success);
+        self.finishes += 1;
         Ok(())
     }
     fn finish_with_reset(&mut self, success: bool, _reset: bool) -> Result<(), FlashPhase> {
@@ -153,9 +147,7 @@ fn replay(
     (outcome, backend.programmed(), backend.finished)
 }
 
-/// Confirmed on silicon: on a transport fast enough that the host flushes every data cluster
-/// before the directory entry that names the file, the image arrives with nothing to bind it. It
-/// must start on its content, and the entry landing last must complete it -- on every geometry.
+/// Data clusters before the directory entry: content starts it, the late entry completes it.
 #[test]
 fn data_first_with_the_dirent_last_completes_on_every_row() {
     for target in fleet() {
@@ -178,11 +170,7 @@ fn data_first_with_the_dirent_last_completes_on_every_row() {
     }
 }
 
-/// The same order with the sectors reordered: the host writes the third payload sector before
-/// the second. The early block is discarded as a gap, the front never re-covers it, and the
-/// declared size can never be met. That is a failure the HOST caused, and it must be named as one
-/// -- `Timeout` is the word a stream that simply stopped arriving gets, and it points the user at
-/// the probe.
+/// The third payload sector before the second: a host reorder, reported as `OutOfOrder`.
 #[test]
 fn a_reordered_data_first_drop_reports_out_of_order_on_every_row() {
     for target in fleet() {
@@ -215,9 +203,7 @@ fn a_reordered_data_first_drop_reports_out_of_order_on_every_row() {
     }
 }
 
-/// The worse sibling: the same reorder with no directory entry ever arriving. Nothing declares a
-/// size, so the stream is nominally finishable, and completing it would program the blocks before
-/// the hole and call the drop `Done` -- a silent partial program reported as success.
+/// The same reorder with no entry ever: it must not complete as `Done` with a hole.
 #[test]
 fn a_reordered_drop_with_no_dirent_fails_loud_on_every_row() {
     for target in fleet() {
@@ -253,9 +239,7 @@ fn a_reordered_drop_with_no_dirent_fails_loud_on_every_row() {
     }
 }
 
-/// The hole the front never reaches: the host skips TWO sectors and returns for neither, so the
-/// front stops below the discarded one. A block of the file's own data that the stream never got
-/// is a hole however early it arrived, and the verdict must say so rather than blame the probe.
+/// Two skipped sectors never returned: a hole however early the later block arrived.
 #[test]
 fn a_hole_below_the_stalled_front_still_fails_loud_on_every_row() {
     for target in fleet() {
@@ -285,10 +269,7 @@ fn a_hole_below_the_stalled_front_still_fails_loud_on_every_row() {
     }
 }
 
-/// The same stall with the early write replaced by a magicless one, and the opposite verdict:
-/// nothing about host housekeeping says the stream was reordered, so a host that simply stopped
-/// writing keeps reporting `Timeout`. Without this the previous test's verdict is just a rename
-/// of every abandoned copy.
+/// A magicless early write instead keeps the `Timeout` verdict of a host that stopped.
 #[test]
 fn housekeeping_beside_a_stalled_stream_stays_a_timeout_on_every_row() {
     for target in fleet() {
@@ -311,9 +292,7 @@ fn housekeeping_beside_a_stalled_stream_stays_a_timeout_on_every_row() {
     }
 }
 
-/// Reordering must not be a one-way door: a host that re-delivers the skipped sector at the
-/// front heals the stream, and the drop completes with every block programmed. Without this the
-/// out-of-order verdict would fail transfers that were merely late.
+/// Re-delivering the skipped sector at the front heals the stream.
 #[test]
 fn a_re_delivered_sector_heals_the_reorder_on_every_row() {
     for target in fleet() {
@@ -332,10 +311,125 @@ fn a_re_delivered_sector_heals_the_reorder_on_every_row() {
     }
 }
 
-/// The geometry each row is swept with must be the record's own. A window literal that has
-/// drifted from the record exercises a composition no probe ships, which is how a host-side pass
-/// clears nothing -- so the sweep asserts it reads the record, and that the fleet's rows are in
-/// fact unequal enough for the sweep to be worth running.
+/// The file's own block with its magic destroyed fails at that write as a decode failure.
+#[test]
+fn a_corrupt_block_inside_the_window_fails_at_that_write_on_every_row() {
+    for target in fleet() {
+        let g = Geometry::of(target);
+        let (outcome, programmed, finished) = replay(&g, |vfs| {
+            write_dirent(vfs, 3 * 512);
+            vfs.write_sector(user_lba(0), &g.block(0, 3, 0xA1));
+            assert!(vfs.is_transfer_active(), "{}", g.name);
+            // Block 2 of the file's own data lands with the magic gone.
+            vfs.write_sector(user_lba(2), &housekeeping());
+            assert!(
+                !vfs.is_transfer_active(),
+                "{}: the corrupt block ends the drop at once",
+                g.name
+            );
+            assert_eq!(
+                vfs.tick(1),
+                MediaState::Detached,
+                "{}: with no idle wait before the volume remounts",
+                g.name
+            );
+        });
+        assert_eq!(outcome, Some(TransferOutcome::DecodeError), "{}", g.name);
+        assert_eq!(finished, Some(false), "{}", g.name);
+        assert_eq!(
+            programmed.len(),
+            256,
+            "{}: only the blocks before the corruption are programmed",
+            g.name
+        );
+    }
+}
+
+/// That corruption closes the flash session at the corrupt write, exactly once.
+#[test]
+fn a_corrupt_block_releases_the_session_once_on_every_row() {
+    for target in fleet() {
+        let g = Geometry::of(target);
+        let mut details = DetailsFile::new(DeviceInfo {
+            version: "0.1.0",
+            serial: "SER123",
+            reset_count: 0,
+        });
+        let mut files: [&mut dyn VfsFile; 1] = [&mut details];
+        let mut vfs: RowVfs<'_> = daplink_vfs::Vfs::new(
+            VfsConfig::default(),
+            &mut files[..],
+            FlashSink::new(RowBackend::new(&g)),
+            NoObserver,
+        );
+        write_dirent(&mut vfs, 3 * 512);
+        vfs.write_sector(user_lba(0), &g.block(0, 3, 0xA1));
+        vfs.write_sector(user_lba(2), &housekeeping());
+        assert_eq!(vfs.sink().backend().finishes, 1, "{}", g.name);
+        // Whatever the host writes next, the closed session is not closed again.
+        vfs.write_sector(user_lba(1), &g.block(1, 3, 0xA5));
+        vfs.tick(daplink_vfs::MSC_TIMEOUT_ACTIVE_MS);
+        assert_eq!(
+            vfs.sink().backend().finishes,
+            1,
+            "{}: the session is released exactly once",
+            g.name
+        );
+    }
+}
+
+/// A sized reorder is judged on the short gapped window, not the active one.
+#[test]
+fn a_sized_forward_gap_reports_out_of_order_without_the_active_wait_on_every_row() {
+    for target in fleet() {
+        let g = Geometry::of(target);
+        let (outcome, _programmed, finished) = replay(&g, |vfs| {
+            write_dirent(vfs, 3 * 512);
+            vfs.write_sector(user_lba(0), &g.block(0, 3, 0xA1));
+            vfs.write_sector(user_lba(2), &g.block(2, 3, 0xC3));
+            assert_eq!(
+                vfs.transfer_timeout(),
+                daplink_vfs::MSC_TIMEOUT_GAPPED_MS,
+                "{}: the discarded sector shortens the idle window",
+                g.name
+            );
+            assert_eq!(
+                vfs.tick(daplink_vfs::MSC_TIMEOUT_GAPPED_MS),
+                MediaState::Detached,
+                "{}",
+                g.name
+            );
+        });
+        assert_eq!(outcome, Some(TransferOutcome::OutOfOrder), "{}", g.name);
+        assert_eq!(finished, Some(false), "{}", g.name);
+    }
+}
+
+/// A gap healed within that window still completes.
+#[test]
+fn a_healed_gap_survives_the_shortened_window_on_every_row() {
+    for target in fleet() {
+        let g = Geometry::of(target);
+        let (outcome, programmed, finished) = replay(&g, |vfs| {
+            write_dirent(vfs, 3 * 512);
+            vfs.write_sector(user_lba(0), &g.block(0, 3, 0xA1));
+            vfs.write_sector(user_lba(2), &g.block(2, 3, 0xC3));
+            assert_eq!(
+                vfs.tick(daplink_vfs::MSC_TIMEOUT_GAPPED_MS - 1),
+                MediaState::Ready,
+                "{}",
+                g.name
+            );
+            vfs.write_sector(user_lba(1), &g.block(1, 3, 0xA5));
+            vfs.write_sector(user_lba(2), &g.block(2, 3, 0xC3));
+        });
+        assert_eq!(outcome, Some(TransferOutcome::Done), "{}", g.name);
+        assert_eq!(finished, Some(true), "{}", g.name);
+        assert_eq!(programmed.len(), 3 * 256, "{}", g.name);
+    }
+}
+
+/// The sweep reads each record's own geometry, and the rows differ.
 #[test]
 fn the_swept_geometry_is_the_registry_and_the_rows_differ() {
     let rows: Vec<Geometry> = fleet().into_iter().map(Geometry::of).collect();

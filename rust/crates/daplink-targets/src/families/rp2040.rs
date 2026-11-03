@@ -4,17 +4,20 @@ use daplink_flash::error::Error;
 use daplink_flash::reset_sequence::{generic_set_target_state, ResetOps, ResetSequence};
 use daplink_flash::target::{ResetType, TargetState};
 
-/// The RP2040's reset/halt strategy: `ResetProgram` halts without resetting, and any reset-to-run
-/// is forced to `SYSRESETREQ`, because every RP2040 reset drops the multidrop debug port.
+use super::rp::{normalise, quiesce, Blocks, VC_HARDERR};
+
+/// RP2040 `WATCHDOG`, `PSM` and `RESETS` bases, and `PSM.PROC1`.
+const BLOCKS: Blocks = Blocks {
+    watchdog: 0x4005_8000,
+    psm: 0x4001_0000,
+    psm_proc1: 1 << 16,
+    resets: 0x4000_C000,
+    demcr: VC_HARDERR,
+};
+
+/// RP2040 reset/halt: `ResetProgram` halts and quiesces the app, and reset-to-run forces `SYSRESETREQ`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Rp2040ResetSequence;
-
-impl Rp2040ResetSequence {
-    /// Multidrop core-select hook; a no-op, since attach already selects core 0 by `TARGETSEL`.
-    fn select_core(&self, _ops: &mut dyn ResetOps) -> Result<(), Error> {
-        Ok(())
-    }
-}
 
 impl ResetSequence for Rp2040ResetSequence {
     fn set_target_state(
@@ -23,10 +26,13 @@ impl ResetSequence for Rp2040ResetSequence {
         state: TargetState,
         reset_type: ResetType,
     ) -> Result<(), Error> {
-        self.select_core(ops)?;
         match state {
-            // Halt-only: any reset drops the multidrop DP, and the RAM-resident algorithm sets its own PC.
-            TargetState::ResetProgram => ops.halt(),
+            // No reset: an nRESET drops the multidrop DP, and the RAM-resident algorithm sets its own PC.
+            TargetState::ResetProgram => {
+                ops.halt()?;
+                quiesce(ops, &BLOCKS)?;
+                normalise(ops)
+            }
             // Forced `SYSRESETREQ`: nRESET may not be wired, and the session ends here anyway.
             TargetState::PostFlashReset | TargetState::ResetRun => {
                 generic_set_target_state(ops, state, ResetType::SoftwareSysReset)

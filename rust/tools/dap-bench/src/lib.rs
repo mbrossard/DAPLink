@@ -4,6 +4,8 @@
 
 pub mod adi;
 pub mod dap;
+pub mod fit;
+pub mod measure;
 pub mod report;
 pub mod sweep;
 pub mod target;

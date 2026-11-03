@@ -6,13 +6,6 @@ use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(rp_accel)");
-    if env::var_os("CARGO_FEATURE_ACCEL").is_some()
-        && env::var_os("CARGO_FEATURE_BITBANG").is_none()
-    {
-        println!("cargo:rustc-cfg=rp_accel");
-    }
-
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());
     File::create(out.join("memory.x"))
         .unwrap()
@@ -31,7 +24,6 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-Tram-text.x");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
 
-    // defmt-rtt's linker script only exists to link against when the feature pulls the crate in.
     if env::var_os("CARGO_FEATURE_DEFMT").is_some() {
         println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
     }

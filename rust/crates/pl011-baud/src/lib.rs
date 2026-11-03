@@ -1,12 +1,10 @@
-//! PL011 baud divisor arithmetic, shared by every RP seam that programs one so its tests run
-//! on the host.
+//! PL011 baud divisor arithmetic, shared by every RP seam that programs one.
 #![no_std]
 
 /// Largest programmable x64 divisor: `UARTIBRD` is 16 bits, `UARTFBRD` 6 bits.
 pub const DIV_X64_MAX: u32 = (0xFFFF << 6) | 0x3F;
 
-/// Smallest programmable x64 divisor: a zero `UARTIBRD` stops the baud generator, so the fastest
-/// rate the lattice serves is [`max_baud`], at this divisor.
+/// Smallest programmable x64 divisor; a zero `UARTIBRD` stops the baud generator.
 pub const DIV_X64_MIN: u32 = 64;
 
 /// Highest rate the PL011 can serve from `clk`: it samples 16x and the smallest divisor is 1.
@@ -14,10 +12,8 @@ pub const fn max_baud(clk: u32) -> u32 {
     clk / 16
 }
 
-/// Baud divisor as 16.6 fixed point -- `round(64 * clk / (16 * baud))`, saturated at
-/// [`DIV_X64_MAX`] so the fraction's carry lands in the integer part instead of truncating.
-/// `None` for a rate the lattice cannot serve -- zero, or faster than [`max_baud`] -- which each
-/// caller answers its own way. `clk` must not exceed 536 MHz.
+/// Baud divisor as 16.6 fixed point, saturated at [`DIV_X64_MAX`]; `None` if zero or above
+/// [`max_baud`]. `clk` must not exceed `u32::MAX / 8`.
 pub fn div_x64(clk: u32, baud: u32) -> Option<u32> {
     if baud == 0 || baud > max_baud(clk) {
         return None;
@@ -25,14 +21,14 @@ pub fn div_x64(clk: u32, baud: u32) -> Option<u32> {
     Some((8 * clk / baud).div_ceil(2).min(DIV_X64_MAX))
 }
 
-/// Split a divisor into the `UARTIBRD` and `UARTFBRD` fields.
+/// Split a divisor into the `UARTIBRD` and `UARTFBRD` fields, saturating at [`DIV_X64_MAX`]
+/// without other validation.
 pub fn split(div_x64: u32) -> (u16, u8) {
     let d = div_x64.min(DIV_X64_MAX);
     ((d >> 6) as u16, (d & 0x3F) as u8)
 }
 
-/// Baud a programmed divisor actually yields, rounded to the nearest whole baud:
-/// `round(4 * clk / div_x64)`. Zero for an unprogrammed divisor.
+/// Baud a programmed divisor yields, rounded to the nearest whole baud; zero if unprogrammed.
 pub fn realized(clk: u32, div_x64: u32) -> u32 {
     (4 * clk + div_x64 / 2).checked_div(div_x64).unwrap_or(0)
 }
@@ -74,8 +70,7 @@ mod tests {
 
     #[test]
     fn realized_rounds_to_nearest_in_both_directions() {
-        // 500e6/192 = 2604166.67 and 500e6/96 = 5208333.33: the first rounds up off the
-        // truncated value, the second stays put.
+        // The first rounds up off the truncated value, the second stays put.
         assert_eq!(realized(RP2040_HZ, 192), 2_604_167);
         assert_eq!(realized(RP2040_HZ, 96), 5_208_333);
         assert_eq!(realized(RP2040_HZ, DIV_X64_MIN), 7_812_500);
@@ -113,6 +108,14 @@ mod tests {
     }
 
     #[test]
+    fn the_clock_domain_holds_at_both_ends() {
+        assert_eq!(div_x64(0, 1), None);
+        let top = u32::MAX / 8;
+        assert_eq!(div_x64(top, max_baud(top)), Some(DIV_X64_MIN));
+        assert_eq!(div_x64(top, 1), Some(DIV_X64_MAX));
+    }
+
+    #[test]
     fn common_rates_round_trip_within_a_tenth_of_a_percent() {
         for clk in [RP2040_HZ, RP2350_HZ] {
             for baud in [9_600, 115_200, 921_600, 1_000_000, 2_000_000, 4_000_000] {
@@ -123,8 +126,7 @@ mod tests {
         }
     }
 
-    /// The DUT images computed the fields inline as a 25.7 divide before this crate existed;
-    /// the extraction must not have moved a single rate.
+    // Same fields as rounding the 25.7 quotient to six fraction bits, carrying into IBRD.
     #[test]
     fn the_fields_match_the_inline_25_7_form() {
         for clk in [RP2040_HZ, RP2350_HZ] {

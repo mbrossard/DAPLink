@@ -1,47 +1,60 @@
-//! The polled USB device: CMSIS-DAP v2, the vendor descriptors, and -- on [`DapUsb`] -- a CDC-ACM
-//! serial port. A board with no VCOM wiring composes [`DapUsbNoVcom`], which never links the class.
+//! Polled DAP products, with CDC and MSC selected by composition.
 
 use crate::cdc::BufferedCdc;
 use crate::dap_class::CmsisDapV2;
-#[cfg(feature = "flash")]
+use crate::dap_pass::DapTransport;
 use crate::msc::MscClass;
-use crate::winusb::VendorDescriptors;
+use crate::product::{MassStorage, NoMsc};
+use crate::winusb::{EndpointRepair, VendorDescriptors};
 use daplink_rs::daplink_core::{DapConfig, USB_MAX_POWER_MA};
 use usb_device::bus::{UsbBus, UsbBusAllocator};
 use usb_device::device::{
     StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbVidPid,
 };
 
-/// The polled USB device; DAP v2 is allocated first, so it lands on interface 0. `MSC_EP` and
-/// `CDC_EP` size the bulk pairs, `CDC_BUF` (>= `CDC_EP`) the serial stream buffers.
+#[cfg(test)]
+mod tests;
+
+/// The polled USB device, DAP v2 on interface 0; `CDC_BUF` (>= `CDC_EP`) sizes the serial buffers.
+/// `MSC_EP` matters only when `M` is [`MscClass`].
 pub struct DapUsb<
     'a,
     B: UsbBus,
     const MSC_EP: usize = 64,
     const CDC_EP: usize = 64,
     const CDC_BUF: usize = 128,
+    M = NoMsc,
 > {
     usb_dev: UsbDevice<'a, B>,
     dap_v2: CmsisDapV2<'a, B>,
     vendor: VendorDescriptors,
     serial: BufferedCdc<'a, B, CDC_EP, CDC_BUF>,
     /// The mass-storage class, allocated last so it never shifts the interfaces above it.
-    #[cfg(feature = "flash")]
-    msc: MscClass<'a, B, MSC_EP>,
-    last_state: UsbDeviceState,
+    msc: M,
+    session: SessionTracker,
 }
 
-impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usize>
-    DapUsb<'a, B, MSC_EP, CDC_EP, CDC_BUF>
+/// DAP, CDC, and MSC, with the same interface ordering as the non-MSC composition.
+pub type DapUsbMsc<
+    'a,
+    B,
+    const MSC_EP: usize = 64,
+    const CDC_EP: usize = 64,
+    const CDC_BUF: usize = 128,
+> = DapUsb<'a, B, MSC_EP, CDC_EP, CDC_BUF, MscClass<'a, B, MSC_EP>>;
+
+impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usize, M>
+    DapUsb<'a, B, MSC_EP, CDC_EP, CDC_BUF, M>
+where
+    M: MassStorage<'a, B, MSC_EP>,
 {
     /// Build the device from a bus allocator and the probe's USB identity; call once per image.
     pub fn new(alloc: &'a UsbBusAllocator<B>, cfg: &DapConfig<'a>) -> Self {
-        let dap_v2 = CmsisDapV2::new(cfg.max_packet_size, alloc);
+        let dap_v2 = CmsisDapV2::new(cfg.max_packet_size.get(), alloc);
         // Interfaces 1 and 2 for the CDC-ACM function, after DAP v2's interface 0.
         let serial = BufferedCdc::new(alloc);
         // Mass storage takes interface 3, so every interface below it keeps its number.
-        #[cfg(feature = "flash")]
-        let msc = MscClass::new(alloc);
+        let msc = M::new(alloc);
         let usb_dev = UsbDeviceBuilder::new(alloc, UsbVidPid(cfg.vid, cfg.pid))
             .strings(&[StringDescriptors::default()
                 .manufacturer(cfg.manufacturer)
@@ -58,50 +71,44 @@ impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usi
         Self {
             usb_dev,
             dap_v2,
-            vendor: VendorDescriptors,
+            vendor: VendorDescriptors::default(),
             serial,
-            #[cfg(feature = "flash")]
             msc,
-            last_state: UsbDeviceState::Default,
+            session: SessionTracker::new(),
         }
     }
 
-    /// Poll the device across every class, returning whether there was bus activity.
-    #[cfg(not(feature = "flash"))]
-    pub fn poll(&mut self) -> bool {
-        self.usb_dev
-            .poll(&mut [&mut self.dap_v2, &mut self.vendor, &mut self.serial])
+    /// Refuse endpoint requests the bus lacks a register for, and repair its toggles through `repair`.
+    pub fn with_endpoint_repair(mut self, repair: &'static dyn EndpointRepair) -> Self {
+        self.vendor = VendorDescriptors::with_repair(repair);
+        self
     }
 
-    /// Poll every class; mass storage polls last, so it appends its descriptors after the rest.
-    #[cfg(feature = "flash")]
+    /// Poll every class; `true` indicates the USB stack's data-event path, not every bus event.
     pub fn poll(&mut self) -> bool {
-        self.usb_dev.poll(&mut [
+        self.msc.poll_vcom(
+            &mut self.usb_dev,
             &mut self.dap_v2,
             &mut self.vendor,
             &mut self.serial,
-            &mut self.msc,
-        ])
-    }
-
-    /// Advance the mass-storage transport over `vfs` as far as the endpoints allow.
-    #[cfg(feature = "flash")]
-    pub fn msc_service<S, O>(&mut self, vfs: &mut daplink_vfs::Vfs<'_, S, O>)
-    where
-        S: daplink_vfs::TransferSink,
-        O: daplink_vfs::VfsObserver,
-    {
-        self.msc.service(vfs);
+        )
     }
 
     /// Read a landed command packet into `buf`, returning its length, or `None` when none is pending.
     pub fn read_command(&mut self, buf: &mut [u8]) -> Option<usize> {
-        self.dap_v2.read_command(buf)
+        self.configured()
+            .then(|| self.dap_v2.read_command(buf))
+            .flatten()
     }
 
     /// Write one response packet, returning `false` when it is oversized or the endpoint is busy.
     pub fn write_response(&mut self, data: &[u8]) -> bool {
-        self.dap_v2.write(data)
+        self.configured() && self.dap_v2.write(data)
+    }
+
+    /// Whether the host touched the VCOM port since the last call.
+    pub fn vcom_activity(&mut self) -> bool {
+        self.serial.take_activity()
     }
 
     /// Read bytes the host wrote to the VCOM serial port; `0` when none are waiting.
@@ -119,7 +126,7 @@ impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usi
         self.serial.write_capacity()
     }
 
-    /// Write bytes to the VCOM serial port, returning how many the endpoint accepted.
+    /// Accept VCOM bytes into software staging; the count does not imply endpoint or host receipt.
     pub fn vcom_write(&mut self, data: &[u8]) -> usize {
         self.serial.write(data).unwrap_or(0)
     }
@@ -134,9 +141,19 @@ impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usi
         self.serial.staged()
     }
 
+    /// Whether a VCOM packet sits at the IN endpoint awaiting completion.
+    pub fn vcom_in_flight(&self) -> bool {
+        self.serial.in_flight()
+    }
+
     /// Take the staged VCOM bytes a port close or a bus reset discarded; the host never got them.
     pub fn vcom_take_discarded(&mut self) -> usize {
         self.serial.take_discarded()
+    }
+
+    /// Whether a port close or bus reset ended a VCOM session since the last call.
+    pub fn vcom_take_close_edge(&mut self) -> bool {
+        self.serial.take_close_edge()
     }
 
     /// Push staged VCOM bytes at the IN endpoint; nothing else empties a buffer that filled.
@@ -154,40 +171,37 @@ impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usi
         self.usb_dev.state() == UsbDeviceState::Configured
     }
 
-    /// Whether the device left `Configured` since the last call; the caller suspends the engine on it.
+    /// Take a reset or deconfiguration event; the caller retires queued work and suspends the engine.
     pub fn session_ended(&mut self) -> bool {
         let state = self.usb_dev.state();
-        let ended = self.last_state == UsbDeviceState::Configured
-            && matches!(state, UsbDeviceState::Default | UsbDeviceState::Addressed);
-        self.last_state = state;
-        ended
+        let reset = self.dap_v2.take_reset();
+        self.session.observe(state, reset)
     }
 }
 
-/// The polled USB device for a board that wires no VCOM: DAP v2 on interface 0, mass storage after
-/// it, and no CDC-ACM class linked at all. `MSC_EP` sizes the mass-storage bulk pair.
-///
-/// Its own type rather than a feature on [`DapUsb`], because Cargo features are additive across the
-/// whole dependency graph: every platform crate takes this one with default features on, so a
-/// default-on `vcom` feature could not be switched off by any firmware. Its own body too, so
-/// [`DapUsb`]'s image stays byte-identical.
-pub struct DapUsbNoVcom<'a, B: UsbBus, const MSC_EP: usize = 64> {
+/// DAP without CDC; the optional MSC class follows interface 0.
+pub struct DapUsbNoVcom<'a, B: UsbBus, const MSC_EP: usize = 64, M = NoMsc> {
     usb_dev: UsbDevice<'a, B>,
     dap_v2: CmsisDapV2<'a, B>,
     vendor: VendorDescriptors,
     /// The mass-storage class, allocated last so it never shifts the interfaces above it.
-    #[cfg(feature = "flash")]
-    msc: MscClass<'a, B, MSC_EP>,
-    last_state: UsbDeviceState,
+    msc: M,
+    session: SessionTracker,
 }
 
-impl<'a, B: UsbBus, const MSC_EP: usize> DapUsbNoVcom<'a, B, MSC_EP> {
+/// DAP and MSC without CDC state or descriptors.
+pub type DapUsbNoVcomMsc<'a, B, const MSC_EP: usize = 64> =
+    DapUsbNoVcom<'a, B, MSC_EP, MscClass<'a, B, MSC_EP>>;
+
+impl<'a, B: UsbBus, const MSC_EP: usize, M> DapUsbNoVcom<'a, B, MSC_EP, M>
+where
+    M: MassStorage<'a, B, MSC_EP>,
+{
     /// Build the device from a bus allocator and the probe's USB identity; call once per image.
     pub fn new(alloc: &'a UsbBusAllocator<B>, cfg: &DapConfig<'a>) -> Self {
-        let dap_v2 = CmsisDapV2::new(cfg.max_packet_size, alloc);
+        let dap_v2 = CmsisDapV2::new(cfg.max_packet_size.get(), alloc);
         // Mass storage takes interface 1, so every interface below it keeps its number.
-        #[cfg(feature = "flash")]
-        let msc = MscClass::new(alloc);
+        let msc = M::new(alloc);
         let usb_dev = UsbDeviceBuilder::new(alloc, UsbVidPid(cfg.vid, cfg.pid))
             .strings(&[StringDescriptors::default()
                 .manufacturer(cfg.manufacturer)
@@ -203,44 +217,34 @@ impl<'a, B: UsbBus, const MSC_EP: usize> DapUsbNoVcom<'a, B, MSC_EP> {
         Self {
             usb_dev,
             dap_v2,
-            vendor: VendorDescriptors,
-            #[cfg(feature = "flash")]
+            vendor: VendorDescriptors::default(),
             msc,
-            last_state: UsbDeviceState::Default,
+            session: SessionTracker::new(),
         }
     }
 
-    /// Poll the device across every class, returning whether there was bus activity.
-    #[cfg(not(feature = "flash"))]
-    pub fn poll(&mut self) -> bool {
-        self.usb_dev.poll(&mut [&mut self.dap_v2, &mut self.vendor])
+    /// Refuse endpoint requests the bus lacks a register for, and repair its toggles through `repair`.
+    pub fn with_endpoint_repair(mut self, repair: &'static dyn EndpointRepair) -> Self {
+        self.vendor = VendorDescriptors::with_repair(repair);
+        self
     }
 
-    /// Poll every class; mass storage polls last, so it appends its descriptors after the rest.
-    #[cfg(feature = "flash")]
+    /// Poll every class; `true` indicates the USB stack's data-event path, not every bus event.
     pub fn poll(&mut self) -> bool {
-        self.usb_dev
-            .poll(&mut [&mut self.dap_v2, &mut self.vendor, &mut self.msc])
-    }
-
-    /// Advance the mass-storage transport over `vfs` as far as the endpoints allow.
-    #[cfg(feature = "flash")]
-    pub fn msc_service<S, O>(&mut self, vfs: &mut daplink_vfs::Vfs<'_, S, O>)
-    where
-        S: daplink_vfs::TransferSink,
-        O: daplink_vfs::VfsObserver,
-    {
-        self.msc.service(vfs);
+        self.msc
+            .poll(&mut self.usb_dev, &mut self.dap_v2, &mut self.vendor)
     }
 
     /// Read a landed command packet into `buf`, returning its length, or `None` when none is pending.
     pub fn read_command(&mut self, buf: &mut [u8]) -> Option<usize> {
-        self.dap_v2.read_command(buf)
+        self.configured()
+            .then(|| self.dap_v2.read_command(buf))
+            .flatten()
     }
 
     /// Write one response packet, returning `false` when it is oversized or the endpoint is busy.
     pub fn write_response(&mut self, data: &[u8]) -> bool {
-        self.dap_v2.write(data)
+        self.configured() && self.dap_v2.write(data)
     }
 
     /// Whether enumeration is over: addressed, descriptors read, and a configuration selected.
@@ -248,12 +252,90 @@ impl<'a, B: UsbBus, const MSC_EP: usize> DapUsbNoVcom<'a, B, MSC_EP> {
         self.usb_dev.state() == UsbDeviceState::Configured
     }
 
-    /// Whether the device left `Configured` since the last call; the caller suspends the engine on it.
+    /// Take a reset or deconfiguration event; the caller retires queued work and suspends the engine.
     pub fn session_ended(&mut self) -> bool {
         let state = self.usb_dev.state();
-        let ended = self.last_state == UsbDeviceState::Configured
+        let reset = self.dap_v2.take_reset();
+        self.session.observe(state, reset)
+    }
+}
+
+impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usize>
+    DapUsbMsc<'a, B, MSC_EP, CDC_EP, CDC_BUF>
+{
+    /// Advance mass storage over the composed volume.
+    pub fn msc_service<S: daplink_vfs::TransferSink, O: daplink_vfs::VfsObserver>(
+        &mut self,
+        vfs: &mut daplink_vfs::Vfs<'_, S, O>,
+    ) {
+        self.msc.service(vfs);
+    }
+}
+
+impl<'a, B: UsbBus, const MSC_EP: usize> DapUsbNoVcomMsc<'a, B, MSC_EP> {
+    /// Advance mass storage over the composed volume.
+    pub fn msc_service<S: daplink_vfs::TransferSink, O: daplink_vfs::VfsObserver>(
+        &mut self,
+        vfs: &mut daplink_vfs::Vfs<'_, S, O>,
+    ) {
+        self.msc.service(vfs);
+    }
+}
+
+impl<'a, B: UsbBus, const MSC_EP: usize, const CDC_EP: usize, const CDC_BUF: usize, M> DapTransport
+    for DapUsb<'a, B, MSC_EP, CDC_EP, CDC_BUF, M>
+where
+    M: MassStorage<'a, B, MSC_EP>,
+{
+    fn session_ended(&mut self) -> bool {
+        DapUsb::session_ended(self)
+    }
+
+    fn read_command(&mut self, slot: &mut [u8]) -> Option<usize> {
+        DapUsb::read_command(self, slot)
+    }
+
+    fn write_response(&mut self, resp: &[u8]) -> bool {
+        DapUsb::write_response(self, resp)
+    }
+}
+
+impl<'a, B: UsbBus, const MSC_EP: usize, M> DapTransport for DapUsbNoVcom<'a, B, MSC_EP, M>
+where
+    M: MassStorage<'a, B, MSC_EP>,
+{
+    fn session_ended(&mut self) -> bool {
+        DapUsbNoVcom::session_ended(self)
+    }
+
+    fn read_command(&mut self, slot: &mut [u8]) -> Option<usize> {
+        DapUsbNoVcom::read_command(self, slot)
+    }
+
+    fn write_response(&mut self, resp: &[u8]) -> bool {
+        DapUsbNoVcom::write_response(self, resp)
+    }
+}
+
+/// The session-ended latch: a class reset, or `Configured` left for `Default` or `Addressed`.
+struct SessionTracker {
+    /// The last state seen outside `Suspend`, which does not end a session.
+    last: UsbDeviceState,
+}
+
+impl SessionTracker {
+    const fn new() -> Self {
+        Self {
+            last: UsbDeviceState::Default,
+        }
+    }
+
+    fn observe(&mut self, state: UsbDeviceState, reset: bool) -> bool {
+        let ended = self.last == UsbDeviceState::Configured
             && matches!(state, UsbDeviceState::Default | UsbDeviceState::Addressed);
-        self.last_state = state;
-        ended
+        if state != UsbDeviceState::Suspend {
+            self.last = state;
+        }
+        reset || ended
     }
 }

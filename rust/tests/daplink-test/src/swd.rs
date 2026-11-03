@@ -8,11 +8,13 @@ use probe_rs::{Core, MemoryInterface};
 use crate::util::chain;
 use crate::{Ctx, Failure};
 
-const HALT_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const HALT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bytes of target RAM a case may pattern, halted and restored.
+pub(crate) const SCRATCH_BYTES: usize = 4096;
 
-/// Stop the core, write and read back a pattern at the top of target RAM, backing the region up
-/// and restoring it, and resume.
+/// Pattern-test the top of target RAM over SWD, restoring it.
 pub(crate) fn run(cx: &mut Ctx, _full_run: bool) -> Result<(), Failure> {
+    // Every later case rides on this wire, so an unreliable one is lost substrate.
     inner(cx).map_err(Failure::Fatal)
 }
 
@@ -22,10 +24,8 @@ fn inner(cx: &mut Ctx) -> Result<(), String> {
     roundtrip(&mut core)
 }
 
-/// Stop the core, write and read back a pattern at the top of target RAM, restoring what was
-/// there, and resume. Shared, so each wire protocol proves the same access over its own attach.
-pub(crate) fn roundtrip(core: &mut Core) -> Result<(), String> {
-    // The top 4 KiB, away from whatever the resident target firmware uses low in RAM.
+/// The top [`SCRATCH_BYTES`] of the first RAM region, away from the resident firmware.
+pub(crate) fn scratch(core: &Core) -> Result<u64, String> {
     let ram = core
         .target()
         .memory_map
@@ -35,9 +35,13 @@ pub(crate) fn roundtrip(core: &mut Core) -> Result<(), String> {
             _ => None,
         })
         .ok_or("target has no RAM region")?;
-    let addr = ram.end - 4096;
+    Ok(ram.end - SCRATCH_BYTES as u64)
+}
 
-    let pattern: Vec<u32> = (0..1024u32)
+/// Halt, pattern-test and restore the top of target RAM, then resume; shared by each wire protocol.
+pub(crate) fn roundtrip(core: &mut Core) -> Result<(), String> {
+    let addr = scratch(core)?;
+    let pattern: Vec<u32> = (0..(SCRATCH_BYTES / 4) as u32)
         .map(|i| i.wrapping_mul(0x9E37_79B9) ^ i)
         .collect();
     core.halt(HALT_TIMEOUT).map_err(chain)?;

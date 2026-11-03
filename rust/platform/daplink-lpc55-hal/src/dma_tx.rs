@@ -1,8 +1,8 @@
-//! Flexcomm0 transmit over DMA0 channel 5: no reload chain, and a byte ring rather than staged
-//! packets, so one transfer carries every contiguous byte waiting.
+//! Flexcomm0 transmit over DMA0 channel 5 from a byte ring, one transfer per contiguous run.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use daplink_core::DmaTxCursor;
 use lpc55_hal::raw;
 
 use crate::dma::{self, TX_MAX_XFER, TX_RING_LEN};
@@ -20,17 +20,15 @@ static TAIL: AtomicUsize = AtomicUsize::new(0);
 static SENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// The wire floor [`sent`] last reported, so a transfer in flight cannot walk it backwards.
 static WIRE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Channel errors the controller latched. The `0x9D` reply has no slot for a transmit fault, so
-/// this is the SWD name a bench reads.
+/// Latched channel errors, readable over SWD by symbol.
 #[no_mangle]
 pub static VCOM_TX_DMA_ERR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Bytes the controller is reading now, zero when idle; what `TAIL` advances by on completion.
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-/// Whether [`start`] has run. Every entry point checks it: DMA0 is unclocked until the port is
-/// handed over, and reading a channel register before that faults the core.
+/// Whether [`start`] has run: DMA0 is unclocked before it, and touching a channel register faults.
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/// Transfers armed and bytes in them: their ratio is the mean transfer, read out over SWD.
+/// Transfers armed and the bytes in them, readable over SWD.
 #[cfg(feature = "probe-timing")]
 #[no_mangle]
 pub static PROBE_TX_ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -47,19 +45,33 @@ pub static PROBE_KICK_BUSY: core::sync::atomic::AtomicU32 = core::sync::atomic::
 pub static PROBE_KICK_EMPTY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn usart() -> &'static raw::usart0::RegisterBlock {
+    #[cfg(test)]
+    {
+        dma::stop_tests::usart()
+    }
+    #[cfg(not(test))]
     // SAFETY: USART0 is owned by the VCOM seam, this module's only caller.
-    unsafe { &*raw::USART0::ptr() }
+    unsafe {
+        &*raw::USART0::ptr()
+    }
 }
 
-/// Bytes waiting, sent and unsent both.
-fn queued(head: usize, tail: usize) -> usize {
-    (head + TX_RING_LEN - tail) % TX_RING_LEN
+/// Ring arithmetic over the three cursors above, capped at what one descriptor covers.
+type Cursor = DmaTxCursor<TX_RING_LEN, TX_MAX_XFER>;
+
+/// Read the three cursors into a value the arithmetic works on. Callers hold the mask.
+fn cursor() -> Cursor {
+    Cursor::from_parts(
+        HEAD.load(Ordering::Relaxed),
+        TAIL.load(Ordering::Relaxed),
+        INFLIGHT.load(Ordering::Relaxed),
+    )
 }
 
 /// Hand the transmit FIFO to the controller. Called once, alongside the receive hand-over.
 pub(crate) fn start() {
     // Shares FIFOCFG with the FLEXCOMM0 handler, which preempts this.
-    cortex_m::interrupt::free(|_| {
+    dma::masked(|| {
         usart().fifocfg.modify(|_, w| w.dmatx().set_bit());
     });
     // Re-arm from the completion: waiting for the next USB pass idles the line at every boundary.
@@ -67,70 +79,61 @@ pub(crate) fn start() {
     STARTED.store(true, Ordering::Relaxed);
 }
 
-/// Reap a finished transfer and start the next run of bytes; usually one register read. Runs from
-/// the DMA0 completion and the USB pass both, so the sequence is masked against arming twice.
+/// Reap a finished transfer and arm the next; runs from DMA0 and the USB pass, so masked.
 pub(crate) fn service() {
     if !STARTED.load(Ordering::Relaxed) {
         return;
     }
-    cortex_m::interrupt::free(|_| {
+    dma::masked(|| {
         let mut reaped = false;
-        // The flag is read rather than cleared blindly, as on the receive and trace channels. The
-        // run in flight is dropped instead of re-sent: `cdc_out - uart_tx` then shows the loss,
-        // where a re-send would put duplicate bytes on the wire.
+        // A faulted run is dropped rather than re-sent, which would duplicate bytes on the wire.
         if dma::take_error(CHANNEL) {
             VCOM_TX_DMA_ERR.fetch_add(1, Ordering::Relaxed);
             dma::stop(CHANNEL);
-            let dropped = INFLIGHT.swap(0, Ordering::Relaxed);
-            let tail = TAIL.load(Ordering::Relaxed);
-            TAIL.store((tail + dropped) % TX_RING_LEN, Ordering::Relaxed);
+            let mut cursor = cursor();
+            cursor.drop_inflight();
+            TAIL.store(cursor.parts().1, Ordering::Relaxed);
+            INFLIGHT.store(0, Ordering::Relaxed);
             reaped = true;
         }
-        let inflight = INFLIGHT.load(Ordering::Relaxed);
-        if inflight != 0 && dma::tx_complete(CHANNEL) {
-            let tail = TAIL.load(Ordering::Relaxed);
-            TAIL.store((tail + inflight) % TX_RING_LEN, Ordering::Relaxed);
+        let mut cursor = cursor();
+        if cursor.is_armed() && dma::tx_complete(CHANNEL) {
+            let done = cursor.reap();
+            TAIL.store(cursor.parts().1, Ordering::Relaxed);
             INFLIGHT.store(0, Ordering::Relaxed);
-            SENT.fetch_add(inflight as u32, Ordering::Relaxed);
+            SENT.fetch_add(done as u32, Ordering::Relaxed);
             reaped = true;
         }
         kick();
         // Wake FLEXCOMM0's deferred rate change, only on the transition to empty and from a reap.
         if reaped && INFLIGHT.load(Ordering::Relaxed) == 0 {
+            #[cfg(not(test))]
             cortex_m::peripheral::NVIC::pend(lpc55_hal::raw::Interrupt::FLEXCOMM0);
         }
     });
 }
 
-/// Arm the run of bytes from `TAIL` up to the end of the ring or the writer, whichever comes
-/// first; a wrap simply costs one extra transfer. Callers hold the mask.
+/// Arm from `TAIL` to the ring end or the writer, whichever is first. Callers hold the mask.
 fn kick() {
-    if INFLIGHT.load(Ordering::Relaxed) != 0 {
+    let mut cursor = cursor();
+    #[cfg(feature = "probe-timing")]
+    let (busy, empty) = (cursor.is_armed(), cursor.queued() == 0);
+    let Some((tail, len)) = cursor.arm() else {
         #[cfg(feature = "probe-timing")]
-        PROBE_KICK_BUSY.fetch_add(1, Ordering::Relaxed);
+        if busy {
+            PROBE_KICK_BUSY.fetch_add(1, Ordering::Relaxed);
+        } else if empty {
+            PROBE_KICK_EMPTY.fetch_add(1, Ordering::Relaxed);
+        }
         return;
-    }
-    let head = HEAD.load(Ordering::Relaxed);
-    let tail = TAIL.load(Ordering::Relaxed);
-    if head == tail {
-        #[cfg(feature = "probe-timing")]
-        PROBE_KICK_EMPTY.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    let run = if head > tail {
-        head - tail
-    } else {
-        TX_RING_LEN - tail
     };
-    let len = run.min(TX_MAX_XFER);
     INFLIGHT.store(len, Ordering::Relaxed);
     #[cfg(feature = "probe-timing")]
     {
         PROBE_TX_ARMED.fetch_add(1, Ordering::Relaxed);
         PROBE_TX_ARMED_BYTES.fetch_add(len as u32, Ordering::Relaxed);
     }
-    // SAFETY: the run is `MEM`'s, and it lies between `TAIL` and `HEAD`, which the writer never
-    // stages into, so nothing else touches it until the transfer completes.
+    // SAFETY: the run lies between `TAIL` and `HEAD`, which the writer never stages into.
     let src = unsafe { core::ptr::addr_of!((*dma::mem()).tx.buf[tail]) };
     dma::arm_tx(
         CHANNEL,
@@ -147,9 +150,7 @@ pub(crate) fn capacity() -> usize {
         return 0;
     }
     service();
-    let head = HEAD.load(Ordering::Relaxed);
-    let tail = TAIL.load(Ordering::Relaxed);
-    TX_RING_LEN - 1 - queued(head, tail)
+    cursor().free()
 }
 
 /// Stage bytes for transmission, returning how many were taken.
@@ -158,34 +159,30 @@ pub(crate) fn write(data: &[u8]) -> usize {
         return 0;
     }
     service();
-    let head = HEAD.load(Ordering::Relaxed);
-    let free = TX_RING_LEN - 1 - queued(head, TAIL.load(Ordering::Relaxed));
-    let n = data.len().min(free);
-    if n == 0 {
+    let mut cursor = cursor();
+    let head = cursor.parts().0;
+    if data.is_empty() || cursor.free() == 0 {
         return 0;
     }
     // Copied before `HEAD` moves: a completion mid-copy arms only what was already published.
-    let first = (TX_RING_LEN - head).min(n);
-    // SAFETY: the bytes lie beyond `HEAD` and within the free count taken above, so the
-    // controller is not reading them.
+    let taken = cursor.accept(data.len());
+    // SAFETY: the bytes lie beyond `HEAD` within the free count, unread by the controller.
     unsafe {
         let base = core::ptr::addr_of_mut!((*dma::mem()).tx.buf) as *mut u8;
-        core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(head), first);
-        if n > first {
-            core::ptr::copy_nonoverlapping(data.as_ptr().add(first), base, n - first);
+        core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(head), taken.first);
+        if taken.second != 0 {
+            core::ptr::copy_nonoverlapping(data.as_ptr().add(taken.first), base, taken.second);
         }
     }
     // Publishing and arming together: the completion preempts this and would miss the copy above.
-    cortex_m::interrupt::free(|_| {
-        HEAD.store((head + n) % TX_RING_LEN, Ordering::Relaxed);
+    dma::masked(|| {
+        HEAD.store(cursor.parts().0, Ordering::Relaxed);
         kick();
     });
-    n
+    taken.taken
 }
 
-/// Bytes past the transmitter, free-running since boot: the reaped total less what the FIFO and
-/// the shift register still hold, which makes it a floor rather than a credit into `FIFOWR`. It is
-/// tight whenever the line is quiet, and short by the transfer in flight while one is running.
+/// Bytes past the transmitter since boot: a floor, short by any transfer in flight.
 pub(crate) fn sent() -> u32 {
     if !STARTED.load(Ordering::Relaxed) {
         return 0;
@@ -195,25 +192,72 @@ pub(crate) fn sent() -> u32 {
     let usart = usart();
     let resident = usart.fifostat.read().txlvl().bits() as u32
         + u32::from(usart.stat.read().txidle().bit_is_clear());
-    let floor = sent.wrapping_sub(resident);
-    let prev = WIRE.load(Ordering::Relaxed);
-    // Signed distance, so the clamp against a mid-transfer dip still survives the counter wrapping.
-    let wire = if (floor.wrapping_sub(prev) as i32) > 0 {
-        floor
-    } else {
-        prev
-    };
+    let wire = wire_floor(sent, resident, WIRE.load(Ordering::Relaxed));
     WIRE.store(wire, Ordering::Relaxed);
     wire
 }
 
-/// Whether everything staged has been handed to the transmitter; the shift register may still be
-/// draining, so a caller needing the line quiet checks `STAT.TXIDLE` as well.
+/// Bytes past the transmitter, never below the `prev` floor even across the counter wrapping.
+#[inline(always)]
+fn wire_floor(sent: u32, resident: u32, prev: u32) -> u32 {
+    let floor = sent.wrapping_sub(resident);
+    // Signed distance, so the clamp against a mid-transfer dip still survives the counter wrapping.
+    if (floor.wrapping_sub(prev) as i32) > 0 {
+        floor
+    } else {
+        prev
+    }
+}
+
+/// Whether everything staged reached the transmitter; the shift register may still be draining.
 pub(crate) fn drained() -> bool {
     if !STARTED.load(Ordering::Relaxed) {
         return true;
     }
     service();
-    INFLIGHT.load(Ordering::Relaxed) == 0
-        && HEAD.load(Ordering::Relaxed) == TAIL.load(Ordering::Relaxed)
+    let cursor = cursor();
+    !cursor.is_armed() && cursor.queued() == 0
+}
+
+#[cfg(test)]
+pub(crate) fn stop_test() {
+    use dma::stop_tests::{assert_unreleased, failed, script};
+    start();
+    assert_eq!(write(&[1, 2, 3, 4]), 4);
+    assert_eq!(write(&[5, 6]), 2);
+    let before = cursor().parts();
+    let bytes = unsafe { (*dma::mem()).tx.buf };
+    script(CHANNEL, None);
+    dma::error_sample();
+    failed(service);
+    assert_unreleased(CHANNEL);
+    assert_eq!(cursor().parts(), before);
+    assert_eq!(unsafe { (*dma::mem()).tx.buf }, bytes);
+    assert_eq!(SENT.load(Ordering::Relaxed), 0);
+    assert_eq!(VCOM_TX_DMA_ERR.load(Ordering::Relaxed), 1);
+    script(CHANNEL, Some(1));
+    dma::error_sample();
+    service();
+    assert_eq!(cursor().parts(), (6, 4, 2));
+    assert_eq!(SENT.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The floor advances with the counter, holds against a dip, and survives the wrap.
+    #[test]
+    fn the_wire_floor_never_walks_backwards_across_the_wrap() {
+        assert_eq!(wire_floor(100, 3, 90), 97);
+        assert_eq!(wire_floor(100, 20, 90), 90);
+        assert_eq!(wire_floor(100, 10, 90), 90);
+        assert_eq!(wire_floor(5, 10, u32::MAX - 100), u32::MAX - 4);
+        assert_eq!(wire_floor(10, 0, u32::MAX - 5), 10);
+        assert_eq!(
+            wire_floor(u32::MAX - 20, 0, 3),
+            3,
+            "a dip across the wrap still holds"
+        );
+    }
 }

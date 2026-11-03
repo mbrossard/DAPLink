@@ -3,16 +3,16 @@
 #![no_std]
 
 pub use daplink_core;
-pub use daplink_core::vendor::{
-    NoVendor, VendorChain, VendorHandler, VENDOR_CMD_FIRST, VENDOR_CMD_LAST,
-};
+pub use daplink_core::vendor::{NoVendor, VendorHandler, VENDOR_CMD_FIRST, VENDOR_CMD_LAST};
 
-mod composed_jtag;
 mod dap_probe;
+mod delay;
+#[cfg(test)]
+mod differential_tests;
 mod flash_backend;
 pub mod flash_mux;
-#[cfg(feature = "guard")]
 mod guard;
+mod jtag_transfer;
 mod late_jtag;
 mod leds;
 mod ram_text;
@@ -21,18 +21,21 @@ mod ring;
 mod spin;
 mod swd_mux;
 mod swd_only;
+mod swd_wait;
 mod swo;
+mod transfer_count;
 mod vcom_baud;
 mod vcom_stats;
 mod wired;
 
-pub use composed_jtag::{ComposedJtagDeps, ComposedJtagDrv, ComposedJtagSwd, SwjPadLoan};
-pub use dap_probe::{BitbangDap, ComposedJtagDap, DapProbe, SwdOnlyDap};
+pub use dap_probe::{BitbangDap, CommandFence, DapProbe, NoCommandFence, SwdOnlyDap};
 pub use daplink_core::dma_ring::{DmaRingCursor, DmaRxChannel, DmaRxRing};
-pub use flash_backend::HwBackend;
-pub use late_jtag::{
-    Deps as LateJtagDeps, JtagLines, LateJtag, LateJtagShifter, SwdDrv as LateSwdDrv,
+pub use delay::DynCycleDelay;
+pub use flash_backend::{
+    FencedFlashBackend, HwBackend, LendStaging, PooledFlashBackend, StagingPool,
 };
+pub use jtag_transfer::jtag_result;
+pub use late_jtag::{LateJtag, LateJtagDeps, LateSwdDrv};
 pub use leds::{noop_activity, Activity, BankLed, NoopLeds, StatusLed};
 pub use reboot::{
     BootloaderEntry, FlashBusy, NeverBusy, NoBootloader, RebootVendor, KIND_NONE, KIND_NXP_ISP,
@@ -42,7 +45,8 @@ pub use reboot::{
 pub use ring::{drain_fifo, ByteConsumer, ByteProducer, ByteRing, FIFO_DRAIN_BUDGET};
 pub use spin::{spin_cycles, PreparedSpin, CYCLES_PER_ITERATION};
 pub use swd_mux::{DapDeps, DapJtag, DapSwd, FlashSession, FlashSide, SwdMux};
-pub use swd_only::{Deps as SwdOnlyDeps, SwdDrv as SwdOnlySwdDrv};
+pub use swd_only::{SwdOnlyDeps, SwdOnlySwdDrv};
+pub use swd_wait::wait_retry;
 pub use swo::{RingSwo, SwoBackend, SwoSource};
 pub use vcom_baud::{
     VcomBaudState, VcomBaudVendor, VCOM_BAUD_APPLIED_VALID, VCOM_BAUD_CMD_ID,
@@ -57,11 +61,9 @@ pub use vcom_stats::{
     VCOM_VALID_FRAME_ERR, VCOM_VALID_HOST_DROPPED, VCOM_VALID_IDENTITY, VCOM_VALID_OVERRUN,
     VCOM_VALID_RING_FULL, VCOM_VALID_RX_DMA_ERR, VCOM_VALID_UART_RX, VCOM_VALID_UART_TX,
 };
-pub use wired::{wired_deps, wired_swd_deps, ScanChainStorage};
+pub use wired::{wired_deps, wired_swd_deps, ScanChainStorage, SwjPin, WiredAdapter};
 
 pub use dap_rs;
-pub use dap_rs::driver::bitbang::{
-    BitbangAdapter, DelayCycles, InputOutputPin, JtagAdapter, SwdAdapter,
-};
+pub use dap_rs::driver::bitbang::{DelayCycles, InputOutputPin};
 pub use dap_rs::swo::{NoSwo, Swo};
 pub use embedded_hal::delay::DelayNs;

@@ -45,8 +45,7 @@ pub fn lookup(name: &str) -> Result<&'static TargetProfile> {
 }
 
 impl TargetProfile {
-    /// The baud the target's integer TPIU prescaler actually realizes for `requested`, or `None`
-    /// when no prescaler divisor exists.
+    /// The baud the target's TPIU prescaler realizes for `requested`, if any divisor does.
     pub fn realized_baud(&self, requested: u32) -> Option<u32> {
         if requested == 0 {
             return None;

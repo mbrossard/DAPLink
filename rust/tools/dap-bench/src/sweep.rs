@@ -23,8 +23,7 @@ pub struct SweepRow {
     pub depth: u32,
 }
 
-/// The ascending clock ladder from `start_hz` to `max_hz`, doubling each rung. The caller
-/// validates `1 <= start_hz <= max_hz`.
+/// The ascending clock ladder from `start_hz` to `max_hz`, doubling each rung; needs `1 <= start_hz <= max_hz`.
 pub fn geometric_ladder(start_hz: u32, max_hz: u32) -> Vec<u32> {
     let mut rungs = Vec::new();
     let mut hz = start_hz.min(max_hz);
@@ -58,8 +57,7 @@ pub fn narrow_interval(low: u32, high: u32, midpoint_passed: bool) -> (u32, u32)
     }
 }
 
-/// Plateau onset over passing rungs in ascending clock order: the first rung whose next two
-/// improvements are both below 5%. `None` with fewer than 3 rows or a curve still climbing.
+/// First passing rung whose next two improvements are both below 5%, if any.
 pub fn detect_plateau(passing_rows: &[(u32, f64)]) -> Option<u32> {
     const THRESHOLD: f64 = 0.05;
     let improvement = |prev: f64, cur: f64| {

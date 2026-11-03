@@ -1,13 +1,8 @@
-//! Simulated real-host write sequences.
-//!
-//! Clean, sequential writes are not what a real host produces: macOS `msdosfs` writes metadata
-//! into the data region on mount, may create the dropped file's directory entry with size 0 and
-//! update it later, and does not guarantee data sectors arrive first, contiguously, or in order.
-//! These tests drive the full [`Vfs`] write path through those sequences: images still decode
-//! and program, host metadata never starts a bogus transfer, and a failure reaches the
-//! `DETAILS.TXT` status line. Besides the named-drop (dirent-first) orderings, the `data_first_*`
-//! and AppleDouble tests drive the content-sniffed ordering: an image arriving with no entry.
+//! Real-host write sequences: early metadata, size-0 entries, out-of-order and data-first drops.
 
+mod common;
+
+use common::{dir_entry, uf2_numbered};
 use daplink_core::{FlashBackend, FlashPhase};
 use daplink_targets::{targets::rp2040::RP2040, Target};
 use daplink_vfs::{
@@ -15,8 +10,7 @@ use daplink_vfs::{
     VfsFile,
 };
 
-/// A flash backend that records every programmed fragment so a test can reassemble and check the
-/// decoded image. Its flash range spans the RP2040 XIP window the test images are addressed for.
+/// A flash backend recording every programmed fragment, over the RP2040 XIP window.
 struct RecordingBackend {
     ranges: [(u32, u32); 1],
     writes: Vec<(u32, Vec<u8>)>,
@@ -25,8 +19,7 @@ struct RecordingBackend {
 }
 
 impl RecordingBackend {
-    /// The window is taken from the RP2040 chip record rather than restated, so it cannot drift
-    /// from it (see `write_order_replay.rs`, which sweeps the same records for the same reason).
+    /// The window comes from the RP2040 chip record so it cannot drift.
     fn new() -> Self {
         let flash = RP2040
             .flash_regions()
@@ -77,16 +70,6 @@ impl FlashBackend for RecordingBackend {
     }
 }
 
-/// A 32-byte directory entry.
-fn dir_entry(name: &[u8; 11], attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
-    let mut e = [0u8; 32];
-    e[0..11].copy_from_slice(name);
-    e[11] = attr;
-    e[26..28].copy_from_slice(&first_cluster.to_le_bytes());
-    e[28..32].copy_from_slice(&size.to_le_bytes());
-    e
-}
-
 /// Write a single 32-byte entry into root-directory `slot` (0..15 of sector 131) and apply it.
 fn write_dir_slot(
     vfs: &mut daplink_vfs::Vfs<'_, FlashSink<RecordingBackend>, NoObserver>,
@@ -100,29 +83,16 @@ fn write_dir_slot(
 
 const XIP_BASE: u32 = 0x1000_0000;
 
-/// A UF2 block placing `payload` at `base + block_no * 256`, tagged block `block_no` of
-/// `num_blocks`. `good_end` controls whether the terminating magic is valid.
+/// Block `block_no` of `num_blocks` at its XIP page; `good_end: false` corrupts the end magic.
 fn uf2_block(block_no: u32, num_blocks: u32, payload: &[u8], good_end: bool) -> [u8; 512] {
-    let mut b = [0u8; 512];
-    b[0..4].copy_from_slice(&0x0A32_4655u32.to_le_bytes()); // MAGIC_START0
-    b[4..8].copy_from_slice(&0x9E5D_5157u32.to_le_bytes()); // MAGIC_START1
-    b[8..12].copy_from_slice(&0u32.to_le_bytes()); // flags (no family)
-    b[12..16].copy_from_slice(&(XIP_BASE + block_no * 256).to_le_bytes()); // target addr
-    b[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // payload size
-    b[20..24].copy_from_slice(&block_no.to_le_bytes());
-    b[24..28].copy_from_slice(&num_blocks.to_le_bytes());
-    b[32..32 + payload.len()].copy_from_slice(payload);
-    let end = if good_end {
-        0x0AB1_6F30u32
-    } else {
-        0xDEAD_BEEFu32
-    };
-    b[508..512].copy_from_slice(&end.to_le_bytes());
+    let mut b = uf2_numbered(block_no, num_blocks, XIP_BASE + block_no * 256, payload);
+    if !good_end {
+        b[508..512].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    }
     b
 }
 
-/// A garbage 512-byte "metadata" sector (no image magic): stands in for `.fseventsd` /
-/// `.Spotlight-V100` cluster contents the host writes into the data region.
+/// A magicless sector standing in for host metadata written into the data region.
 fn metadata_sector(fill: u8) -> [u8; 512] {
     let mut s = [fill; 512];
     // Zero the leading word so the sector can never be mistaken for an image start.
@@ -164,7 +134,6 @@ fn find(
     None
 }
 
-/// Read a generated file's body through the volume (single contiguous run is enough here).
 fn read_file(
     vfs: &mut daplink_vfs::Vfs<'_, FlashSink<RecordingBackend>, NoObserver>,
     name: &[u8; 11],
@@ -191,7 +160,7 @@ fn status_line(vfs: &mut daplink_vfs::Vfs<'_, FlashSink<RecordingBackend>, NoObs
     text[off..off + 64].trim_end().to_string()
 }
 
-/// Drive the volume through the finished transfer's detach + remount so status files refresh.
+/// Drive the detach and remount so status files refresh.
 fn cycle_remount(vfs: &mut daplink_vfs::Vfs<'_, FlashSink<RecordingBackend>, NoObserver>) {
     // A finished transfer detaches on the next tick.
     for _ in 0..2 {
@@ -237,14 +206,14 @@ fn metadata_written_before_file_does_not_start_bogus_transfer() {
     with_vfs!(vfs, {
         let (b0, b1, expected) = two_block_uf2();
 
-        // The host creates the .uf2 directory entry (binding UF2, cluster 10, size 1024)...
+        // The host creates the directory entry (UF2, cluster 10, size 1024)...
         write_dir_slot(
             &mut vfs,
             5,
             &dir_entry(b"APP     UF2", 0x20, USER_CLUSTER, 1024),
         );
 
-        // ...then writes filesystem metadata into the data region FIRST (clusters 6 and 7).
+        // ...then writes metadata into the data region first.
         vfs.write_sector(fat::cluster_to_lba(6), &metadata_sector(0x5A));
         vfs.write_sector(fat::cluster_to_lba(7), &metadata_sector(0xC3));
         // No transfer must have started from metadata.
@@ -274,8 +243,7 @@ fn dir_entry_size_zero_then_updated_after_data() {
         vfs.write_sector(fat::cluster_to_lba(6), &metadata_sector(0x11));
         assert!(!vfs.is_transfer_active());
 
-        // The data streams while the entry still reads size 0 (so the stream stays "unsized" and
-        // completes on the finishable idle timeout, exactly as on real firmware's tick loop).
+        // The data streams while the entry still reads size 0, so it completes on the unsized timeout.
         vfs.write_sector(user_lba(0), &b0);
         vfs.write_sector(user_lba(1), &b1);
         // The host rewrites the entry with the real cluster and size on close.
@@ -340,8 +308,7 @@ fn apple_double_sidecar_with_same_basename_is_ignored() {
     with_vfs!(vfs, {
         let (b0, b1, expected) = two_block_uf2();
 
-        // A macOS `._APP.UF2` AppleDouble sidecar (hidden) shares the basename; it must neither
-        // bind the transfer nor, via its own data, corrupt it.
+        // A hidden AppleDouble sidecar sharing the basename must neither bind nor corrupt the transfer.
         write_dir_slot(&mut vfs, 4, &dir_entry(b"._APP   UF2", 0x22, 6, 4096));
         write_dir_slot(
             &mut vfs,
@@ -363,8 +330,7 @@ fn apple_double_sidecar_with_same_basename_is_ignored() {
 #[test]
 fn details_status_populated_on_decode_error() {
     with_vfs!(vfs, {
-        // A UF2 whose start magic is valid (so it starts) but whose terminating magic is corrupt:
-        // the decoder rejects it and the transfer fails with DecodeError.
+        // A valid start magic with a corrupt end magic fails with DecodeError.
         let bad = uf2_block(0, 1, &[0xAAu8; 256], false);
         write_dir_slot(
             &mut vfs,
@@ -388,8 +354,7 @@ fn details_status_populated_on_decode_error() {
 #[test]
 fn data_first_sniff_starts_and_late_dirent_completes_it() {
     with_vfs!(vfs, {
-        // The payload arrives with no directory entry at all: nothing but the block magic says
-        // these bytes are an image, and that is what has to start the transfer.
+        // No directory entry at all: the block magic alone starts the transfer.
         let (b0, b1, expected) = two_block_uf2();
 
         vfs.write_sector(user_lba(0), &b0);
@@ -399,8 +364,7 @@ fn data_first_sniff_starts_and_late_dirent_completes_it() {
         );
         vfs.write_sector(user_lba(1), &b1);
 
-        // The entry lands last, carrying the size the stream has already met and the cluster
-        // whose first sector is the one the stream began at: it binds and completes inline.
+        // The entry lands last with the met size and the starting cluster: it binds and completes.
         write_dir_slot(
             &mut vfs,
             5,
@@ -416,9 +380,7 @@ fn data_first_sniff_starts_and_late_dirent_completes_it() {
 #[test]
 fn interleaved_metadata_during_a_data_first_drop_is_ignored() {
     with_vfs!(vfs, {
-        // Same data-first drop, but host housekeeping lands on a cluster ahead of the streaming
-        // front while the entry is still unwritten, so the stream has no size to bound it by.
-        // A magicless sector is foreign wherever it lands, never a gap the transfer waits to heal.
+        // Data-first, with housekeeping ahead of the front: a magicless sector is foreign, not a gap.
         let (b0, b1, expected) = two_block_uf2();
 
         vfs.write_sector(user_lba(0), &b0);
@@ -450,10 +412,7 @@ fn interleaved_metadata_during_a_data_first_drop_is_ignored() {
 #[test]
 fn a_reordered_data_first_drop_reports_out_of_order_not_timeout() {
     with_vfs!(vfs, {
-        // The same data-first drop, but the host writes the third payload sector before the
-        // second. The early block is discarded as a gap, the front never re-covers it, and the
-        // entry's size can never be met. The user must be told the sectors arrived in an order
-        // the transfer could not follow -- `Timeout` reads as a hung probe.
+        // Data-first with the third sector before the second: the verdict names the reorder.
         vfs.write_sector(user_lba(0), &uf2_block(0, 3, &[0xA1u8; 256], true));
         assert!(vfs.is_transfer_active());
         vfs.write_sector(user_lba(2), &uf2_block(2, 3, &[0xC3u8; 256], true));
@@ -491,10 +450,7 @@ fn a_reordered_data_first_drop_reports_out_of_order_not_timeout() {
 #[test]
 fn apple_double_sidecar_does_not_claim_a_data_first_drop() {
     with_vfs!(vfs, {
-        // The AppleDouble sidecar ordering against the unbound path: the sidecar's own dirent and
-        // data land first, then the real file's payload sniff-starts before its own entry exists.
-        // Nothing about the sidecar -- hidden, same basename, its own data cluster -- may claim
-        // or corrupt that stream.
+        // The sidecar lands first, then the real payload sniff-starts; the sidecar must not claim it.
         write_dir_slot(&mut vfs, 4, &dir_entry(b"._APP   UF2", 0x22, 6, 4096));
         vfs.write_sector(fat::cluster_to_lba(6), &metadata_sector(0x2E));
         assert!(!vfs.is_transfer_active());

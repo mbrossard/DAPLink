@@ -5,13 +5,13 @@ edition = "2021"
 license = "Apache-2.0"
 description = "rp2040-hal platform support for daplink-rs"
 
-# Own workspace: pins its own embedded target and HAL feature graph.
 [workspace]
 
 [dependencies]
 rp2040-hal = { version = "0.10", features = ["rt"] }
 usb-device = "0.3"
 cortex-m = "0.7"
+critical-section = "1"
 static_cell = "2"
 # thumbv6m has no atomic CAS; portable-atomic routes StaticCell's CAS through critical-section.
 portable-atomic = { version = "1", default-features = false, features = ["critical-section"] }
@@ -19,14 +19,12 @@ portable-atomic = { version = "1", default-features = false, features = ["critic
 daplink-rs = { path = "../../crates/daplink-rs" }
 pl011-baud = { path = "../../crates/pl011-baud" }
 daplink-usb-device = { path = "../daplink-usb-device" }
+# Optional bring-up logging, enabled by the image that carries the RTT transport.
+defmt = { version = "1", optional = true }
 
-# `carrier-leds` wires the Pico-family carrier's five-LED debug bank (GP10/11/12/14/15); GP15
-# (SWO) has no cheap activity tap on this firmware and stays dark.
 [features]
-carrier-leds = []
-clock-200mhz = []
+defmt = ["dep:defmt"]
 
-# The unique-id read is the only use, and rp2040-flash's ARM inline asm is unconditional, so the
-# dependency is target-only and the host gate can reach the rest of the crate.
+# Target-only: rp2040-flash's inline asm is unconditional, and only the unique-id read needs it.
 [target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
 rp2040-flash = "0.5"

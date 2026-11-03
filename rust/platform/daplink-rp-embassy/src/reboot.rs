@@ -5,8 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use daplink_rs::{BootloaderEntry, KIND_UF2};
 use embassy_time::Timer;
 
-/// Latched by [`RpUsbBoot::arm`], observed by [`reboot_armed`]. Plain load/store only (no CAS),
-/// so it is sound on the RP2040's thumbv6m core without `portable-atomic`.
+/// Latched by [`RpUsbBoot::arm`]; plain load/store only, since thumbv6m has no CAS.
 static REBOOT: AtomicBool = AtomicBool::new(false);
 
 /// Grace before entering the ROM, so the host reads the acknowledgement before USB resets.
@@ -19,8 +18,7 @@ pub fn reboot_armed() -> bool {
     REBOOT.load(Ordering::SeqCst)
 }
 
-/// The RP-family boot-ROM BOOTSEL entry: restarts the chip as the RPI-RP2 UF2 device. The
-/// `embassy-rp` name is chip-agnostic, so one type serves both the Pico and the Pico 2.
+/// The RP-family boot-ROM BOOTSEL entry, one type for both the Pico and the Pico 2.
 pub struct RpUsbBoot;
 
 impl BootloaderEntry for RpUsbBoot {
@@ -39,8 +37,7 @@ impl BootloaderEntry for RpUsbBoot {
     }
 }
 
-/// Thread-mode reboot trigger: wait for a reboot to be armed, wait the grace out so the DAP
-/// response drains, then enter the ROM. Spawned as a task, keeping the ROM entry out of the ISR.
+/// Thread-mode reboot trigger: once armed, wait the grace out, then enter the ROM outside the ISR.
 #[embassy_executor::task]
 pub async fn reboot_watch() -> ! {
     loop {

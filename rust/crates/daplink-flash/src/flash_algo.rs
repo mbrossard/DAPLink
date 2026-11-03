@@ -68,8 +68,6 @@ pub struct FlashRegion<'a> {
     pub end: u32,
     /// Whether this is the default region for drag-n-drop programming.
     pub is_default: bool,
-    /// Whether this region is secure.
-    pub is_secure: bool,
     /// The algorithm that programs this region.
     pub algo: &'a FlashAlgorithm<'a>,
 }

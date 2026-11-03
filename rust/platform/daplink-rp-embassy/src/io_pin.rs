@@ -6,7 +6,6 @@ use embassy_rp::pac::SIO;
 use embassy_rp::Peri;
 
 /// A GPIO line driven by SIO register mask; a zero mask is a no-connect, `open_drain` marks nRESET.
-/// Stateless, so a second handle to the same pad is safe to hold.
 #[derive(Clone, Copy)]
 pub struct IoPin {
     mask: u32,
@@ -69,8 +68,7 @@ impl InputOutputPin for IoPin {
     }
 }
 
-/// A line whose drive and readback are separate pads; a zero mask is a no-connect. Direction and
-/// level go to the driven pad, so the SWD read turnaround tristates that pad alone.
+/// A line with separate drive and readback pads, so the read turnaround tristates only the driven pad.
 #[derive(Clone, Copy)]
 pub struct SplitIoPin {
     out_mask: u32,

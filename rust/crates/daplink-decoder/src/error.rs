@@ -6,6 +6,8 @@
 pub enum Error {
     /// A uf2 block was malformed: bad magic, oversized payload, or a trailing partial block.
     Uf2,
+    /// A uf2 stream ended short of the `numBlocks` its own blocks declared.
+    Uf2Short,
     /// An internal invariant failed, e.g. the caller's scratchpad is too small for a record/block.
     Internal,
 }

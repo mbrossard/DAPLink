@@ -19,8 +19,7 @@ fn mock() -> MockFlash {
     MockFlash::uniform(BASE, SIZE, SECTOR)
 }
 
-/// Forwards to a [`MockFlash`] shared behind `Rc<RefCell<_>>`, so a test can keep observing it
-/// after the `FlashManager` that owned it by value has been dropped.
+/// Forwards to a shared [`MockFlash`], observable after the owning `FlashManager` drops.
 struct SharedMock(Rc<RefCell<MockFlash>>);
 
 impl FlashInterface for SharedMock {
@@ -169,8 +168,7 @@ fn caller_opened_session_is_torn_down_by_drop() {
     assert!(!flash.is_initialized(), "the session must be closed");
 }
 
-/// The reset-after-flash policy learned at the end of a transfer reaches the device: `finish`
-/// applies it just before teardown.
+/// `finish` applies the reset-after-flash policy just before teardown.
 #[test]
 fn finish_threads_the_reset_policy_to_the_device() {
     const PROGRAM: FlashOp = FlashOp::ProgramPage {
@@ -263,6 +261,109 @@ fn erase_mode_chip_uses_chip_erase() {
         FlashOp::PostFlashReset,
     ]);
     flash.assert_no_violations();
+}
+
+#[test]
+fn unsupported_erase_does_not_program_in_either_manager_path() {
+    for stepped in [false, true] {
+        for mode in [EraseMode::Sector, EraseMode::Chip] {
+            let mut flash = MockFlashBuilder::new(BASE, SIZE)
+                .uniform_sectors(SECTOR)
+                .no_sector_erase();
+            if mode == EraseMode::Chip {
+                flash = flash.no_chip_erase();
+            }
+            let mut buf = [0; PAGE as usize];
+            let mut mgr = FlashManager::new(flash.build(), &mut buf).unwrap();
+            mgr.set_erase_mode(mode);
+            mgr.set_post_flash_reset(false);
+            if stepped {
+                assert!(mgr.prepare_begin().unwrap().is_none());
+                assert_eq!(mgr.stage(BASE, &[0x55; PAGE as usize]), Ok(PAGE as usize));
+                assert!(matches!(mgr.flush_begin(), Err(Error::EraseNotSupported)));
+            } else {
+                assert_eq!(
+                    mgr.write(BASE, &[0x55; PAGE as usize]),
+                    Err(Error::EraseNotSupported)
+                );
+            }
+            let (flash, _) = mgr.abort();
+            flash.assert_operations(&[FlashOp::Init, FlashOp::EraseSector(BASE), FlashOp::Uninit]);
+            assert_eq!(
+                flash.read(BASE, SIZE as usize),
+                alloc::vec![0xff; SIZE as usize]
+            );
+            assert!(!flash.is_initialized());
+            flash.assert_no_violations();
+        }
+    }
+}
+
+#[test]
+fn chip_erase_programs_without_sector_erase_support() {
+    let flash = MockFlashBuilder::new(BASE, SIZE)
+        .uniform_sectors(SECTOR)
+        .no_sector_erase()
+        .build();
+    let mut buf = [0; PAGE as usize];
+    let mut mgr = FlashManager::new(flash, &mut buf).unwrap();
+    mgr.set_erase_mode(EraseMode::Chip);
+    mgr.write(BASE, &[0x55; PAGE as usize]).unwrap();
+    let (result, (flash, _)) = mgr.finish(false);
+    result.unwrap();
+    flash.assert_operations(&[
+        FlashOp::Init,
+        FlashOp::EraseChip,
+        FlashOp::ProgramPage {
+            addr: BASE,
+            len: PAGE as usize,
+        },
+        FlashOp::Uninit,
+    ]);
+    assert_eq!(flash.read(BASE, PAGE as usize), [0x55; PAGE as usize]);
+    flash.assert_no_violations();
+}
+
+#[test]
+fn unsupported_mock_erases_preserve_programmed_bytes() {
+    for sector in [false, true] {
+        let builder = MockFlashBuilder::new(BASE, SIZE).uniform_sectors(SECTOR);
+        let mut flash = if sector {
+            builder.no_sector_erase()
+        } else {
+            builder.no_chip_erase()
+        }
+        .build();
+        flash.init().unwrap();
+        let (supported, rejected) = if sector {
+            flash.erase_chip().unwrap();
+            (FlashOp::EraseChip, FlashOp::EraseSector(BASE))
+        } else {
+            flash.erase_sector(BASE).unwrap();
+            (FlashOp::EraseSector(BASE), FlashOp::EraseChip)
+        };
+        flash.program_page(BASE, &[0x55; PAGE as usize]).unwrap();
+        let result = if sector {
+            flash.erase_sector(BASE)
+        } else {
+            flash.erase_chip()
+        };
+        assert_eq!(result, Err(Error::EraseNotSupported));
+        assert_eq!(flash.read(BASE, PAGE as usize), [0x55; PAGE as usize]);
+        flash.set_post_flash_reset(false);
+        flash.uninit().unwrap();
+        flash.assert_operations(&[
+            FlashOp::Init,
+            supported,
+            FlashOp::ProgramPage {
+                addr: BASE,
+                len: PAGE as usize,
+            },
+            rejected,
+            FlashOp::Uninit,
+        ]);
+        flash.assert_no_violations();
+    }
 }
 
 #[test]
@@ -409,8 +510,7 @@ fn unaligned_program_is_rejected() {
     );
 }
 
-/// A buffer too small to hold a page still programs aligned blocks, at the largest power of two
-/// it can stage.
+/// A buffer smaller than a page programs aligned blocks at the largest power of two it holds.
 #[test]
 fn buffer_full_auto_flushes() {
     let mut buf = [0u8; 8];
@@ -473,8 +573,7 @@ fn buffer_larger_than_the_device_page_is_split() {
     assert_eq!(flash.read(BASE, 1024), [0x5A; 1024]);
 }
 
-/// The same split holds when arriving fragments are smaller than the page: the manager still
-/// accumulates up to the device's page rather than the buffer's capacity.
+/// Small fragments still accumulate to the device's page, not the buffer's capacity.
 #[test]
 fn small_fragments_accumulate_to_the_device_page() {
     let mut buf = [0u8; 1024];
@@ -551,8 +650,7 @@ fn unaligned_fragment_is_programmed_as_aligned_pages() {
     assert_eq!(flash.read(BASE + 0x104 + 600, 4), [0xFF; 4]);
 }
 
-/// The mock refuses what the manager must never emit: a page-sized run at a non-page-base
-/// address, and a length that cannot be an aligned page block.
+/// The mock refuses non-page-base page runs and unaligned block lengths.
 #[test]
 fn mock_rejects_a_program_that_is_not_an_aligned_page_block() {
     let mut raw = mock();
@@ -577,8 +675,7 @@ fn mock_rejects_a_program_that_is_not_an_aligned_page_block() {
     );
 }
 
-/// Two fragments in one page with a gap between them are programmed as a single page, the gap
-/// filled with the erased value.
+/// Two gapped fragments in one page program as one page, the gap filled with the erased value.
 #[test]
 fn gap_inside_one_page_is_filled_rather_than_reprogrammed() {
     let mut buf = [0u8; 256];
@@ -604,8 +701,7 @@ fn gap_inside_one_page_is_filled_rather_than_reprogrammed() {
     assert_eq!(flash.read(BASE + 0x80, 4), [0xB2; 4]);
 }
 
-/// A sector run whose start is not a multiple of its own sector size: the base of the sector
-/// covering an address is relative to the run's start, not to an absolute multiple of the size.
+/// Sector bases are relative to a run's start, not absolute multiples of the sector size.
 #[test]
 fn offset_sector_run_erases_the_sector_it_programs() {
     const RUN_START: u32 = BASE + 0x400;

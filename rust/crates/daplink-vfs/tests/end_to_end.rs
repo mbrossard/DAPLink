@@ -1,6 +1,9 @@
 //! End-to-end tests: drop an image, cycle the remount, inspect the volume via a host reader.
 #![allow(dead_code, unused_imports)]
 
+mod common;
+
+use common::{dir_entry, uf2_block};
 use daplink_vfs::transfer::TransferOutcome;
 use daplink_vfs::{
     fat, DecoderSet, MediaState, NoObserver, NullSink, TransferSink, VfsConfig, VfsFile,
@@ -71,16 +74,6 @@ impl HostReader {
     }
 }
 
-/// Build a root-directory entry for a dropped file.
-fn dir_entry(name: &[u8; 11], attr: u8, first_cluster: u16, size: u32) -> [u8; 32] {
-    let mut e = [0u8; 32];
-    e[0..11].copy_from_slice(name);
-    e[11] = attr;
-    e[26..28].copy_from_slice(&first_cluster.to_le_bytes());
-    e[28..32].copy_from_slice(&size.to_le_bytes());
-    e
-}
-
 #[test]
 fn registered_details_file_extracts() {
     use daplink_vfs::{DetailsFile, DeviceInfo};
@@ -100,18 +93,6 @@ fn registered_details_file_extracts() {
     assert!(text.contains("Unique ID: SER123"));
 }
 
-/// Build a valid single-block uf2 sector placing `payload` at `addr`.
-fn uf2_block(addr: u32, payload: &[u8]) -> [u8; 512] {
-    let mut b = [0u8; 512];
-    b[0..4].copy_from_slice(&0x0A32_4655u32.to_le_bytes()); // MAGIC_START0
-    b[4..8].copy_from_slice(&0x9E5D_5157u32.to_le_bytes()); // MAGIC_START1
-    b[12..16].copy_from_slice(&addr.to_le_bytes()); // target addr
-    b[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // payload size
-    b[32..32 + payload.len()].copy_from_slice(payload);
-    b[508..512].copy_from_slice(&0x0AB1_6F30u32.to_le_bytes()); // MAGIC_END
-    b
-}
-
 #[test]
 fn drop_image_flows_and_remounts_with_stats() {
     use daplink_vfs::{FatShortName, StatsSink};
@@ -128,8 +109,7 @@ fn drop_image_flows_and_remounts_with_stats() {
         NoObserver,
     );
 
-    // The transfer engine is directory-driven: the file's data must be written to the LBAs of
-    // its declared cluster, so it streams from cluster 3's first sector.
+    // The engine is directory-driven: data streams from the declared cluster's first sector.
     let mut root = [0u8; 512];
     root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 3, 512));
     vfs.write_sector(131, &root);
@@ -138,8 +118,11 @@ fn drop_image_flows_and_remounts_with_stats() {
         &uf2_block(0x0800_0000, &[1, 2, 3, 4]),
     );
 
-    // The sized transfer completes; tick detaches, then remounts.
-    assert_eq!(vfs.tick(1), MediaState::Detached);
+    // The sized transfer completes; the volume detaches once the host is quiet, then remounts.
+    assert_eq!(
+        vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_MS),
+        MediaState::Detached
+    );
     assert!(vfs.take_transfer_finished());
     assert_eq!(vfs.tick(daplink_vfs::MSC_RECONNECT_MS), MediaState::Ready);
 
@@ -148,8 +131,7 @@ fn drop_image_flows_and_remounts_with_stats() {
 
 #[test]
 fn multi_file_session_decodes_independently() {
-    // Two back-to-back transfers in the SAME Vfs must decode independently: the second must not
-    // inherit the first's format/size state (pins the full reset of bound_ext/expected_size).
+    // Two transfers in the same Vfs decode independently; no format or size state carries over.
     use daplink_decoder::Format;
     use daplink_vfs::StatsSink;
 
@@ -161,7 +143,6 @@ fn multi_file_session_decodes_independently() {
         NoObserver,
     );
 
-    // First session: a one-block image, sized by its entry.
     let mut root = [0u8; 512];
     root[0..32].copy_from_slice(&dir_entry(b"APP     UF2", 0x20, 2, 512));
     vfs.write_sector(131, &root);
@@ -170,13 +151,13 @@ fn multi_file_session_decodes_independently() {
     assert_eq!(vfs.sink().fmt, Some(Format::Uf2));
     assert_eq!(vfs.sink().addr_min, 0x0800_0000);
 
-    // Cycle the remount.
-    assert_eq!(vfs.tick(1), MediaState::Detached);
+    assert_eq!(
+        vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_MS),
+        MediaState::Detached
+    );
     assert!(vfs.take_transfer_finished());
     assert_eq!(vfs.tick(daplink_vfs::MSC_RECONNECT_MS), MediaState::Ready);
 
-    // Second session in the same Vfs: a different image at a different address, decoded on its
-    // own terms rather than against the first session's leftover size and addresses.
     let mut root2 = [0u8; 512];
     root2[0..32].copy_from_slice(&dir_entry(b"NEXT    UF2", 0x20, 2, 512));
     vfs.write_sector(131, &root2);
@@ -189,9 +170,7 @@ fn multi_file_session_decodes_independently() {
 
 #[test]
 fn details_status_names_the_failure_then_the_success() {
-    // DETAILS.TXT is the reporting surface: each remount patches its `Status:` field with the
-    // last transfer's rendered line, so a host reads a failure there and a later success clears
-    // it -- without the file's size or any other offset moving.
+    // Each remount patches `Status:` in DETAILS.TXT without moving any offset.
     use daplink_vfs::{DetailsFile, DeviceInfo, StatsSink};
 
     let mut details = DetailsFile::new(DeviceInfo {
@@ -234,8 +213,7 @@ fn details_status_names_the_failure_then_the_success() {
         "status names the failure: {text:?}"
     );
 
-    // A dropped image whose data is never recognized (every sector guard-skipped) must also
-    // fail loud, and name the no-data reason after the active-timeout remount.
+    // An image whose data is never recognized fails loud with the no-data reason.
     let mut root3 = [0u8; 512];
     root3[32..64].copy_from_slice(&dir_entry(b"GHOST   UF2", 0x20, 0, 4096));
     vfs.write_sector(131, &root3);
@@ -263,7 +241,10 @@ fn details_status_names_the_failure_then_the_success() {
         &uf2_block(0x0800_0000, &[1, 2, 3, 4]),
     );
     assert_eq!(vfs.sink().outcome(), Some(TransferOutcome::Done));
-    assert_eq!(vfs.tick(1), MediaState::Detached);
+    assert_eq!(
+        vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_MS),
+        MediaState::Detached
+    );
     assert_eq!(vfs.tick(daplink_vfs::MSC_RECONNECT_MS), MediaState::Ready);
     let text = status_of(&mut vfs);
     assert!(text.ends_with("-> Done"), "status: {text:?}");

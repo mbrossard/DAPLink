@@ -1,4 +1,4 @@
-//! PAC-register GPIO line for the bit-bang SWJ driver; handles are `Copy`.
+//! PAC-register GPIO line for the bit-bang SWJ driver.
 
 use daplink_rs::InputOutputPin;
 use embassy_stm32::gpio::Pin;
@@ -8,7 +8,6 @@ use embassy_stm32::Peri;
 /// GPIO ports sit `0x400` apart on every STM32.
 const PORT_STRIDE: usize = 0x400;
 
-/// Register access for one line: the port block address plus the pin index.
 #[derive(Clone, Copy)]
 pub struct Line {
     block: usize,
@@ -29,7 +28,7 @@ impl Line {
         unsafe { Gpio::from_ptr(self.block as *mut ()) }
     }
 
-    /// Drive the line (or, open-drain, release it) through the atomic set/reset register.
+    /// Drive the line, or release an open-drain one, through BSRR.
     #[inline(always)]
     fn set_high(&self, high: bool) {
         let bit = if high {
@@ -45,7 +44,7 @@ impl Line {
         self.block().idr().read().0 & (1 << self.pin) != 0
     }
 
-    /// Rewrite this pin's two MODER bits; the other config registers are set once at wiring.
+    /// Rewrite this pin's MODER bits; speed and pull are set once at wiring.
     fn set_mode(&self, mode: u32) {
         let shift = 2 * self.pin;
         let moder = self.block().moder();
@@ -54,30 +53,32 @@ impl Line {
     }
 }
 
-/// MODER field values: general-purpose input / output.
 const MODE_INPUT: u32 = 0b00;
 const MODE_OUTPUT: u32 = 0b01;
 
-/// A bit-bang SWJ line: `Pin` is bidirectional push-pull, `OpenDrain` drives a wired-AND net and
-/// stays an output permanently (the data register alone releases it), `Nc` is a no-op placeholder.
+/// A bit-bang SWJ line; `OpenDrain` stays an output and releases through ODR alone.
 #[derive(Clone, Copy)]
 pub enum IoPin {
-    /// A single bidirectional push-pull line.
     Pin(Line),
-    /// A bidirectional open-drain line: low is driven, high releases (wired-AND).
+    /// An open-drain line: low is driven, high releases.
     OpenDrain(Line),
-    /// A no-connect pin: every operation is a no-op.
     Nc,
 }
 
 impl IoPin {
-    /// Wire a bidirectional push-pull line: very-high speed, pulled up, idle high, input for now.
+    /// A push-pull line at very-high speed, pulled up, starting as an input.
     pub fn new(p: Peri<'static, impl Pin>) -> Self {
+        Self::with_speed(p, 0b11)
+    }
+
+    /// [`new`](Self::new) at a caller-chosen `OSPEEDR` class.
+    pub fn with_speed(p: Peri<'static, impl Pin>, speed: u32) -> Self {
         let line = Line::new(p.port(), p.pin());
         let block = line.block();
         let shift = 2 * line.pin;
-        // Speed and pull are set once here; only MODER flips at runtime.
-        block.ospeedr().modify(|w| w.0 |= 0b11 << shift);
+        block
+            .ospeedr()
+            .modify(|w| w.0 = (w.0 & !(0b11 << shift)) | ((speed & 0b11) << shift));
         block
             .pupdr()
             .modify(|w| w.0 = (w.0 & !(0b11 << shift)) | (0b01 << shift));
@@ -86,11 +87,11 @@ impl IoPin {
         IoPin::Pin(line)
     }
 
-    /// Wire a bidirectional open-drain line (typically nRESET), released, permanently an output.
+    /// An open-drain line (typically nRESET), released and permanently an output.
     pub fn new_open_drain(p: Peri<'static, impl Pin>) -> Self {
         let line = Line::new(p.port(), p.pin());
         line.block().otyper().modify(|w| w.0 |= 1 << line.pin);
-        // Release before entering output mode, so a stale low can never assert the net.
+        // Release before entering output mode, so a stale low never asserts the net.
         line.set_high(true);
         line.set_mode(MODE_OUTPUT);
         IoPin::OpenDrain(line)
@@ -101,7 +102,6 @@ impl InputOutputPin for IoPin {
     fn set_as_output(&mut self) {
         match self {
             IoPin::Pin(l) => l.set_mode(MODE_OUTPUT),
-            // Already (and permanently) an open-drain output.
             IoPin::OpenDrain(_) | IoPin::Nc => {}
         }
     }
@@ -114,7 +114,7 @@ impl InputOutputPin for IoPin {
     fn set_as_input(&mut self) {
         match self {
             IoPin::Pin(l) => l.set_mode(MODE_INPUT),
-            // "Input" for the open-drain line means released; the net's pull-up raises it.
+            // Released; the net's pull-up raises it.
             IoPin::OpenDrain(l) => l.set_high(true),
             IoPin::Nc => {}
         }
@@ -122,9 +122,18 @@ impl InputOutputPin for IoPin {
     #[inline(always)]
     fn is_high(&mut self) -> bool {
         match self {
-            // IDR reads the real net level even in output mode.
+            // IDR reads the net level even in output mode.
             IoPin::Pin(l) | IoPin::OpenDrain(l) => l.is_high(),
             IoPin::Nc => false,
         }
+    }
+}
+
+/// Park `pins` of `port` as unpulled inputs, so a pad sharing a net drives nothing.
+pub fn park_inputs(port: Gpio, pins: u16) {
+    for pin in (0..16).filter(|n| pins & (1 << n) != 0) {
+        let shift = 2 * pin;
+        port.pupdr().modify(|w| w.0 &= !(0b11 << shift));
+        port.moder().modify(|w| w.0 &= !(0b11 << shift));
     }
 }

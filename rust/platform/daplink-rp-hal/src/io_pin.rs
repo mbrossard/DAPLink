@@ -3,7 +3,6 @@
 use daplink_rs::InputOutputPin;
 
 /// A GPIO line driven by SIO register mask; a zero mask is a no-connect, `open_drain` marks nRESET.
-/// Stateless, so a second handle to the same pad is safe to hold; the masks differ only when split.
 #[derive(Clone, Copy)]
 pub struct IoPin {
     out_mask: u32,

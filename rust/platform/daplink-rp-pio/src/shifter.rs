@@ -2,8 +2,7 @@
 
 use daplink_rs::dap_rs::swj::Pins;
 
-/// The PIO state-machine primitives, so the protocol engine is host-testable against a mock. The
-/// SM always makes progress, so only a host-side pairing bug can wedge the blocking `put`/`get`.
+/// Blocking FIFO operations require a clocked, enabled SM with a matching program and command stream.
 pub trait PioShifter {
     /// Push one word into the TX FIFO, blocking until there is space.
     fn put(&mut self, word: u32);
@@ -56,4 +55,7 @@ pub(crate) fn start_idle<S: PioShifter>(shifter: &mut S, dispatcher: u8) {
 pub trait SwjPinsSio {
     /// Apply the masked levels, dwell, and sample every pin; the caller brackets the pad loan.
     fn swj_pins(&mut self, output: Pins, mask: Pins, wait_us: u32) -> Pins;
+
+    /// Release nRESET, which stays on SIO, without touching the shared pads.
+    fn release_nreset(&mut self);
 }

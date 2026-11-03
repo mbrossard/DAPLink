@@ -12,12 +12,10 @@ use crate::{FlashRegion, RamRegion, SectorInfo, Target};
 /// Official Microsoft UF2 family id for the RP2040 (`uf2families.json`, "Raspberry Pi RP2040").
 pub const RP2040_UF2_FAMILY: u32 = 0xE48B_FF56;
 
-/// Multidrop `TARGETSEL` for the RP2040's core 0; core 1 is `0x1100_2927`, the rescue DP
-/// `0xF100_2927`. A cold chip may not answer DPIDR until one of them is selected.
+/// Multidrop `TARGETSEL` for core 0; a cold chip may not answer DPIDR until selected.
 pub const RP2040_CORE0_TARGETSEL: u32 = 0x0100_2927;
 
-/// Target-identity probes: the bootrom magic at `0x0000_0010` (`'M'`, `'u'`, ROM version), masked
-/// to `0x0001_754D` (RP2040 datasheet 2.8.3).
+/// Identity: the bootrom magic at `0x0000_0010`, masked to `'M'`, `'u'` and the ROM version.
 pub static IDENTITY_PROBES: [IdentityProbe; 1] =
     [IdentityProbe::new(0x0000_0010, 0x00FF_FFFF, 0x0001_754D)];
 
@@ -26,7 +24,6 @@ pub static FLASH_REGIONS: [FlashRegion<'static>; 1] = [FlashRegion {
     start: 0x1000_0000,
     end: 0x1020_0000,
     is_default: true,
-    is_secure: false,
     algo: &SELECTED_ALGO,
 }];
 
@@ -44,7 +41,7 @@ pub static SECTORS: [SectorInfo; 1] = [SectorInfo {
 }];
 
 /// Page-staging scratch size: the algorithm's program buffer, one 4 KiB QSPI sector.
-pub const PROGRAM_BUFFER_SIZE: usize = 0x1000;
+pub const PROGRAM_BUFFER_SIZE: usize = SELECTED_ALGO.program_buffer_size as usize;
 
 /// The target description type for this device.
 #[derive(Clone, Copy, Debug, Default)]

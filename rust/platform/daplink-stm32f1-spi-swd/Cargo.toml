@@ -1,0 +1,13 @@
+[package]
+name = "daplink-stm32f1-spi-swd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "STM32F1 register seam for the SPI-session SWD engine"
+
+[workspace]
+
+[dependencies]
+daplink-rs = { path = "../../crates/daplink-rs" }
+daplink-spi-swd = { path = "../../crates/daplink-spi-swd" }
+stm32f1 = { version = "0.16", default-features = false, features = ["stm32f103"] }

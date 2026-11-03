@@ -92,16 +92,14 @@ impl FrameKind {
     }
 }
 
-/// Transmitter shaping: `bytes` of wire traffic, then `idle_ms` of silence. `bytes` of 0 shapes
-/// nothing.
+/// Transmitter shaping: `bytes` of wire traffic, then `idle_ms` of silence; 0 bytes shapes nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BurstSpec {
     pub bytes: u32,
     pub idle_ms: u32,
 }
 
-/// One decoded frame; on the wire, little-endian: magic `V1MK` (4 bytes), kind (1), direction
-/// (1), sequence u32, payload offset u64, payload-span CRC32, header CRC16 over the first 22.
+/// One decoded frame: magic, kind, direction, sequence, offset, span CRC32, header CRC16, all LE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
     pub kind: FrameKind,
@@ -115,7 +113,6 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Serialize the frame, header CRC16 included.
     pub fn encode(&self) -> [u8; FRAME_LEN] {
         let mut out = [0u8; FRAME_LEN];
         out[..4].copy_from_slice(&MAGIC);

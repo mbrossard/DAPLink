@@ -1,8 +1,6 @@
 //! Helpers shared by cases: error chains, line splitting, hex encoding, and a payload PRNG.
 
-/// `e` followed by its `source()` chain, joined with `: `. probe-rs wrappers such as
-/// `Error::Arm` display a bare sentence and carry the whole diagnosis on the chain, so
-/// printing only the outermost error says nothing about the failure.
+/// `e` followed by its `source()` chain, joined with `: `, since probe-rs wrappers carry the diagnosis there.
 pub(crate) fn chain(e: impl std::error::Error) -> String {
     let mut out = e.to_string();
     let mut prev = out.clone();
@@ -20,12 +18,6 @@ pub(crate) fn chain(e: impl std::error::Error) -> String {
     out
 }
 
-/// The first `\n`-framed line of a response (the whole slice if there is no newline).
-#[allow(dead_code)]
-pub(crate) fn first_line(resp: &[u8]) -> &[u8] {
-    resp.split(|&b| b == b'\n').next().unwrap_or(resp)
-}
-
 /// Append the lowercase-hex encoding of `bytes` to `out`.
 pub(crate) fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -35,7 +27,6 @@ pub(crate) fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-/// Lowercase-hex encode `bytes` as a `String`.
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = Vec::with_capacity(bytes.len() * 2);
     push_hex(&mut out, bytes);
@@ -51,7 +42,6 @@ impl Rng {
         Rng(seed | 1)
     }
 
-    /// Advance and return the next 64-bit state.
     pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
@@ -61,7 +51,6 @@ impl Rng {
         x
     }
 
-    /// A `len`-byte pseudo-random payload.
     pub(crate) fn payload(&mut self, len: usize) -> Vec<u8> {
         (0..len).map(|_| self.next_u64() as u8).collect()
     }
@@ -111,12 +100,6 @@ mod tests {
     fn hex_encodes_lowercase() {
         assert_eq!(hex(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
         assert_eq!(hex(&[0xa5, 0x5a, 0xc3, 0x3c]), "a55ac33c");
-    }
-
-    #[test]
-    fn first_line_splits_on_newline() {
-        assert_eq!(first_line(b"OK PONG\nextra"), b"OK PONG");
-        assert_eq!(first_line(b"no newline"), b"no newline");
     }
 
     #[test]

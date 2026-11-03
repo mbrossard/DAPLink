@@ -1,10 +1,8 @@
-//! STM32 USART BRR divisor arithmetic, split out of the F401 DUT image so its tests run
-//! on the host.
+//! STM32 USART BRR divisor arithmetic, split out so its tests run on the host.
 #![no_std]
 
-/// BRR word and OVER8 setting for `baud` at clock `fck`: `fck/baud` rounded to nearest, taken
-/// straight as the OVER16 BRR when it reaches 16, else as eighths of USARTDIV8 under OVER8.
-/// `baud` must be nonzero.
+/// BRR word and OVER8 setting for `baud` at clock `fck`, rounded to nearest. Unvalidated: `baud`
+/// must be nonzero and its rounded divisor `fck / baud` within `8..=0xFFFF`.
 pub fn usart_brr(fck: u32, baud: u32) -> (bool, u32) {
     let raw = (fck + baud / 2) / baud;
     if raw >= 16 {
@@ -14,6 +12,9 @@ pub fn usart_brr(fck: u32, baud: u32) -> (bool, u32) {
 }
 
 /// Baud a programmed `(over8, brr)` pair actually yields, rounded to the nearest whole baud.
+///
+/// # Panics
+/// If `brr` decodes to a zero divisor.
 pub fn usart_baud_realized(fck: u32, over8: bool, brr: u32) -> u32 {
     let raw = if over8 {
         (brr >> 4) * 8 + (brr & 0x7)
@@ -37,7 +38,7 @@ mod tests {
 
     #[test]
     fn rounding_makes_2_500_000_reachable() {
-        // 42e6/2.5e6 = 16.8: truncating to 16 lands 5.0% high; 17 realizes -1.2%.
+        // Rounds to 17 rather than truncating to 16.
         assert_eq!(usart_brr(APB1_HZ, 2_500_000), (false, 17));
         assert_eq!(usart_baud_realized(APB1_HZ, false, 17), 2_470_588);
     }

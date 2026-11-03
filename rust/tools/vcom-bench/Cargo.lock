@@ -319,8 +319,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dap-conformance",
+ "firmware-row",
  "nusb",
 ]
+
+[[package]]
+name = "dap-conformance"
+version = "0.1.0"
 
 [[package]]
 name = "daplink-core"
@@ -423,6 +429,10 @@ name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
+
+[[package]]
+name = "firmware-row"
+version = "0.1.0"
 
 [[package]]
 name = "flate2"
@@ -1353,9 +1363,12 @@ dependencies = [
  "clap",
  "dap-bench",
  "daplink-test-protocol",
+ "firmware-row",
  "nusb",
  "object 0.36.7",
  "probe-rs",
+ "serde",
+ "serde_json",
  "serialport",
 ]
 

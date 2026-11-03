@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use dap_conformance::cmsis_dap::{exchange, ids, Context, Finding, Link, Reply};
 use nusb::transfer::{Buffer, Bulk, Direction, In, Out};
 use nusb::{Endpoint, MaybeFuture};
 use probe_rs::probe::DebugProbeSelector;
@@ -25,39 +26,55 @@ pub(crate) struct RawDap {
 }
 
 impl RawDap {
-    pub(crate) fn command(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
+    /// Submit one request without reading its reply, so a caller can fill the probe's queue.
+    pub(crate) fn send(&mut self, request: &[u8], timeout: Duration) -> Result<(), String> {
         self.out
-            .transfer_blocking(Buffer::from(request.to_vec()), TIMEOUT)
+            .transfer_blocking(Buffer::from(request.to_vec()), timeout)
             .into_result()
-            .map_err(|e| format!("bulk write failed: {e}"))?;
+            .map(|_| ())
+            .map_err(|e| format!("bulk write failed: {e}"))
+    }
+
+    /// Read one reply, for a caller that queued its requests separately.
+    pub(crate) fn recv(&mut self, timeout: Duration) -> Result<Vec<u8>, String> {
         // Bulk IN reads must be a whole number of the endpoint's max packet size.
         let read_len = round_up(RESPONSE_BUFFER_HINT, self.inp.max_packet_size().max(1));
         Ok(self
             .inp
-            .transfer_blocking(Buffer::new(read_len), TIMEOUT)
+            .transfer_blocking(Buffer::new(read_len), timeout)
             .into_result()
             .map_err(|e| format!("bulk read failed: {e}"))?
             .into_vec())
     }
 
+    pub(crate) fn command(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
+        self.send(request, TIMEOUT)?;
+        self.recv(TIMEOUT)
+    }
+
     /// One `DAP_Info` exchange, returning the payload behind the `[0x00, len]` framing.
     pub(crate) fn dap_info(&mut self, id: u8) -> Result<Vec<u8>, String> {
-        let resp = self.command(&[0x00, id])?;
-        if resp.first() != Some(&0x00) {
-            return Err(format!(
-                "DAP_Info({id:#04x}) reply {resp:02x?} echoes wrongly"
-            ));
+        self.dap_info_checked(id).map(|(value, _)| value)
+    }
+
+    /// [`RawDap::dap_info`], with the findings `check::exchange` makes on the value.
+    pub(crate) fn dap_info_checked(&mut self, id: u8) -> Result<(Vec<u8>, Vec<Finding>), String> {
+        let request = [ids::INFO, id];
+        let resp = self.command(&request)?;
+        let checked = exchange(&request, &resp, Context::arm(Link::Swd));
+        match checked.exchange.map(|e| e.reply) {
+            Some(Reply::Info(value)) => Ok((value, checked.findings)),
+            _ => Err(format!(
+                "DAP_Info({id:#04x}) reply {resp:02x?} is malformed: {:?}",
+                checked.findings
+            )),
         }
-        let len = usize::from(*resp.get(1).ok_or("reply too short")?);
-        resp.get(2..2 + len)
-            .map(<[u8]>::to_vec)
-            .ok_or_else(|| format!("DAP_Info({id:#04x}) reply shorter than its length byte"))
     }
 }
 
-/// Open the probe's vendor bulk interface by its selector.
-pub(crate) fn open(selector: &DebugProbeSelector) -> Result<RawDap, String> {
-    let device_info = nusb::list_devices()
+/// The probe's bus entry, matched by its selector.
+pub(crate) fn find_device(selector: &DebugProbeSelector) -> Result<nusb::DeviceInfo, String> {
+    nusb::list_devices()
         .wait()
         .map_err(|e| e.to_string())?
         .find(|d| {
@@ -68,8 +85,20 @@ pub(crate) fn open(selector: &DebugProbeSelector) -> Result<RawDap, String> {
                     .as_deref()
                     .is_none_or(|s| d.serial_number() == Some(s))
         })
-        .ok_or("probe not found on the bus")?;
-    let device = device_info.open().wait().map_err(|e| e.to_string())?;
+        .ok_or_else(|| "probe not found on the bus".to_string())
+}
+
+/// Open the probe's USB device without claiming an interface.
+pub(crate) fn open_device(selector: &DebugProbeSelector) -> Result<nusb::Device, String> {
+    find_device(selector)?
+        .open()
+        .wait()
+        .map_err(|e| e.to_string())
+}
+
+/// Open the probe's vendor bulk interface by its selector.
+pub(crate) fn open(selector: &DebugProbeSelector) -> Result<RawDap, String> {
+    let device = open_device(selector)?;
     let config = device.active_configuration().map_err(|e| e.to_string())?;
 
     // The vendor interface with a bulk OUT/IN pair is the CMSIS-DAP v2 interface.
@@ -109,6 +138,30 @@ pub(crate) fn open(selector: &DebugProbeSelector) -> Result<RawDap, String> {
     })
 }
 
+/// One SWD idle cycle: gated by a flash session, where a zero count would answer OK regardless.
+const IDLE_CYCLE_SEQUENCE: [u8; 4] = [0x1D, 1, 1, 0];
+
+/// Whether a flash session holds the wire; once none does, the pads are left parked.
+pub(crate) fn wire_held(selector: &DebugProbeSelector) -> Result<bool, String> {
+    let mut dap = open(selector)?;
+    let reply = dap.command(&IDLE_CYCLE_SEQUENCE)?;
+    let held = sequence_refused(&reply)?;
+    if !held {
+        // Best effort: the remount may detach the device, and the next attach reconnects anyway.
+        let _ = dap.command(&[0x03]);
+    }
+    Ok(held)
+}
+
+/// dap-rs marks a refusal over the command byte, status left OK; `[0x1D, 0xFF]` is Arm's form.
+fn sequence_refused(reply: &[u8]) -> Result<bool, String> {
+    match reply {
+        [0x1D, 0x00] => Ok(false),
+        [0xFF, 0x00] | [0x1D, 0xFF] => Ok(true),
+        _ => Err(format!("DAP_SWD_Sequence reply {reply:02x?} is malformed")),
+    }
+}
+
 /// Pulse the target's reset line through the probe: assert nRESET low, dwell, release.
 pub(crate) fn pulse_nreset(selector: &DebugProbeSelector) -> Result<(), String> {
     let mut dap = open(selector)?;
@@ -123,7 +176,6 @@ pub(crate) fn pulse_nreset(selector: &DebugProbeSelector) -> Result<(), String> 
     Ok(())
 }
 
-/// Round `len` up to the next multiple of `granularity`.
 fn round_up(len: usize, granularity: usize) -> usize {
     if granularity == 0 {
         return len;
@@ -133,7 +185,33 @@ fn round_up(len: usize, granularity: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::round_up;
+    use super::{round_up, sequence_refused};
+
+    /// During a session `DAP_SWJ_Clock` answers OK, so a poll on it passes; the sequence does not.
+    #[test]
+    fn a_held_session_passes_the_clock_poll_and_fails_the_sequence_poll() {
+        let clock_poll_passes = |reply: &[u8]| matches!(reply, [0x11, 0x00]);
+        assert!(clock_poll_passes(&[0x11, 0x00]));
+        assert_eq!(sequence_refused(&[0xFF, 0x00]), Ok(true));
+    }
+
+    #[test]
+    fn a_released_wire_answers_the_sequence_ok() {
+        assert_eq!(sequence_refused(&[0x1D, 0x00]), Ok(false));
+    }
+
+    #[test]
+    fn the_spec_form_of_a_refusal_also_reads_as_held() {
+        assert_eq!(sequence_refused(&[0x1D, 0xFF]), Ok(true));
+    }
+
+    /// A reply that is neither answer never reads as a release.
+    #[test]
+    fn an_unrecognised_reply_is_an_error() {
+        for reply in [&[0xFF][..], &[0x11, 0x00], &[0x1D], &[0x1D, 0x00, 0x00]] {
+            assert!(sequence_refused(reply).is_err(), "{reply:02x?}");
+        }
+    }
 
     #[test]
     fn round_up_keeps_a_full_speed_read_at_one_packet() {

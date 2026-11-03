@@ -12,8 +12,7 @@ pub const CSW_SIGNATURE: u32 = 0x5342_5355;
 pub const CSW_PASSED: u8 = 0;
 /// CSW status: command failed.
 pub const CSW_FAILED: u8 = 1;
-/// CSW status: phase error, for a CBW whose declared direction or data-phase presence contradicts
-/// the command; the host recovers with a Bulk-Only reset. Length mismatches use [`CSW_FAILED`].
+/// CSW status: phase error, for a CBW whose direction or data phase contradicts the command.
 pub const CSW_PHASE_ERROR: u8 = 2;
 
 /// A parsed Command Block Wrapper.
@@ -54,6 +53,12 @@ pub const SENSE_NONE: Sense = Sense {
 pub const SENSE_ILLEGAL: Sense = Sense {
     key: 0x05,
     asc: 0x20,
+    ascq: 0x00,
+};
+/// Invalid field in the command block.
+pub const SENSE_INVALID_CDB: Sense = Sense {
+    key: 0x05,
+    asc: 0x24,
     ascq: 0x00,
 };
 /// Logical unit not supported: the CBW named a unit this device does not have.
@@ -111,20 +116,17 @@ pub enum ScsiAction {
     Fail(Sense),
 }
 
-/// Clamp a reply's byte length to the host's declared CBW data-transfer length; a device that
-/// sends more than the CBW declared reports a wrong residue.
+/// Clamp a reply's length to the CBW's declared data-transfer length.
 pub fn clamp_reply_len(reply_len: usize, cbw_data_len: u32) -> usize {
     core::cmp::min(reply_len, cbw_data_len as usize)
 }
 
-/// Whether a block command's declared CBW length is exactly `count * MSC_SECTOR_SIZE`. A CBW that
-/// disagrees must be rejected before the data phase, or the Bulk-Only stream desynchronizes.
+/// Whether a block command's CBW length is exactly `count * MSC_SECTOR_SIZE`.
 pub fn block_data_len_matches(cbw_data_len: u32, count: u32) -> bool {
     cbw_data_len as u64 == count as u64 * MSC_SECTOR_SIZE as u64
 }
 
-/// What the transport should do with a dispatched command once the CBW's declared data phase has
-/// been reconciled against it -- the result of [`reconcile_cbw`].
+/// What the transport does with a command once [`reconcile_cbw`] has checked its data phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BotVerdict {
     /// The CBW and the command agree; run the data phase (if any) and report as usual.
@@ -135,14 +137,12 @@ pub enum BotVerdict {
         status: u8,
         /// The sense to latch for the following REQUEST SENSE.
         sense: Sense,
-        /// Which endpoint a stalling transport stalls before the CSW: `Some(true)` = IN,
-        /// `Some(false)` = OUT, `None` = nothing declared. A non-stalling one uses the residue.
+        /// Endpoint a stalling transport stalls before the CSW: `Some(true)` IN, `Some(false)` OUT.
         stall_dir_in: Option<bool>,
     },
 }
 
-/// Reconcile a CBW's declared data phase with the dispatched command -- the "thirteen cases" gate.
-/// Direction or presence disagreements are [`CSW_PHASE_ERROR`], length ones [`CSW_FAILED`].
+/// Reconcile a CBW's declared data phase with the dispatched command (the thirteen cases).
 pub fn reconcile_cbw(dir_in: bool, data_len: u32, action: &ScsiAction) -> BotVerdict {
     // A reject stalls the host's declared direction, and only when a data phase was declared.
     let stall_host_dir = if data_len > 0 { Some(dir_in) } else { None };
@@ -177,8 +177,7 @@ pub fn reconcile_cbw(dir_in: bool, data_len: u32, action: &ScsiAction) -> BotVer
     }
 }
 
-/// Whether processing `opcode` should clear the latched sense after replying: REQUEST SENSE
-/// reports the latched condition once and clears it, every other command leaves it untouched.
+/// Whether `opcode` clears the latched sense after replying (REQUEST SENSE only).
 pub fn should_clear_sense(opcode: u8) -> bool {
     opcode == OP_REQUEST_SENSE
 }
@@ -193,8 +192,7 @@ pub const CBW_LEN: usize = 31;
 /// Length of a Command Status Wrapper, in bytes.
 pub const CSW_LEN: usize = 13;
 
-/// Parse a [`CBW_LEN`]-byte Command Block Wrapper; signature, packet length and `bCBWCBLength`
-/// (`1..=16`) are validated, and `bCBWLUN` is returned whole so a reserved-bit LUN cannot alias 0.
+/// Parse a [`CBW_LEN`]-byte CBW, validating signature, length and `bCBWCBLength`; LUN returned whole.
 pub fn parse_cbw(pkt: &[u8]) -> Option<Cbw> {
     if pkt.len() != CBW_LEN {
         return None;
@@ -235,7 +233,6 @@ pub fn build_csw(tag: u32, residue: u32, status: u8) -> [u8; CSW_LEN] {
     csw
 }
 
-// SCSI opcodes.
 const OP_TEST_UNIT_READY: u8 = 0x00;
 const OP_REQUEST_SENSE: u8 = 0x03;
 const OP_INQUIRY: u8 = 0x12;
@@ -245,7 +242,8 @@ const OP_PREVENT_ALLOW_REMOVAL: u8 = 0x1E;
 const OP_READ_FORMAT_CAPACITIES: u8 = 0x23;
 const OP_READ_CAPACITY_10: u8 = 0x25;
 const OP_READ_10: u8 = 0x28;
-const OP_WRITE_10: u8 = 0x2A;
+/// SCSI WRITE(10).
+pub const OP_WRITE_10: u8 = 0x2A;
 const OP_VERIFY_10: u8 = 0x2F;
 const OP_SYNCHRONIZE_CACHE_10: u8 = 0x35;
 const OP_SYNCHRONIZE_CACHE_16: u8 = 0x91;
@@ -270,9 +268,37 @@ fn in_range(lba: u32, count: u32) -> bool {
         .is_some_and(|end| end <= VFS_TOTAL_SECTORS)
 }
 
-/// Dispatch a SCSI command block.
-pub fn dispatch(cb: &[u8; 16], media_ready: bool, sense: Sense) -> ScsiAction {
+/// A START STOP UNIT's effect on the medium: eject (`Some(false)`), load (`Some(true)`), or none.
+pub fn start_stop_load(cb: &[u8; 16]) -> Option<bool> {
+    // Power condition 0 with LOEJ; a plain STOP is a host spinning the unit down.
+    (cb[0] == OP_START_STOP_UNIT && cb[4] & 0xF2 == 0x02).then_some(cb[4] & 0x01 != 0)
+}
+
+/// Dispatch a SCSI command block, validating its declared length before interpreting fields.
+pub fn dispatch(cb: &[u8; 16], cb_len: u8, media_ready: bool, sense: Sense) -> ScsiAction {
+    if !(1..=16).contains(&cb_len) {
+        return ScsiAction::Fail(SENSE_INVALID_CDB);
+    }
     let op = cb[0];
+    let minimum = match op {
+        OP_TEST_UNIT_READY
+        | OP_REQUEST_SENSE
+        | OP_INQUIRY
+        | OP_MODE_SENSE_6
+        | OP_START_STOP_UNIT
+        | OP_PREVENT_ALLOW_REMOVAL => 6,
+        OP_READ_FORMAT_CAPACITIES
+        | OP_READ_CAPACITY_10
+        | OP_READ_10
+        | OP_WRITE_10
+        | OP_VERIFY_10
+        | OP_SYNCHRONIZE_CACHE_10 => 10,
+        OP_SYNCHRONIZE_CACHE_16 => 16,
+        _ => return ScsiAction::Fail(SENSE_ILLEGAL),
+    };
+    if cb_len < minimum {
+        return ScsiAction::Fail(SENSE_INVALID_CDB);
+    }
     match op {
         OP_TEST_UNIT_READY => {
             if media_ready {
@@ -372,6 +398,87 @@ mod tests {
         cb
     }
 
+    #[test]
+    fn declared_lengths_cover_every_supported_format() {
+        let formats = [
+            (OP_TEST_UNIT_READY, 6),
+            (OP_REQUEST_SENSE, 6),
+            (OP_INQUIRY, 6),
+            (OP_MODE_SENSE_6, 6),
+            (OP_START_STOP_UNIT, 6),
+            (OP_PREVENT_ALLOW_REMOVAL, 6),
+            (OP_READ_FORMAT_CAPACITIES, 10),
+            (OP_READ_CAPACITY_10, 10),
+            (OP_READ_10, 10),
+            (OP_WRITE_10, 10),
+            (OP_VERIFY_10, 10),
+            (OP_SYNCHRONIZE_CACHE_10, 10),
+            (OP_SYNCHRONIZE_CACHE_16, 16),
+        ];
+        for (op, minimum) in formats {
+            let mut cb = [0xA5; 16];
+            cb[0] = op;
+            cb[2..6].copy_from_slice(&5u32.to_be_bytes());
+            cb[7..9].copy_from_slice(&1u16.to_be_bytes());
+            match op {
+                OP_REQUEST_SENSE | OP_MODE_SENSE_6 => cb[4] = 18,
+                OP_INQUIRY => cb[3..5].copy_from_slice(&256u16.to_be_bytes()),
+                _ => {}
+            }
+            for ready in [false, true] {
+                for prior in [SENSE_NONE, SENSE_MEDIUM_CHANGED] {
+                    for len in 1..minimum {
+                        assert_eq!(
+                            dispatch(&cb, len, ready, prior),
+                            ScsiAction::Fail(SENSE_INVALID_CDB),
+                            "opcode {op:#x}, length {len}"
+                        );
+                    }
+                    let expected = dispatch(&cb, 16, ready, prior);
+                    assert_ne!(expected, ScsiAction::Fail(SENSE_INVALID_CDB));
+                    for len in minimum..=16 {
+                        assert_eq!(
+                            dispatch(&cb, len, ready, prior),
+                            expected,
+                            "opcode {op:#x}, length {len}"
+                        );
+                    }
+                    for len in [0, 17, 255] {
+                        assert_eq!(
+                            dispatch(&cb, len, ready, prior),
+                            ScsiAction::Fail(SENSE_INVALID_CDB)
+                        );
+                    }
+                }
+            }
+        }
+        for len in 1..=16 {
+            assert_eq!(
+                dispatch(&cb_with(0xFD, &[]), len, true, SENSE_NONE),
+                ScsiAction::Fail(SENSE_ILLEGAL)
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_block_commands_preserve_zero_count_readiness_and_range_behavior() {
+        for op in [OP_READ_10, OP_WRITE_10] {
+            for lba in [5, VFS_TOTAL_SECTORS, u32::MAX] {
+                for count in [0u16, 1, 2] {
+                    let mut cb = cb_with(op, &[]);
+                    cb[2..6].copy_from_slice(&lba.to_be_bytes());
+                    cb[7..9].copy_from_slice(&count.to_be_bytes());
+                    for ready in [false, true] {
+                        assert_eq!(
+                            dispatch(&cb, 10, ready, SENSE_NONE),
+                            dispatch(&cb, 16, ready, SENSE_NONE)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn make_cbw(tag: u32, data_len: u32, dir_in: bool, cb: &[u8]) -> [u8; 31] {
         let mut pkt = [0u8; 31];
         pkt[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
@@ -455,7 +562,7 @@ mod tests {
     #[test]
     fn inquiry_exact_bytes() {
         let cb = cb_with(OP_INQUIRY, &[0x00, 0x00, 0x00, 36]);
-        match dispatch(&cb, true, SENSE_NONE) {
+        match dispatch(&cb, 16, true, SENSE_NONE) {
             ScsiAction::Reply { data, len } => {
                 assert_eq!(len, 36);
                 assert_eq!(data[0], 0x00);
@@ -474,7 +581,7 @@ mod tests {
     #[test]
     fn inquiry_clamps_to_alloc_len() {
         let cb = cb_with(OP_INQUIRY, &[0x00, 0x00, 0x00, 5]);
-        match dispatch(&cb, true, SENSE_NONE) {
+        match dispatch(&cb, 16, true, SENSE_NONE) {
             ScsiAction::Reply { len, .. } => assert_eq!(len, 5),
             other => panic!("expected Reply, got {other:?}"),
         }
@@ -484,14 +591,14 @@ mod tests {
     fn inquiry_16bit_alloc_length() {
         // cb[3] = 0x00, cb[4] = 0x24 (36) -> full 36-byte reply.
         let cb = cb_with(OP_INQUIRY, &[0x00, 0x00, 0x00, 0x24]);
-        match dispatch(&cb, true, SENSE_NONE) {
+        match dispatch(&cb, 16, true, SENSE_NONE) {
             ScsiAction::Reply { len, .. } => assert_eq!(len, 36),
             other => panic!("expected Reply, got {other:?}"),
         }
 
         // cb[3] = 0x01, cb[4] = 0x00 (256) -> min(36, 256) = 36; a byte read of cb[4] gives 0.
         let cb = cb_with(OP_INQUIRY, &[0x00, 0x00, 0x01, 0x00]);
-        match dispatch(&cb, true, SENSE_NONE) {
+        match dispatch(&cb, 16, true, SENSE_NONE) {
             ScsiAction::Reply { len, .. } => assert_eq!(len, 36),
             other => panic!("expected Reply, got {other:?}"),
         }
@@ -500,7 +607,7 @@ mod tests {
     #[test]
     fn read_capacity_be_math() {
         let cb = cb_with(OP_READ_CAPACITY_10, &[]);
-        match dispatch(&cb, true, SENSE_NONE) {
+        match dispatch(&cb, 16, true, SENSE_NONE) {
             ScsiAction::Reply { data, len } => {
                 assert_eq!(len, 8);
                 assert_eq!(&data[0..4], &(VFS_TOTAL_SECTORS - 1).to_be_bytes());
@@ -523,7 +630,7 @@ mod tests {
     fn read10_field_extraction() {
         let cb = cb_with(OP_READ_10, &rw10_rest(0x10, 4));
         assert_eq!(
-            dispatch(&cb, true, SENSE_NONE),
+            dispatch(&cb, 16, true, SENSE_NONE),
             ScsiAction::ReadSectors {
                 lba: 0x10,
                 count: 4
@@ -535,7 +642,7 @@ mod tests {
     fn write10_field_extraction() {
         let cb = cb_with(OP_WRITE_10, &rw10_rest(0x10, 4));
         assert_eq!(
-            dispatch(&cb, true, SENSE_NONE),
+            dispatch(&cb, 16, true, SENSE_NONE),
             ScsiAction::WriteSectors {
                 lba: 0x10,
                 count: 4
@@ -549,7 +656,7 @@ mod tests {
         let lba = VFS_TOTAL_SECTORS - count;
         let cb = cb_with(OP_READ_10, &rw10_rest(lba, count as u16));
         assert_eq!(
-            dispatch(&cb, true, SENSE_NONE),
+            dispatch(&cb, 16, true, SENSE_NONE),
             ScsiAction::ReadSectors { lba, count }
         );
     }
@@ -560,7 +667,7 @@ mod tests {
         let lba = VFS_TOTAL_SECTORS - count + 1;
         let cb = cb_with(OP_READ_10, &rw10_rest(lba, count as u16));
         assert_eq!(
-            dispatch(&cb, true, SENSE_NONE),
+            dispatch(&cb, 16, true, SENSE_NONE),
             ScsiAction::Fail(SENSE_LBA_RANGE)
         );
     }
@@ -571,7 +678,7 @@ mod tests {
         let lba = VFS_TOTAL_SECTORS - count + 1;
         let cb = cb_with(OP_WRITE_10, &rw10_rest(lba, count as u16));
         assert_eq!(
-            dispatch(&cb, true, SENSE_NONE),
+            dispatch(&cb, 16, true, SENSE_NONE),
             ScsiAction::Fail(SENSE_LBA_RANGE)
         );
     }
@@ -579,14 +686,14 @@ mod tests {
     #[test]
     fn read10_zero_count_is_ok() {
         let cb = cb_with(OP_READ_10, &rw10_rest(0x10, 0));
-        assert_eq!(dispatch(&cb, true, SENSE_NONE), ScsiAction::Ok);
+        assert_eq!(dispatch(&cb, 16, true, SENSE_NONE), ScsiAction::Ok);
     }
 
     #[test]
     fn read10_zero_count_no_medium_is_not_ready() {
         let cb = cb_with(OP_READ_10, &rw10_rest(0x10, 0));
         assert_eq!(
-            dispatch(&cb, false, SENSE_NONE),
+            dispatch(&cb, 16, false, SENSE_NONE),
             ScsiAction::Fail(SENSE_NO_MEDIUM)
         );
     }
@@ -595,7 +702,7 @@ mod tests {
     fn write10_zero_count_no_medium_is_not_ready() {
         let cb = cb_with(OP_WRITE_10, &rw10_rest(0x10, 0));
         assert_eq!(
-            dispatch(&cb, false, SENSE_NONE),
+            dispatch(&cb, 16, false, SENSE_NONE),
             ScsiAction::Fail(SENSE_NO_MEDIUM)
         );
     }
@@ -603,19 +710,19 @@ mod tests {
     #[test]
     fn write10_zero_count_is_ok() {
         let cb = cb_with(OP_WRITE_10, &rw10_rest(0x10, 0));
-        assert_eq!(dispatch(&cb, true, SENSE_NONE), ScsiAction::Ok);
+        assert_eq!(dispatch(&cb, 16, true, SENSE_NONE), ScsiAction::Ok);
     }
 
     #[test]
     fn read_write_no_medium() {
         let read = cb_with(OP_READ_10, &rw10_rest(0, 1));
         assert_eq!(
-            dispatch(&read, false, SENSE_NONE),
+            dispatch(&read, 16, false, SENSE_NONE),
             ScsiAction::Fail(SENSE_NO_MEDIUM)
         );
         let write = cb_with(OP_WRITE_10, &rw10_rest(0, 1));
         assert_eq!(
-            dispatch(&write, false, SENSE_NONE),
+            dispatch(&write, 16, false, SENSE_NONE),
             ScsiAction::Fail(SENSE_NO_MEDIUM)
         );
     }
@@ -623,9 +730,9 @@ mod tests {
     #[test]
     fn test_unit_ready_both_states() {
         let cb = cb_with(OP_TEST_UNIT_READY, &[]);
-        assert_eq!(dispatch(&cb, true, SENSE_NONE), ScsiAction::Ok);
+        assert_eq!(dispatch(&cb, 16, true, SENSE_NONE), ScsiAction::Ok);
         assert_eq!(
-            dispatch(&cb, false, SENSE_NONE),
+            dispatch(&cb, 16, false, SENSE_NONE),
             ScsiAction::Fail(SENSE_NO_MEDIUM)
         );
     }
@@ -634,7 +741,7 @@ mod tests {
     fn unknown_opcode_illegal() {
         let cb = cb_with(0xFD, &[]);
         assert_eq!(
-            dispatch(&cb, true, SENSE_NONE),
+            dispatch(&cb, 16, true, SENSE_NONE),
             ScsiAction::Fail(SENSE_ILLEGAL)
         );
     }
@@ -647,7 +754,7 @@ mod tests {
             ascq: 0x00,
         };
         let cb = cb_with(OP_REQUEST_SENSE, &[0x00, 0x00, 0x00, 18]);
-        match dispatch(&cb, true, latched) {
+        match dispatch(&cb, 16, true, latched) {
             ScsiAction::Reply { data, len } => {
                 assert_eq!(len, 18);
                 assert_eq!(data[0], 0x70);
@@ -663,7 +770,7 @@ mod tests {
     #[test]
     fn request_sense_clamps_to_alloc_len() {
         let cb = cb_with(OP_REQUEST_SENSE, &[0x00, 0x00, 0x00, 8]);
-        match dispatch(&cb, true, SENSE_NONE) {
+        match dispatch(&cb, 16, true, SENSE_NONE) {
             ScsiAction::Reply { len, .. } => assert_eq!(len, 8),
             other => panic!("expected Reply, got {other:?}"),
         }
@@ -672,19 +779,25 @@ mod tests {
     #[test]
     fn nop_commands_ok() {
         assert_eq!(
-            dispatch(&cb_with(OP_START_STOP_UNIT, &[]), true, SENSE_NONE),
+            dispatch(&cb_with(OP_START_STOP_UNIT, &[]), 16, true, SENSE_NONE),
             ScsiAction::Ok
         );
         assert_eq!(
-            dispatch(&cb_with(OP_PREVENT_ALLOW_REMOVAL, &[]), true, SENSE_NONE),
+            dispatch(
+                &cb_with(OP_PREVENT_ALLOW_REMOVAL, &[]),
+                16,
+                true,
+                SENSE_NONE
+            ),
             ScsiAction::Ok
         );
         assert_eq!(
-            dispatch(&cb_with(OP_VERIFY_10, &[]), true, SENSE_NONE),
+            dispatch(&cb_with(OP_VERIFY_10, &[]), 16, true, SENSE_NONE),
             ScsiAction::Ok
         );
         match dispatch(
             &cb_with(OP_MODE_SENSE_6, &[0x00, 0x00, 0x00, 4]),
+            16,
             true,
             SENSE_NONE,
         ) {
@@ -695,9 +808,7 @@ mod tests {
 
     #[test]
     fn clamp_reply_len_never_exceeds_cbw_data_len() {
-        // Reply shorter than the declared data phase is returned as-is...
         assert_eq!(clamp_reply_len(8, 36), 8);
-        // ...and a reply longer than the CBW declared is clamped down (residue stays correct).
         assert_eq!(clamp_reply_len(36, 16), 16);
         assert_eq!(clamp_reply_len(36, 0), 0);
     }
@@ -812,12 +923,10 @@ mod tests {
 
     #[test]
     fn reconcile_matching_and_failing_actions_proceed() {
-        // Matching block transfers proceed...
         let read = ScsiAction::ReadSectors { lba: 0, count: 2 };
         assert_eq!(reconcile_cbw(true, 1024, &read), BotVerdict::Proceed);
         let write = ScsiAction::WriteSectors { lba: 0, count: 2 };
         assert_eq!(reconcile_cbw(false, 1024, &write), BotVerdict::Proceed);
-        // ...and a dispatch-level failure is not second-guessed (the Fail arm handles it).
         let fail = ScsiAction::Fail(SENSE_NO_MEDIUM);
         assert_eq!(reconcile_cbw(true, 512, &fail), BotVerdict::Proceed);
         assert_eq!(reconcile_cbw(false, 0, &fail), BotVerdict::Proceed);
@@ -829,7 +938,7 @@ mod tests {
         let mut rest = [0u8; 9];
         rest[6..8].copy_from_slice(&0x00FCu16.to_be_bytes()); // allocation length at cb[7..9]
         let cb = cb_with(OP_READ_FORMAT_CAPACITIES, &rest);
-        match dispatch(&cb, true, SENSE_NONE) {
+        match dispatch(&cb, 16, true, SENSE_NONE) {
             ScsiAction::Reply { data, len } => {
                 assert_eq!(len, 12);
                 assert_eq!(&data[0..4], &[0, 0, 0, 8], "8-byte capacity list");
@@ -846,14 +955,29 @@ mod tests {
     }
 
     #[test]
+    fn start_stop_loads_or_ejects_only_with_loej_and_no_power_condition() {
+        let ssu = |byte4: u8| cb_with(OP_START_STOP_UNIT, &[0, 0, 0, byte4]);
+        assert_eq!(start_stop_load(&ssu(0x02)), Some(false));
+        assert_eq!(start_stop_load(&ssu(0x03)), Some(true));
+        assert_eq!(start_stop_load(&ssu(0x06)), Some(false), "NO_FLUSH");
+        assert_eq!(start_stop_load(&ssu(0x00)), None);
+        assert_eq!(start_stop_load(&ssu(0x01)), None);
+        assert_eq!(start_stop_load(&ssu(0x12)), None, "a power condition");
+        assert_eq!(
+            start_stop_load(&cb_with(OP_TEST_UNIT_READY, &[0, 0, 0, 0x02])),
+            None
+        );
+    }
+
+    #[test]
     fn sync_cache_is_ok() {
         // Nothing is cached, so both widths report success rather than an illegal request.
         assert_eq!(
-            dispatch(&cb_with(OP_SYNCHRONIZE_CACHE_10, &[]), true, SENSE_NONE),
+            dispatch(&cb_with(OP_SYNCHRONIZE_CACHE_10, &[]), 16, true, SENSE_NONE),
             ScsiAction::Ok
         );
         assert_eq!(
-            dispatch(&cb_with(OP_SYNCHRONIZE_CACHE_16, &[]), true, SENSE_NONE),
+            dispatch(&cb_with(OP_SYNCHRONIZE_CACHE_16, &[]), 16, true, SENSE_NONE),
             ScsiAction::Ok
         );
     }

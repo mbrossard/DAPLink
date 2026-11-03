@@ -2,18 +2,20 @@
 
 use daplink_rs::daplink_core::msc_proto::{
     build_csw, clamp_reply_len, dispatch, is_test_unit_ready, parse_cbw, reconcile_cbw,
-    should_clear_sense, BotVerdict, ScsiAction, Sense, CSW_FAILED, CSW_LEN, CSW_PASSED,
-    SENSE_LUN_NOT_SUPPORTED, SENSE_MEDIUM_CHANGED, SENSE_NONE,
+    should_clear_sense, start_stop_load, BotVerdict, ScsiAction, Sense, CSW_FAILED, CSW_LEN,
+    CSW_PASSED, SENSE_LUN_NOT_SUPPORTED, SENSE_MEDIUM_CHANGED, SENSE_NONE, SENSE_NO_MEDIUM,
 };
 use daplink_rs::daplink_core::{
     MSC_BULK_ONLY_RESET, MSC_GET_MAX_LUN, MSC_INTERFACE_CLASS, MSC_SECTOR_SIZE,
 };
 use daplink_vfs::{DirectIo, SectorIo, SectorPoll, TransferSink, Vfs, VfsObserver};
 use usb_device::class_prelude::*;
-use usb_device::control::{Recipient, RequestType};
+use usb_device::control::{Recipient, Request, RequestType};
 
 /// Upper bound on `step` iterations per pump, so an unexpected state cannot spin forever.
 const PUMP_BOUND: usize = 1024;
+/// More OUT packets than any supported controller can hold landed.
+const RESET_DRAIN_PACKETS: usize = 4;
 
 /// The bulk endpoint pair as the machine sees it: two directions plus stall control.
 trait BulkPort {
@@ -21,10 +23,10 @@ trait BulkPort {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()>;
     /// Write one IN packet; `Err` means the endpoint is busy and the caller retries next poll.
     fn write(&mut self, data: &[u8]) -> Result<usize, ()>;
-    /// Stall the device-to-host endpoint.
     fn stall_in(&mut self);
-    /// Stall the host-to-device endpoint.
     fn stall_out(&mut self);
+    /// Request IN recovery; cancellation of an armed packet is driver-dependent.
+    fn flush_in(&mut self);
 }
 
 /// A [`BulkPort`] over the class's real endpoints.
@@ -46,6 +48,11 @@ impl<B: UsbBus> BulkPort for EndpointPort<'_, '_, B> {
     fn stall_out(&mut self) {
         self.ep_out.stall();
     }
+    fn flush_in(&mut self) {
+        // usb-device has no abort; stall/unstall does not guarantee cancellation of an armed packet.
+        self.ep_in.stall();
+        self.ep_in.unstall();
+    }
 }
 
 /// Where the transport currently is within a command.
@@ -55,40 +62,29 @@ enum Phase {
     WaitCbw,
     /// Sending a fixed reply payload (INQUIRY, READ CAPACITY, ...).
     ReplyIn {
-        /// Reply bytes.
         buf: [u8; 36],
         /// Valid length, already clamped to the CBW data length.
         len: usize,
-        /// Bytes already sent.
         sent: usize,
     },
     /// Streaming read sectors to the host.
     DataIn {
-        /// Current logical block.
         lba: u32,
         /// Sectors still to send.
         remaining: u32,
-        /// Byte offset within the current sector.
         offset: usize,
         /// Whether the current sector is loaded into the scratch buffer.
         loaded: bool,
     },
     /// Receiving write sectors from the host.
     DataOut {
-        /// Current logical block.
         lba: u32,
         /// Sectors still to receive.
         remaining: u32,
-        /// Byte offset within the current sector.
         offset: usize,
     },
     /// Sending the Command Status Wrapper.
-    SendCsw {
-        /// The CSW bytes.
-        csw: [u8; CSW_LEN],
-        /// Bytes already sent.
-        sent: usize,
-    },
+    SendCsw { csw: [u8; CSW_LEN], sent: usize },
 }
 
 /// The resumable CBW-to-CSW machine, held apart from the endpoints; `EP` is the packet size.
@@ -101,6 +97,8 @@ struct Machine<const EP: usize = 64> {
     sector: [u8; MSC_SECTOR_SIZE],
     /// A media-changed remount awaiting its UNIT ATTENTION report; survives a BOT reset.
     ua_pending: bool,
+    /// The host ejected the medium; a load, a remount or a bus reset brings it back.
+    ejected: bool,
     /// The data-phase level the block device already believes; only edges are published.
     data_phase: bool,
 }
@@ -119,6 +117,7 @@ impl<const EP: usize> Machine<EP> {
             transferred: 0,
             sector: [0u8; MSC_SECTOR_SIZE],
             ua_pending: false,
+            ejected: false,
             data_phase: false,
         }
     }
@@ -131,10 +130,28 @@ impl<const EP: usize> Machine<EP> {
         }
     }
 
-    /// Return to the idle state after a completed command or a host-issued BOT reset.
-    fn reset(&mut self) {
+    /// Return to the idle state, ready for the next Command Block Wrapper.
+    fn idle(&mut self) {
         self.phase = Phase::WaitCbw;
         self.transferred = 0;
+    }
+
+    /// A USB bus reset: the endpoints are torn down with it, so nothing stays armed.
+    fn bus_reset(&mut self) {
+        self.ejected = false;
+        self.idle();
+    }
+
+    /// A class Bulk-Only Mass Storage Reset: an armed IN packet would answer the next CBW stale.
+    fn bot_reset<P: BulkPort + ?Sized>(&mut self, port: &mut P) {
+        port.flush_in();
+        // A packet landed before the reset belongs to the abandoned command; the next CBW follows it.
+        for _ in 0..RESET_DRAIN_PACKETS {
+            if port.read(&mut self.sector).is_err() {
+                break;
+            }
+        }
+        self.idle();
     }
 
     /// Move to the CSW phase, with the residue of advertised against transferred bytes.
@@ -167,6 +184,7 @@ impl<const EP: usize> Machine<EP> {
                 self.set_data_phase(io, false);
                 if io.media_changed() {
                     self.ua_pending = true;
+                    self.ejected = false;
                 }
                 // A desynchronised host delivers up to `EP` bytes, and a short buffer can panic.
                 let n = match port.read(&mut self.sector[..]) {
@@ -194,14 +212,19 @@ impl<const EP: usize> Machine<EP> {
                     self.finish(CSW_FAILED);
                     return true;
                 }
-                // Only a TEST UNIT READY declaring no data phase may consume the latch.
-                if self.ua_pending && is_test_unit_ready(cbw.cb[0]) && self.data_len == 0 {
+                let ready = io.media_ready() && !self.ejected;
+                let action = dispatch(&cbw.cb, cbw.cb_len, ready, self.sense);
+                // Only a validated TEST UNIT READY with no data phase may consume the latch.
+                if self.ua_pending
+                    && is_test_unit_ready(cbw.cb[0])
+                    && self.data_len == 0
+                    && matches!(action, ScsiAction::Ok | ScsiAction::Fail(SENSE_NO_MEDIUM))
+                {
                     self.ua_pending = false;
                     self.sense = SENSE_MEDIUM_CHANGED;
                     self.finish(CSW_FAILED);
                     return true;
                 }
-                let action = dispatch(&cbw.cb, io.media_ready(), self.sense);
                 // Reconcile before any data phase runs, or a disagreement desynchronises the stream.
                 if let BotVerdict::Reject {
                     status,
@@ -231,7 +254,12 @@ impl<const EP: usize> Machine<EP> {
                             sent: 0,
                         };
                     }
-                    ScsiAction::Ok => self.finish(CSW_PASSED),
+                    ScsiAction::Ok => {
+                        if let Some(load) = start_stop_load(&cbw.cb) {
+                            self.ejected = !load;
+                        }
+                        self.finish(CSW_PASSED);
+                    }
                     ScsiAction::ReadSectors { lba, count } => {
                         self.phase = Phase::DataIn {
                             lba,
@@ -368,7 +396,7 @@ impl<const EP: usize> Machine<EP> {
             }
             Phase::SendCsw { csw, sent } => {
                 if sent >= CSW_LEN {
-                    self.reset();
+                    self.idle();
                     return true;
                 }
                 match port.write(&csw[sent..CSW_LEN]) {
@@ -442,7 +470,7 @@ impl<B: UsbBus, const EP: usize> UsbClass<B> for MscClass<'_, B, EP> {
     }
 
     fn reset(&mut self) {
-        self.machine.reset();
+        self.machine.bus_reset();
     }
 
     fn control_in(&mut self, xfer: ControlIn<B>) {
@@ -453,8 +481,31 @@ impl<B: UsbBus, const EP: usize> UsbClass<B> for MscClass<'_, B, EP> {
     }
 
     fn control_out(&mut self, xfer: ControlOut<B>) {
+        let req = xfer.request();
+        if req.request_type == RequestType::Standard
+            && req.recipient == Recipient::Device
+            && req.request == Request::SET_CONFIGURATION
+            && req.index == 0
+            && req.length == 0
+            && req.value <= 1
+        {
+            // Configuration changes retire the command and both endpoint buffers.
+            self.ep_in.stall();
+            self.ep_out.stall();
+            if req.value == 1 {
+                self.ep_in.unstall();
+                self.ep_out.unstall();
+            }
+            self.machine.bus_reset();
+            // Leave the standard request and its status stage to UsbDevice.
+            return;
+        }
         if self.is_for_us(xfer.request(), MSC_BULK_ONLY_RESET) {
-            self.machine.reset();
+            let mut port = EndpointPort {
+                ep_in: &self.ep_in,
+                ep_out: &self.ep_out,
+            };
+            self.machine.bot_reset(&mut port);
             xfer.accept().ok();
         }
     }
@@ -473,11 +524,16 @@ impl<B: UsbBus, const EP: usize> MscClass<'_, B, EP> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daplink_rs::daplink_core::msc_bot_cases::BOT_CASES;
-    use daplink_rs::daplink_core::msc_proto::{CBW_LEN, CBW_SIGNATURE, CSW_SIGNATURE};
+    use daplink_rs::daplink_core::msc_bot_cases::{truncated_cases, BOT_CASES, EJECT_SEQUENCE};
+    use daplink_rs::daplink_core::msc_proto::{
+        CBW_LEN, CBW_SIGNATURE, CSW_SIGNATURE, SENSE_INVALID_CDB,
+    };
     use daplink_rs::daplink_core::{SCSI_PRODUCT_ID, SCSI_VENDOR_ID};
     use std::collections::{BTreeMap, VecDeque};
     use std::vec::Vec;
+    use usb_device::bus::{PollResult, UsbBusAllocator};
+    use usb_device::device::{UsbDeviceBuilder, UsbVidPid};
+    use usb_device::{UsbDirection, UsbError};
 
     /// The bulk packet size the tests drive the machine at.
     const EP_CHUNK: usize = 64;
@@ -490,6 +546,9 @@ mod tests {
         write_budget: usize,
         stalled_in: bool,
         stalled_out: bool,
+        /// IN packets dropped by a class reset.
+        flushed_in: usize,
+        halt_aware: bool,
     }
 
     impl MockPort {
@@ -500,6 +559,8 @@ mod tests {
                 write_budget: usize::MAX,
                 stalled_in: false,
                 stalled_out: false,
+                flushed_in: 0,
+                halt_aware: false,
             }
         }
         fn push_out(&mut self, pkt: &[u8]) {
@@ -509,6 +570,9 @@ mod tests {
 
     impl BulkPort for MockPort {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+            if self.halt_aware && self.stalled_out {
+                return Err(());
+            }
             let pkt = self.input.pop_front().ok_or(())?;
             // As unforgiving as the strictest bus driver, which panics rather than truncating.
             assert!(
@@ -521,7 +585,7 @@ mod tests {
             Ok(pkt.len())
         }
         fn write(&mut self, data: &[u8]) -> Result<usize, ()> {
-            if self.write_budget == 0 {
+            if self.write_budget == 0 || (self.halt_aware && self.stalled_in) {
                 return Err(());
             }
             self.write_budget -= 1;
@@ -534,6 +598,9 @@ mod tests {
         fn stall_out(&mut self) {
             self.stalled_out = true;
         }
+        fn flush_in(&mut self) {
+            self.flushed_in += 1;
+        }
     }
 
     /// A trivial in-memory block device over the [`SectorIo`] seam.
@@ -541,6 +608,9 @@ mod tests {
         sectors: BTreeMap<u32, [u8; MSC_SECTOR_SIZE]>,
         ready: bool,
         changed: bool,
+        reads: usize,
+        writes: usize,
+        phases: Vec<bool>,
     }
 
     impl RamDisk {
@@ -549,6 +619,9 @@ mod tests {
                 sectors: BTreeMap::new(),
                 ready,
                 changed: false,
+                reads: 0,
+                writes: 0,
+                phases: Vec::new(),
             }
         }
     }
@@ -558,6 +631,7 @@ mod tests {
             self.ready
         }
         fn read(&mut self, lba: u32, buf: &mut [u8; MSC_SECTOR_SIZE]) -> SectorPoll {
+            self.reads += 1;
             *buf = self
                 .sectors
                 .get(&lba)
@@ -566,11 +640,15 @@ mod tests {
             SectorPoll::Ready
         }
         fn write(&mut self, lba: u32, buf: &[u8; MSC_SECTOR_SIZE]) -> SectorPoll {
+            self.writes += 1;
             self.sectors.insert(lba, *buf);
             SectorPoll::Ready
         }
         fn media_changed(&mut self) -> bool {
             core::mem::replace(&mut self.changed, false)
+        }
+        fn set_data_phase(&mut self, open: bool) {
+            self.phases.push(open);
         }
     }
 
@@ -597,7 +675,6 @@ mod tests {
         }
     }
 
-    /// Build the 31 CBW bytes.
     fn cbw(tag: u32, data_len: u32, dir_in: bool, cb: &[u8]) -> [u8; CBW_LEN] {
         let mut pkt = [0u8; CBW_LEN];
         pkt[0..4].copy_from_slice(&CBW_SIGNATURE.to_le_bytes());
@@ -622,6 +699,158 @@ mod tests {
             u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
             b[12],
         )
+    }
+
+    #[test]
+    fn truncated_write_has_no_sector_effects() {
+        for len in 1..10 {
+            let mut io = RamDisk::new(true);
+            io.sectors.insert(5, [0xA5; MSC_SECTOR_SIZE]);
+            let mut c = cbw(0xAA, 512, false, &[0x2A, 0, 0, 0, 0, 5, 0, 0, 1, 0]);
+            c[14] = len;
+            let mut port = MockPort::new();
+            port.push_out(&c);
+            port.push_out(&[0x5A; 64]);
+            let mut m: Machine = Machine::new();
+            assert!(m.step(&mut port, &mut io));
+            assert_eq!((io.reads, io.writes), (0, 0));
+            assert!(io.phases.is_empty());
+            assert_eq!(io.sectors[&5], [0xA5; MSC_SECTOR_SIZE]);
+            assert_eq!(port.input.len(), 1);
+            assert!(port.stalled_out);
+            assert_eq!(
+                m.sense,
+                Sense {
+                    key: 5,
+                    asc: 0x24,
+                    ascq: 0
+                }
+            );
+            assert!(m.step(&mut port, &mut io));
+            assert_eq!(parse_csw(&port.output), (0xAA, 512, CSW_FAILED));
+        }
+    }
+
+    #[test]
+    fn truncated_tur_preserves_unit_attention() {
+        for ready in [false, true] {
+            let mut io = RamDisk::new(ready);
+            let mut m: Machine = Machine::new();
+            m.ua_pending = true;
+            let (data, csw) = run_cmd(&mut m, &mut io, &cbw(1, 0, false, &[0]), &[]);
+            assert!(data.is_empty());
+            assert_eq!(csw, (1, 0, CSW_FAILED));
+            assert!(m.ua_pending);
+            assert_eq!(
+                m.sense,
+                Sense {
+                    key: 5,
+                    asc: 0x24,
+                    ascq: 0
+                }
+            );
+            let (_, csw) = run_cmd(&mut m, &mut io, &cbw(2, 0, false, &[0; 6]), &[]);
+            assert_eq!(csw, (2, 0, CSW_FAILED));
+            assert!(!m.ua_pending);
+            assert_eq!(m.sense, SENSE_MEDIUM_CHANGED);
+        }
+    }
+
+    #[test]
+    fn absent_lun_precedes_truncated_tur_and_preserves_attention() {
+        let mut io = RamDisk::new(true);
+        let mut m: Machine = Machine::new();
+        m.ua_pending = true;
+        let mut command = cbw(1, 0, false, &[0]);
+        command[13] = 1;
+        let (_, csw) = run_cmd(&mut m, &mut io, &command, &[]);
+        assert_eq!(csw, (1, 0, CSW_FAILED));
+        assert_eq!(m.sense, SENSE_LUN_NOT_SUPPORTED);
+        assert!(m.ua_pending);
+        assert_eq!((io.reads, io.writes), (0, 0));
+        assert!(io.phases.is_empty());
+    }
+
+    fn rejected_then_valid_at<const EP: usize>() {
+        for (dir_in, data_len) in [(false, 0), (true, 18), (false, 512)] {
+            let mut io = RamDisk::new(true);
+            let mut m: Machine<EP> = Machine::new();
+            let mut port = MockPort::new();
+            port.halt_aware = true;
+            let mut short = cbw(1, data_len, dir_in, &[0x03, 0, 0, 0, 18, 0]);
+            short[14] = 1;
+            let payload = [0x5A; MSC_SECTOR_SIZE];
+            let commands = [
+                short,
+                cbw(2, 18, true, &[0x03, 0, 0, 0, 18, 0]),
+                cbw(3, 0, false, &[0; 6]),
+                cbw(4, 512, false, &[0x2A, 0, 0, 0, 0, 5, 0, 0, 1, 0]),
+                cbw(5, 512, true, &[0x28, 0, 0, 0, 0, 5, 0, 0, 1, 0]),
+            ];
+            for (index, command) in commands.iter().enumerate() {
+                port.output.clear();
+                port.push_out(command);
+                if index == 3 {
+                    for chunk in payload.chunks(EP) {
+                        port.push_out(chunk);
+                    }
+                }
+                m.pump(&mut port, &mut io);
+                if index == 0 {
+                    assert_eq!(
+                        (port.stalled_in, port.stalled_out),
+                        (dir_in && data_len > 0, !dir_in && data_len > 0)
+                    );
+                    if port.stalled_in {
+                        assert!(port.output.is_empty());
+                        port.stalled_in = false;
+                        m.pump(&mut port, &mut io);
+                    }
+                    port.stalled_out = false;
+                }
+                let status = if index == 0 { CSW_FAILED } else { CSW_PASSED };
+                let residue = if index == 0 { data_len } else { 0 };
+                let split = port.output.len() - CSW_LEN;
+                assert_eq!(
+                    parse_csw(&port.output[split..]),
+                    (index as u32 + 1, residue, status)
+                );
+                match index {
+                    0 => {
+                        assert_eq!(split, 0);
+                        assert_eq!((io.reads, io.writes), (0, 0));
+                        assert!(io.phases.is_empty());
+                        assert_eq!(
+                            m.sense,
+                            Sense {
+                                key: 5,
+                                asc: 0x24,
+                                ascq: 0
+                            }
+                        );
+                    }
+                    1 => {
+                        assert_eq!(port.output[2], 5);
+                        assert_eq!(port.output[12], 0x24);
+                        assert_eq!(port.output[13], 0);
+                        assert_eq!(m.sense, SENSE_NONE);
+                    }
+                    3 => assert_eq!(io.writes, 1),
+                    4 => {
+                        assert_eq!(port.output[..split], payload);
+                        assert_eq!(io.reads, 1);
+                    }
+                    _ => {}
+                }
+                assert!(port.input.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_request_sense_then_valid_commands_share_state() {
+        rejected_then_valid_at::<64>();
+        rejected_then_valid_at::<512>();
     }
 
     /// Run one command to completion, splitting the captured IN stream into `(data, csw)`.
@@ -742,9 +971,10 @@ mod tests {
 
     /// The shared Bulk-Only case table at packet size `EP`; only the stall column is local.
     fn bot_case_table_at<const EP: usize>() {
-        for case in BOT_CASES {
+        let truncated: Vec<_> = truncated_cases().collect();
+        for case in BOT_CASES.iter().chain(&truncated) {
             let name = case.name;
-            let mut io = RamDisk::new(true);
+            let mut io = RamDisk::new(case.media_ready);
             let mut m: Machine<EP> = Machine::new();
             m.ua_pending = case.ua_before;
             let mut port = MockPort::new();
@@ -776,12 +1006,54 @@ mod tests {
                 "{name}: pending unit attention"
             );
             assert!(port.input.is_empty(), "{name}: host packets all consumed");
+            if case.sense == SENSE_INVALID_CDB {
+                assert_eq!((io.reads, io.writes), (0, 0), "{name}");
+                assert!(io.phases.is_empty(), "{name}");
+            }
         }
     }
 
     #[test]
     fn bot_case_table_is_answered_as_the_shared_expectations_say() {
         bot_case_table_at::<EP_CHUNK>();
+    }
+
+    #[test]
+    fn an_eject_leaves_the_medium_absent_until_a_load() {
+        let mut m: Machine = Machine::new();
+        let mut io = RamDisk::new(true);
+        for case in EJECT_SEQUENCE {
+            let name = case.name;
+            m.sense = SENSE_NONE;
+            let mut port = MockPort::new();
+            port.push_out(&case.cbw);
+            m.pump(&mut port, &mut io);
+            assert_eq!(
+                parse_csw(&port.output[case.data_len..]),
+                (case.tag(), case.residue, case.status),
+                "{name}: CSW"
+            );
+            assert_eq!(m.sense, case.sense, "{name}: latched sense");
+            assert_eq!(
+                (port.stalled_in, port.stalled_out),
+                case.stalled_pair(),
+                "{name}: stalled endpoints"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bus_reset_loads_an_ejected_medium() {
+        let mut m: Machine = Machine::new();
+        let mut io = RamDisk::new(true);
+        let eject = [0x1Bu8, 0, 0, 0, 0x02, 0];
+        let tur = [0x00u8, 0, 0, 0, 0, 0];
+        run_cmd(&mut m, &mut io, &cbw(1, 0, false, &eject), &[]);
+        let (_, (_, _, status)) = run_cmd(&mut m, &mut io, &cbw(2, 0, false, &tur), &[]);
+        assert_eq!(status, CSW_FAILED, "the eject took the medium away");
+        m.bus_reset();
+        let (_, (_, _, status)) = run_cmd(&mut m, &mut io, &cbw(3, 0, false, &tur), &[]);
+        assert_eq!(status, CSW_PASSED, "a bus reset brings it back");
     }
 
     #[test]
@@ -937,7 +1209,22 @@ mod tests {
         m.pump(&mut port, &mut io);
         assert_eq!(io.events, std::vec![Ev::Open], "no payload arrived");
         // Bulk-Only reset, then an idle poll with nothing scripted.
-        m.reset();
+        m.bot_reset(&mut port);
+        m.pump(&mut port, &mut io);
+        assert_eq!(io.events, std::vec![Ev::Open, Ev::Close]);
+    }
+
+    #[test]
+    fn a_data_phase_torn_down_by_a_bus_reset_is_released_on_the_next_poll() {
+        // A bus reset abandons the same command, and the phase must not stay open across it.
+        let mut io = PhaseLog { events: Vec::new() };
+        let mut m: Machine = Machine::new();
+        let cb = [0x2Au8, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x02, 0x00];
+        let mut port = MockPort::new();
+        port.push_out(&cbw(0x68, 2 * MSC_SECTOR_SIZE as u32, false, &cb));
+        m.pump(&mut port, &mut io);
+        assert_eq!(io.events, std::vec![Ev::Open], "no payload arrived");
+        m.bus_reset();
         m.pump(&mut port, &mut io);
         assert_eq!(io.events, std::vec![Ev::Open, Ev::Close]);
     }
@@ -989,7 +1276,7 @@ mod tests {
             m.pump(&mut port, &mut io);
         }
         assert_eq!(
-            vfs.tick(1),
+            vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_MS),
             MediaState::Ready,
             "the medium must survive the command it is inside"
         );
@@ -1028,9 +1315,9 @@ mod tests {
         assert!(m.ua_pending, "the latch survives a passing command");
 
         // A mid-session BOT reset must not clear the pending attention.
-        m.reset();
+        m.bot_reset(&mut MockPort::new());
         assert!(m.ua_pending, "a BOT reset does not clear UNIT ATTENTION");
-        let tur = [0x00u8];
+        let tur = [0x00u8; 6];
         let (_, (_, _, status)) = run_cmd(&mut m, &mut io, &cbw(2, 0, false, &tur), &[]);
         assert_eq!(
             status, CSW_FAILED,
@@ -1046,5 +1333,196 @@ mod tests {
         // A subsequent TEST UNIT READY passes normally (no attention still pending).
         let (_, (_, _, status)) = run_cmd(&mut m, &mut io, &cbw(4, 0, false, &tur), &[]);
         assert_eq!(status, CSW_PASSED);
+    }
+
+    #[test]
+    fn a_bot_reset_drops_the_csw_the_host_never_fetched() {
+        // An armed CSW that survived the reset would answer the next CBW with a stale tag.
+        let mut io = RamDisk::new(true);
+        let mut m: Machine = Machine::new();
+        let tur = [0x00u8, 0, 0, 0, 0, 0];
+        let mut port = MockPort::new();
+        port.write_budget = 0;
+        port.push_out(&cbw(0x81, 0, false, &tur));
+        m.pump(&mut port, &mut io);
+        assert!(port.output.is_empty(), "the CSW is queued, not written");
+        assert!(matches!(m.phase, Phase::SendCsw { .. }));
+
+        m.bot_reset(&mut port);
+        assert_eq!(port.flushed_in, 1, "the armed IN packet is dropped once");
+        assert!(matches!(m.phase, Phase::WaitCbw));
+
+        port.write_budget = usize::MAX;
+        port.push_out(&cbw(0x82, 0, false, &tur));
+        m.pump(&mut port, &mut io);
+        assert_eq!(port.output.len(), CSW_LEN, "only the fresh CSW is sent");
+        assert_eq!(parse_csw(&port.output), (0x82, 0, CSW_PASSED));
+    }
+
+    #[test]
+    fn a_bot_reset_after_a_completed_command_keeps_the_sense_and_the_attention() {
+        // The reset readies the transport for the next CBW; it is not a remount or a sense clear.
+        let mut io = RamDisk::new(true);
+        io.changed = true;
+        let mut m: Machine = Machine::new();
+        let unknown = [0xFDu8, 0, 0, 0, 0, 0];
+        let (_, (_, _, status)) = run_cmd(&mut m, &mut io, &cbw(0x83, 0, false, &unknown), &[]);
+        assert_eq!(status, CSW_FAILED);
+        let sense = m.sense;
+        assert!(m.ua_pending, "the remount latched an attention");
+
+        let mut port = MockPort::new();
+        m.bot_reset(&mut port);
+        assert_eq!(port.flushed_in, 1);
+        assert_eq!(m.sense, sense, "the latched sense survives the reset");
+        assert!(m.ua_pending, "so does the pending attention");
+    }
+
+    #[test]
+    fn a_bus_reset_flushes_nothing_because_the_endpoints_are_torn_down() {
+        // The bus reset itself deconfigures the endpoints, so the class owes the port no call.
+        let mut io = RamDisk::new(true);
+        let mut m: Machine = Machine::new();
+        let tur = [0x00u8, 0, 0, 0, 0, 0];
+        let mut port = MockPort::new();
+        port.write_budget = 0;
+        port.push_out(&cbw(0x84, 0, false, &tur));
+        m.pump(&mut port, &mut io);
+        assert!(matches!(m.phase, Phase::SendCsw { .. }));
+
+        m.bus_reset();
+        assert_eq!(port.flushed_in, 0, "no port call on a bus reset");
+        assert_eq!(m.transferred, 0);
+        assert!(matches!(m.phase, Phase::WaitCbw));
+
+        port.write_budget = usize::MAX;
+        port.push_out(&cbw(0x85, 0, false, &tur));
+        m.pump(&mut port, &mut io);
+        assert_eq!(port.output.len(), CSW_LEN);
+        assert_eq!(parse_csw(&port.output), (0x85, 0, CSW_PASSED));
+    }
+
+    /// BOT 3.1: a reset readies the next CBW, and the next WRITE still completes in full.
+    #[test]
+    fn a_packet_landed_under_a_bot_reset_is_not_taken_for_a_cbw() {
+        for landed in [[0xAAu8; 64].to_vec(), cbw(5, 0, false, &[0; 6]).to_vec()] {
+            let mut m: Machine = Machine::new();
+            let mut io = RamDisk::new(true);
+            let mut port = MockPort::new();
+            port.push_out(&cbw(1, 1024, false, &[0x2A, 0, 0, 0, 0, 5, 0, 0, 2, 0]));
+            m.pump(&mut port, &mut io);
+            port.push_out(&landed);
+            m.bot_reset(&mut port);
+            m.pump(&mut port, &mut io);
+            assert_eq!((port.stalled_in, port.stalled_out), (false, false));
+            assert!(
+                port.output.is_empty(),
+                "a packet from before the reset was served"
+            );
+
+            let payload = [0x5Au8; MSC_SECTOR_SIZE];
+            port.push_out(&cbw(2, 512, false, &[0x2A, 0, 0, 0, 0, 5, 0, 0, 1, 0]));
+            for chunk in payload.chunks(EP_CHUNK) {
+                port.push_out(chunk);
+            }
+            m.pump(&mut port, &mut io);
+            assert_eq!(parse_csw(&port.output), (2, 0, CSW_PASSED));
+            assert_eq!(io.sectors.get(&5), Some(&payload));
+        }
+    }
+
+    std::thread_local! {
+        static SETUP: core::cell::RefCell<Option<[u8; 8]>> = const { core::cell::RefCell::new(None) };
+        static IN_DONE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+
+    /// A bus that delivers one SETUP.
+    struct OneSetupBus {
+        next: usize,
+    }
+
+    impl UsbBus for OneSetupBus {
+        fn alloc_ep(
+            &mut self,
+            dir: UsbDirection,
+            addr: Option<EndpointAddress>,
+            _: EndpointType,
+            _: u16,
+            _: u8,
+        ) -> usb_device::Result<EndpointAddress> {
+            Ok(addr.unwrap_or_else(|| {
+                self.next += 1;
+                EndpointAddress::from_parts(self.next, dir)
+            }))
+        }
+        fn enable(&mut self) {}
+        fn reset(&self) {}
+        fn set_device_address(&self, _: u8) {}
+        fn write(&self, ep: EndpointAddress, data: &[u8]) -> usb_device::Result<usize> {
+            if ep.index() == 0 {
+                IN_DONE.with(|c| c.set(true));
+            }
+            Ok(data.len())
+        }
+        fn read(&self, ep: EndpointAddress, data: &mut [u8]) -> usb_device::Result<usize> {
+            if ep.index() != 0 {
+                return Err(UsbError::WouldBlock);
+            }
+            match SETUP.with(|s| s.borrow_mut().take()) {
+                Some(s) => {
+                    data[..8].copy_from_slice(&s);
+                    Ok(8)
+                }
+                None => Err(UsbError::WouldBlock),
+            }
+        }
+        fn set_stalled(&self, _: EndpointAddress, _: bool) {}
+        fn is_stalled(&self, _: EndpointAddress) -> bool {
+            false
+        }
+        fn suspend(&self) {}
+        fn resume(&self) {}
+        fn poll(&self) -> PollResult {
+            if SETUP.with(|s| s.borrow().is_some()) {
+                PollResult::Data {
+                    ep_out: 0,
+                    ep_in_complete: 0,
+                    ep_setup: 1,
+                }
+            } else if IN_DONE.with(|c| c.replace(false)) {
+                PollResult::Data {
+                    ep_out: 0,
+                    ep_in_complete: 1,
+                    ep_setup: 0,
+                }
+            } else {
+                PollResult::None
+            }
+        }
+    }
+
+    /// USB 2.0 9.1.1.5: a configuration change retires the command, and an eject with it.
+    #[test]
+    fn set_configuration_abandons_the_command_in_flight() {
+        for value in [0u8, 1] {
+            let alloc = UsbBusAllocator::new(OneSetupBus { next: 0 });
+            let mut class: MscClass<'_, OneSetupBus> = MscClass::new(&alloc);
+            let mut dev = UsbDeviceBuilder::new(&alloc, UsbVidPid(1, 2)).build();
+            let mut io = RamDisk::new(true);
+            let mut port = MockPort::new();
+            port.push_out(&cbw(1, 1024, false, &[0x2A, 0, 0, 0, 0, 5, 0, 0, 2, 0]));
+            class.machine.pump(&mut port, &mut io);
+            assert!(matches!(class.machine.phase, Phase::DataOut { .. }));
+            class.machine.ejected = true;
+            SETUP.with(|s| *s.borrow_mut() = Some([0, 9, value, 0, 0, 0, 0, 0]));
+            for _ in 0..3 {
+                dev.poll(&mut [&mut class]);
+            }
+            assert!(
+                matches!(class.machine.phase, Phase::WaitCbw),
+                "value {value}"
+            );
+            assert!(!class.machine.ejected, "value {value}");
+        }
     }
 }

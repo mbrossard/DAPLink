@@ -1,7 +1,6 @@
 //! `__pre_init` that copies `.ramtext` from its flash load image into SRAM before `main`.
 
-/// Defines `__pre_init`; use when nothing else claims the slot.
-/// `wrapping` interposes via `--wrap=__pre_init` and tail-calls the real one.
+/// Defines `__pre_init`; `wrapping` interposes via `--wrap=__pre_init` and tail-calls the real one.
 #[macro_export]
 macro_rules! ram_text_pre_init {
     () => {

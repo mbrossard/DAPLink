@@ -4,22 +4,19 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Own workspace: this firmware pins its own embedded target and HAL feature graph.
 [workspace]
 
 [dependencies]
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt"] }
 embassy-stm32 = { version = "0.6.0", features = ["stm32h523ce", "unstable-pac", "memory-x", "time-driver-any"] }
 embassy-usb = "0.6.0"
 embassy-futures = "0.1"
-# The pipelined DAP loop's two edge-triggered signals between its reader and executor futures.
-embassy-sync = "0.8"
-embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
+# 50 MHz tick: the H5 USB receive erratum delay spins on it per OUT packet.
+embassy-time = { version = "0.5", features = ["tick-hz-50_000_000"] }
 
 daplink-rs = { path = "../../crates/daplink-rs" }
-# The SPI-session SWD engine this firmware supplies a register seam for; `accel` only.
-daplink-spi-swd = { path = "../../crates/daplink-spi-swd", optional = true }
-daplink-stm32-embassy = { path = "../../platform/daplink-stm32-embassy" }
+daplink-spi-swd = { path = "../../crates/daplink-spi-swd" }
+daplink-stm32-embassy = { path = "../../platform/daplink-stm32-embassy", features = ["block-swd", "spi-swd"] }
 daplink-embassy-usb = { path = "../../platform/daplink-embassy-usb" }
 daplink-vfs = { path = "../../crates/daplink-vfs", optional = true }
 daplink-targets = { path = "../../crates/daplink-targets", default-features = false, optional = true }
@@ -29,31 +26,33 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 panic-halt = "0.2"
 
-# Optional defmt-RTT bring-up logging, off by default.
 defmt = { version = "1", optional = true }
 defmt-rtt = { version = "1", optional = true }
 panic-probe = { version = "1", optional = true, features = ["print-defmt"] }
 
 [features]
-default = ["guard"]
-# `guard` bounds-checks each report against the engine's consumption before dispatch.
-guard = ["daplink-rs/guard"]
-# `flash` adds the drag-n-drop mass-storage drive and the vendor flash commands over the
-# flash-wins mux; it is the target-less spine, so a `flash-<chip>` row must select the target.
-flash = ["dep:daplink-vfs", "dep:daplink-targets", "daplink-embassy-usb/flash"]
+default = []
+# Target-less drag-n-drop spine; a `flash-<chip>` row selects the target.
+flash = ["dep:daplink-vfs", "dep:daplink-targets",]
 flash-stm32f401 = ["flash", "daplink-targets/stm32f401ce"]
-# `accel` drives SWD through SPI2 half-duplex sessions on the same probe pads; JTAG stays
-# bit-bang and the VCOM/SWO pins are unchanged. Without it the wire is bit-banged by the CPU.
-accel = ["dep:daplink-spi-swd", "daplink-stm32-embassy/spi-swd"]
-# Bench-only: lifts the injected SCK ceiling to u32::MAX so the rung ladder follows the host's
-# request unclamped; only meaningful with `accel`, never shipped.
-no-clamp = []
-# Free-running CDC packet counters, read off the image's symbols over SWD. Diagnostic: a leg that
-# delivers every byte late looks the same in the byte ledger whether the probe could not send or
-# had nothing to send, and the packet counts separate the two.
+flash-nrf52840 = ["flash", "daplink-targets/nrf52840"]
+flash-nrf52833 = ["flash", "daplink-targets/nrf52833"]
+# SPI2-session SWD in place of the default bit-bang engine; JTAG stays bit-bang.
+accel = []
+# The dap-rs bit-bang engine in place of the fast one.
+plain-bitbang = []
+# Duplex SPI SWD: data sensed on PB14 (MISO), driven from PB15 (MOSI) only to transmit.
+accel-duplex = ["accel"]
+# `DAP_Transfer` and `DAP_TransferBlock` as back-to-back SPI sessions.
+spi-block = ["accel", "daplink-stm32-embassy/spi-block"]
+# A 512-byte DAP packet spanning several 64-byte bulk packets.
+dap-packet-512 = ["daplink-embassy-usb/multi-packet"]
+# Diagnostic GPIO toggle sequence on PB10/PB15 at boot; never shipped.
+wire-probe = ["daplink-stm32-embassy/wire-probe"]
+# Diagnostic CDC packet counters, read over SWD.
 usb-counters = ["daplink-embassy-usb/usb-counters"]
-# RTT-backed defmt logging, captured by a probe attached over SWD; host-side only (no image
-# growth beyond the `.defmt` string table, which the linker keeps out of the loadable image).
+# Diagnostic DWT event trace, dumped from `DAP_TRACE` over SWD; never shipped.
+dap-trace = ["daplink-embassy-usb/dap-trace"]
 defmt = [
     "dep:defmt",
     "dep:defmt-rtt",
@@ -61,6 +60,7 @@ defmt = [
     "embassy-executor/defmt",
     "embassy-stm32/defmt",
     "daplink-rs/defmt",
+    "daplink-vfs?/defmt",
 ]
 
 [[bin]]
@@ -72,7 +72,6 @@ bench = false
 opt-level = 3
 lto = true
 codegen-units = 1
-# Keep debug info in the ELF (probe-rs uses it); flashable images are unaffected.
 debug = 2
 panic = "abort"
 overflow-checks = false

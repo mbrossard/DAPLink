@@ -17,7 +17,6 @@ static FLASH_REGIONS: [FlashRegion<'static>; 1] = [FlashRegion {
     start: 0x0800_0000,
     end: 0x0800_4000,
     is_default: true,
-    is_secure: false,
     algo: &SYNTHETIC_ALGO,
 }];
 

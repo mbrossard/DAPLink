@@ -15,7 +15,6 @@ pub const TOTAL_SECTORS: u32 = 131_200;
 /// Sectors occupied by a single FAT copy.
 pub const FAT_SECTORS: u32 = 65;
 
-/// Ceiling division for `u32` values (`b` must be non-zero).
 pub(crate) const fn div_ceil_u32(a: u32, b: u32) -> u32 {
     a.div_ceil(b)
 }
@@ -38,41 +37,32 @@ pub const fn cluster_to_lba(n: u32) -> u32 {
     DATA_START_LBA + (n - 2) * SECTORS_PER_CLUSTER
 }
 
-/// Constant boot-sector header, offsets `0..62`: every field except the volume id (`39..43`),
-/// the volume label (`43..54`) and the boot signature (`510..512`), which are patched at runtime.
+/// Constant boot-sector header; volume id, label and signature are patched at runtime.
 const BOOT_HEADER: [u8; 62] = {
     let mut h = [0u8; 62];
     // Jump instruction.
     h[0] = 0xEB;
     h[1] = 0x3C;
     h[2] = 0x90;
-    // OEM name.
     let oem = b"MSDOS5.0";
     let mut i = 0;
     while i < oem.len() {
         h[3 + i] = oem[i];
         i += 1;
     }
-    // Bytes per sector.
     let bps = (SECTOR_SIZE as u16).to_le_bytes();
     h[11] = bps[0];
     h[12] = bps[1];
-    // Sectors per cluster.
     h[13] = SECTORS_PER_CLUSTER as u8;
-    // Reserved sectors.
     let rs = (RESERVED_SECTORS as u16).to_le_bytes();
     h[14] = rs[0];
     h[15] = rs[1];
-    // Number of FATs.
     h[16] = NUM_FATS as u8;
-    // Root-directory entries.
     let re = (ROOT_ENTRIES as u16).to_le_bytes();
     h[17] = re[0];
     h[18] = re[1];
-    // Total sectors (16-bit) stays zero: the 32-bit field below carries it.
-    // Media descriptor (fixed disk).
+    // Media descriptor (fixed disk); the 16-bit total stays zero.
     h[21] = 0xF8;
-    // FAT size (16-bit), in sectors.
     let fs = (FAT_SECTORS as u16).to_le_bytes();
     h[22] = fs[0];
     h[23] = fs[1];
@@ -83,7 +73,6 @@ const BOOT_HEADER: [u8; 62] = {
     let heads = 255u16.to_le_bytes();
     h[26] = heads[0];
     h[27] = heads[1];
-    // Total sectors (32-bit).
     let ts = TOTAL_SECTORS.to_le_bytes();
     h[32] = ts[0];
     h[33] = ts[1];
@@ -93,8 +82,7 @@ const BOOT_HEADER: [u8; 62] = {
     h[36] = 0x80;
     // Extended boot signature.
     h[38] = 0x29;
-    // Volume id (39..43) and label (43..54) stay zeroed: `boot_sector` patches them per probe.
-    // File-system type.
+    // File-system type; the volume id and label are patched per probe.
     let fst = b"FAT16   ";
     let mut j = 0;
     while j < fst.len() {
@@ -104,26 +92,21 @@ const BOOT_HEADER: [u8; 62] = {
     h
 };
 
-/// The volume id a probe uses when it has no per-probe one to offer: "DAPL" as a little-endian
-/// word. Two probes sharing it present two volumes hosts may confuse, so prefer a per-probe id.
+/// Fallback volume id, "DAPL" little-endian; two probes sharing it may confuse hosts.
 pub const DEFAULT_VOLUME_ID: u32 = 0x4441_504C;
 
-/// Render the FAT16 boot sector into `buf`, patching the 11-byte `label` and 32-bit `volume_id`
-/// over the constant header.
+/// Render the boot sector into `buf` with `label` and `volume_id` patched in.
 pub fn boot_sector(buf: &mut [u8; 512], label: &[u8; 11], volume_id: u32) {
     *buf = [0u8; 512];
     buf[0..62].copy_from_slice(&BOOT_HEADER);
-    // Volume id.
     buf[39..43].copy_from_slice(&volume_id.to_le_bytes());
-    // Volume label.
     buf[43..54].copy_from_slice(label);
     // Boot signature.
     buf[510] = 0x55;
     buf[511] = 0xAA;
 }
 
-/// The FAT entry for `cluster` given the allocated `chains`. Each `(first, n)` is a contiguous
-/// run: cluster `k` points to `k + 1`, the run's last cluster is `0xFFFF`, and the rest is free.
+/// The FAT entry for `cluster`; each `(first, n)` chain is contiguous and ends in `0xFFFF`.
 fn fat_entry(cluster: u32, chains: &[(u32, u32)]) -> u16 {
     for &(first, n) in chains {
         if cluster >= first && cluster < first + n {
@@ -163,7 +146,7 @@ mod tests {
         assert_eq!(cluster_to_lba(3), 141);
     }
 
-    /// frozen: a host's FAT16 driver parses these exact fields at these exact offsets to mount.
+    /// Frozen: a host's FAT16 driver parses these fields at these offsets.
     #[test]
     fn boot_sector_exact_bytes() {
         let mut b = [0u8; 512];
@@ -191,7 +174,7 @@ mod tests {
         assert_eq!(b[511], 0xAA);
     }
 
-    /// frozen: bytes `62..510` are unused and must stay zero, not stray bytes of a future field.
+    /// Frozen: bytes `62..510` stay zero.
     #[test]
     fn boot_sector_padding_between_header_and_signature_is_zero() {
         let mut b = [0u8; 512];

@@ -4,7 +4,7 @@ mod proto;
 
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use nusb::descriptors::TransferType;
 use nusb::transfer::{Buffer, Bulk, Direction, In, Out};
@@ -12,8 +12,7 @@ use nusb::{DeviceInfo, Endpoint, MaybeFuture};
 
 use daplink_core::{DAPLINK_PID, DAPLINK_VID};
 
-/// Product-string marker every daplink-rs probe advertises. `daplink-core` documents it as a
-/// substring, not a prefix: the board name follows it (`daplink-rs CMSIS-DAP (rp2040)`).
+/// Product-string marker, matched as a substring: the board name follows it.
 const PRODUCT_MARKER: &str = "CMSIS-DAP";
 /// `bInterfaceClass` for a vendor-specific interface (what CMSIS-DAP v2 advertises).
 const VENDOR_SPECIFIC_CLASS: u8 = 0xFF;
@@ -62,7 +61,6 @@ fn main() -> Result<()> {
         .endpoint::<Bulk, In>(ep_in)
         .context("opening bulk IN endpoint")?;
 
-    // Discovery: confirm identity and learn the bootloader kind.
     let reply =
         xfer(&mut out, &mut in_, &proto::discovery_cmd()).context("discovery transfer failed")?;
     let disc = proto::parse_discovery(&reply)?;
@@ -76,36 +74,93 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if !disc.kind.supports_reboot() {
-        println!("reboot skipped: {}", disc.kind.followup_hint());
-        return Ok(());
-    }
+    require_reboot(disc.kind)?;
 
-    // The probe detaches shortly after answering, so a failed read here is success too.
-    match xfer(&mut out, &mut in_, &proto::reboot_cmd()) {
-        Ok(reply) => match proto::parse_status(&reply) {
-            Ok(status) => println!("reboot: {}", status.label()),
-            Err(e) => println!("reboot: sent (unparsable status: {e})"),
+    let request = reboot_transaction(
+        || submit(&mut out, &proto::reboot_cmd()),
+        || receive(&mut in_),
+    );
+    finish_reboot(
+        request,
+        || {
+            drop(out);
+            drop(in_);
+            drop(interface);
+            drop(device);
         },
-        Err(_) => println!("reboot: sent (probe detached before acknowledging)"),
-    }
+        || wait_for_detach(&info, DETACH_TIMEOUT),
+    )?;
+    println!(
+        "reboot armed and probe detached; {}",
+        disc.kind.followup_hint()
+    );
+    Ok(())
+}
 
-    // Drop the endpoints/interface/device so the OS can re-enumerate cleanly.
-    drop(out);
-    drop(in_);
-    drop(interface);
-    drop(device);
+enum RebootRequest {
+    SubmissionFailed(anyhow::Error),
+    Armed,
+    Refused(proto::Status),
+    Unconfirmed(anyhow::Error),
+}
 
-    if wait_for_detach(&info, DETACH_TIMEOUT)? {
-        println!("probe detached; {}", disc.kind.followup_hint());
-    } else {
-        println!("warning: probe still present after {DETACH_TIMEOUT:?}");
+fn require_reboot(kind: proto::Kind) -> Result<()> {
+    if !kind.supports_reboot() {
+        bail!("reboot unsupported: {}", kind.followup_hint());
     }
     Ok(())
 }
 
-/// Find a daplink-rs probe by DAPLink VID/PID and the `CMSIS-DAP` product-string marker,
-/// optionally filtered by serial.
+fn reboot_transaction(
+    submit: impl FnOnce() -> Result<()>,
+    receive: impl FnOnce() -> Result<Vec<u8>>,
+) -> RebootRequest {
+    if let Err(error) = submit() {
+        return RebootRequest::SubmissionFailed(error);
+    }
+    match receive().and_then(|reply| proto::parse_status(&reply)) {
+        Ok(proto::Status::Armed) => RebootRequest::Armed,
+        Ok(proto::Status::Unknown(value)) => {
+            RebootRequest::Unconfirmed(anyhow!("unknown acknowledgement status {value:#04x}"))
+        }
+        Ok(status) => RebootRequest::Refused(status),
+        Err(error) => RebootRequest::Unconfirmed(error),
+    }
+}
+
+fn finish_reboot(
+    request: RebootRequest,
+    release: impl FnOnce(),
+    poll: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    // Endpoint and interface handles must be released before enumeration polling.
+    release();
+    match request {
+        RebootRequest::SubmissionFailed(error) => {
+            Err(error.context("reboot OUT submission failed"))
+        }
+        RebootRequest::Refused(status) => bail!("reboot refused: {}", status.label()),
+        RebootRequest::Armed => {
+            if poll().context("reboot armed; detach observation failed")? {
+                Ok(())
+            } else {
+                bail!("reboot armed, but probe still present after {DETACH_TIMEOUT:?}");
+            }
+        }
+        RebootRequest::Unconfirmed(error) => {
+            let detached = poll().with_context(|| {
+                format!("UNCONFIRMED reboot ({error:#}); detach observation failed")
+            })?;
+            Err(error.context(if detached {
+                "UNCONFIRMED reboot: probe detached without affirmative arming; verify the expected post-reboot identity before recovery"
+            } else {
+                "UNCONFIRMED reboot: no affirmative arming and probe still present"
+            }))
+        }
+    }
+}
+
+/// Find a daplink-rs probe by DAPLink VID/PID and product marker, optionally by serial.
 fn find_probe(serial: Option<&str>) -> Result<DeviceInfo> {
     let mut matches = nusb::list_devices()
         .wait()
@@ -126,14 +181,11 @@ fn find_probe(serial: Option<&str>) -> Result<DeviceInfo> {
     Ok(first)
 }
 
-/// Whether a USB product string identifies a daplink-rs probe: the `CMSIS-DAP` marker may appear
-/// anywhere in it. [`find_probe`] has already restricted enumeration to DAPLink's VID/PID.
 fn product_matches(product: Option<&str>) -> bool {
     product.is_some_and(|p| p.contains(PRODUCT_MARKER))
 }
 
-/// Locate the CMSIS-DAP v2 interface (a vendor-specific interface with a bulk IN + bulk OUT
-/// pair) and its endpoint addresses.
+/// Locate the CMSIS-DAP v2 vendor interface and its bulk endpoint addresses.
 fn find_dap_v2_interface(device: &nusb::Device) -> Result<(u8, u8, u8)> {
     let config = device
         .active_configuration()
@@ -162,16 +214,29 @@ fn find_dap_v2_interface(device: &nusb::Device) -> Result<(u8, u8, u8)> {
     bail!("no CMSIS-DAP v2 bulk interface found on the probe")
 }
 
-/// Send a command on the bulk OUT endpoint and read the reply from the bulk IN endpoint.
 fn xfer(
     out: &mut Endpoint<Bulk, Out>,
     in_: &mut Endpoint<Bulk, In>,
     cmd: &[u8],
 ) -> Result<Vec<u8>> {
-    out.transfer_blocking(Buffer::from(cmd), TRANSFER_TIMEOUT)
-        .into_result()
-        .context("bulk OUT")?;
-    // Bulk IN reads must be a whole number of the endpoint's max packet size.
+    submit(out, cmd)?;
+    receive(in_)
+}
+
+fn submit(out: &mut Endpoint<Bulk, Out>, cmd: &[u8]) -> Result<()> {
+    let completion = out.transfer_blocking(Buffer::from(cmd), TRANSFER_TIMEOUT);
+    completion.status.context("bulk OUT")?;
+    check_submission_length(completion.actual_len, cmd.len())
+}
+
+fn check_submission_length(actual: usize, expected: usize) -> Result<()> {
+    if actual != expected {
+        bail!("bulk OUT incomplete: submitted {actual} of {expected} bytes");
+    }
+    Ok(())
+}
+
+fn receive(in_: &mut Endpoint<Bulk, In>) -> Result<Vec<u8>> {
     let read_len = round_up(RESPONSE_BUFFER_HINT, in_.max_packet_size().max(1));
     let reply = in_
         .transfer_blocking(Buffer::new(read_len), TRANSFER_TIMEOUT)
@@ -180,7 +245,6 @@ fn xfer(
     Ok(reply.into_vec())
 }
 
-/// Round `len` up to the next multiple of `granularity`.
 fn round_up(len: usize, granularity: usize) -> usize {
     if granularity == 0 {
         return len;
@@ -212,44 +276,139 @@ fn wait_for_detach(info: &DeviceInfo, timeout: Duration) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{product_matches, round_up};
+    use super::*;
+    use std::cell::RefCell;
 
-    #[test]
-    fn round_up_keeps_a_full_speed_read_at_one_packet() {
-        assert_eq!(round_up(64, 64), 64);
+    fn transaction(
+        submission_ok: bool,
+        reply: Result<Vec<u8>>,
+        detached: Result<bool>,
+    ) -> (Result<()>, Vec<&'static str>) {
+        let calls = RefCell::new(Vec::new());
+        let request = reboot_transaction(
+            || {
+                calls.borrow_mut().push("submit");
+                if submission_ok {
+                    Ok(())
+                } else {
+                    bail!("OUT fixture")
+                }
+            },
+            || {
+                calls.borrow_mut().push("receive");
+                reply
+            },
+        );
+        let result = finish_reboot(
+            request,
+            || calls.borrow_mut().push("release"),
+            || {
+                calls.borrow_mut().push("poll");
+                detached
+            },
+        );
+        (result, calls.into_inner())
     }
 
     #[test]
-    fn round_up_pads_to_a_whole_high_speed_packet() {
-        assert_eq!(round_up(64, 512), 512);
+    fn out_failure_never_reads_or_polls_and_releases_once() {
+        let (result, calls) = transaction(false, Ok(vec![0x9F, 0]), Ok(true));
+        assert_eq!(calls, ["submit", "release"]);
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("OUT submission failed"));
+        assert!(message.contains("OUT fixture"));
     }
 
     #[test]
-    fn round_up_is_a_no_op_at_zero_granularity() {
-        assert_eq!(round_up(64, 0), 64);
+    fn partial_out_is_not_submission_success() {
+        for actual in 0..proto::reboot_cmd().len() {
+            let request = reboot_transaction(
+                || check_submission_length(actual, proto::reboot_cmd().len()),
+                || panic!("partial OUT must not read"),
+            );
+            assert!(finish_reboot(request, || {}, || panic!("partial OUT must not poll")).is_err());
+        }
+        assert!(check_submission_length(6, 6).is_ok());
     }
 
-    /// `CMSIS-DAP` sits in the middle of a real product string, where a prefix match misses it.
+    #[test]
+    fn unsupported_and_unknown_kinds_fail_requested_reboot() {
+        assert!(require_reboot(proto::Kind::None).is_err());
+        assert!(require_reboot(proto::Kind::Unknown(127)).is_err());
+        for kind in [proto::Kind::Uf2, proto::Kind::StDfu, proto::Kind::NxpIsp] {
+            assert!(require_reboot(kind).is_ok());
+        }
+    }
+
+    #[test]
+    fn armed_requires_detach_and_releases_before_polling() {
+        for detached in [true, false] {
+            let (result, calls) = transaction(true, Ok(vec![0x9F, 0]), Ok(detached));
+            assert_eq!(calls, ["submit", "receive", "release", "poll"]);
+            assert_eq!(result.is_ok(), detached);
+        }
+    }
+
+    #[test]
+    fn explicit_refusals_never_poll_or_succeed() {
+        for status in [1, 2, 3] {
+            let (result, calls) = transaction(true, Ok(vec![0x9F, status]), Ok(true));
+            assert_eq!(calls, ["submit", "receive", "release"]);
+            assert!(format!("{:#}", result.unwrap_err()).contains("reboot refused"));
+        }
+    }
+
+    #[test]
+    fn missing_malformed_and_unknown_acknowledgements_remain_unconfirmed() {
+        for detached in [true, false] {
+            for reply in [
+                Err(anyhow!("IN fixture")),
+                Ok(vec![]),
+                Ok(vec![0x9F]),
+                Ok(vec![0xFF, 0]),
+                Ok(vec![0x9F, 127]),
+            ] {
+                let (result, calls) = transaction(true, reply, Ok(detached));
+                assert_eq!(calls, ["submit", "receive", "release", "poll"]);
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(message.contains("UNCONFIRMED"));
+                assert!(message.contains(if detached {
+                    "detached without affirmative"
+                } else {
+                    "still present"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn enumeration_failure_is_not_detach() {
+        for reply in [Ok(vec![0x9F, 0]), Err(anyhow!("IN fixture"))] {
+            let (result, calls) = transaction(true, reply, Err(anyhow!("enumeration fixture")));
+            assert_eq!(calls, ["submit", "receive", "release", "poll"]);
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(message.contains("detach observation failed"));
+            assert!(message.contains("enumeration fixture"));
+        }
+    }
+
     #[test]
     fn matches_fleet_product_strings() {
         assert!(product_matches(Some("daplink-rs CMSIS-DAP (rp2040)")));
         assert!(product_matches(Some("daplink-rs CMSIS-DAP (stm32f103)")));
     }
 
-    /// A bare `"CMSIS-DAP"` still contains the marker, so it matches under the substring rule.
     #[test]
     fn matches_bare_marker() {
         assert!(product_matches(Some("CMSIS-DAP")));
     }
 
-    /// Something clearly foreign -- no marker at all -- must not match.
     #[test]
     fn rejects_foreign_product_string() {
         assert!(!product_matches(Some("Bus Pirate 6")));
         assert!(!product_matches(Some("STLink-V3")));
     }
 
-    /// A device with no readable product string descriptor must not match.
     #[test]
     fn rejects_missing_product_string() {
         assert!(!product_matches(None));

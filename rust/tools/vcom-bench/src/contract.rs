@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::stream::{Conservation, ConservationClass, VcomCounters};
+use crate::counters::{Conservation, ConservationClass, VcomCounters};
 
 pub const DEFAULT_BAUD: u32 = 115_200;
 pub const EXCHANGES: usize = 1_000;
@@ -10,6 +10,7 @@ pub const DEFAULT_CYCLES: usize = 10;
 pub const QUALIFY_CYCLES: usize = 100;
 pub const IDLE: Duration = Duration::from_secs(10);
 pub const QUALIFY_IDLE: Duration = Duration::from_secs(5 * 60);
+/// What a line-coding transition costs on a quiet line; queued data extends the bound.
 pub const LINE_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
 pub const LINE_SETTLE_POLL: Duration = Duration::from_millis(5);
 pub const LINE_CONTROL_QUIET: Duration = Duration::from_millis(150);
@@ -84,6 +85,7 @@ pub fn apply_counter_classification(result: &mut CaseResult) {
         Some(ConservationClass::IdentityFailed) => "probe counter identity failed",
         // The disposition `stuck` has: a channel reinitialised mid-case voids its evidence.
         Some(ConservationClass::DmaFaulted) => "probe recovered a DMA fault; case is not evidence",
+        Some(ConservationClass::Restart) => "probe restarted mid-case; case is not evidence",
         _ => return,
     };
     result.pass = false;
@@ -149,6 +151,11 @@ pub fn line_transition_failure(
     })
 }
 
+/// An expiry names the bound it was given and the queue that set it, so neither is guesswork.
+pub fn line_settle_expiry(detail: &str, bound: Duration, queued: &str) -> String {
+    format!("{detail} (bound {} ms; {queued})", bound.as_millis())
+}
+
 pub fn line_runtime_failure(
     cycle: usize,
     requested: u32,
@@ -164,12 +171,20 @@ pub fn line_echo_failure(
     written: u64,
     read: u64,
     first_divergence: Option<u64>,
+    head: &[u8],
 ) -> String {
-    format!(
+    let mut text = format!(
         "line-coding cycle {cycle} rate {requested} bulk echo stage: wrote {written}, read {read}, \
          first divergence {}",
         first_divergence.map_or_else(|| "none".into(), |offset| offset.to_string())
-    )
+    );
+    if !head.is_empty() {
+        text.push_str(", read starts");
+        for byte in head {
+            text.push_str(&format!(" {byte:#04x}"));
+        }
+    }
+    text
 }
 
 pub fn small_exchange_pass(no_dap: &Latencies, with_dap: &Latencies) -> Result<(), String> {
@@ -247,7 +262,7 @@ mod tests {
     #[test]
     fn counter_classification_requires_both_samples() {
         let sample = VcomCounters {
-            valid: Some(crate::stream::VALID_RX_LEDGER),
+            valid: Some(crate::counters::VALID_RX_LEDGER),
             ..VcomCounters::default()
         };
         // Full coverage without a grade word can no longer claim completeness.
@@ -262,16 +277,16 @@ mod tests {
     #[test]
     fn counter_classification_uses_the_case_delta() {
         let before = VcomCounters {
-            uart_rx: u32::MAX - 2,
-            cdc_in: u32::MAX - 2,
-            valid: Some(crate::stream::VALID_RX_LEDGER),
+            uart_rx: 100,
+            cdc_in: 100,
+            valid: Some(crate::counters::VALID_RX_LEDGER),
             ..VcomCounters::default()
         };
         let after = VcomCounters {
-            uart_rx: 2,
-            cdc_in: 1,
+            uart_rx: 110,
+            cdc_in: 109,
             host_dropped: 1,
-            valid: Some(crate::stream::VALID_RX_LEDGER),
+            valid: Some(crate::counters::VALID_RX_LEDGER),
             ..VcomCounters::default()
         };
         assert_eq!(
@@ -286,6 +301,7 @@ mod tests {
             ConservationClass::ObservedLoss,
             ConservationClass::IdentityFailed,
             ConservationClass::DmaFaulted,
+            ConservationClass::Restart,
         ] {
             let mut result = CaseResult {
                 case: "test",
@@ -377,8 +393,22 @@ mod tests {
     #[test]
     fn line_echo_failure_preserves_the_host_ledger() {
         assert_eq!(
-            line_echo_failure(7, 921_600, 64, 61, Some(17)),
+            line_echo_failure(7, 921_600, 64, 61, Some(17), &[]),
             "line-coding cycle 7 rate 921600 bulk echo stage: wrote 64, read 61, first divergence 17"
+        );
+    }
+
+    #[test]
+    fn an_expired_transition_names_its_bound_and_the_queue_that_set_it() {
+        assert_eq!(
+            line_settle_expiry(
+                "line-coding cycle 6 rate 9600 target stage: the probe has not applied the rate \
+                 yet",
+                Duration::from_millis(2_632),
+                "2047 bytes were still queued at the old rate",
+            ),
+            "line-coding cycle 6 rate 9600 target stage: the probe has not applied the rate yet \
+             (bound 2632 ms; 2047 bytes were still queued at the old rate)"
         );
     }
 

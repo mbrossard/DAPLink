@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::dap::{
-    decode_connect, decode_info_packet_size, decode_jtag_configure, decode_jtag_idcode,
-    decode_swj_clock, decode_swj_sequence, decode_transfer, decode_transfer_block,
-    decode_transfer_configure, decode_write_abort, encode_connect, encode_info,
-    encode_jtag_configure, encode_jtag_idcode, encode_swj_clock, encode_swj_sequence,
+    check_reply, decode_connect, decode_info_packet_size, decode_jtag_configure,
+    decode_jtag_idcode, decode_swj_clock, decode_swj_sequence, decode_transfer,
+    decode_transfer_block, decode_transfer_configure, decode_write_abort, encode_connect,
+    encode_info, encode_jtag_configure, encode_jtag_idcode, encode_swj_clock, encode_swj_sequence,
     encode_transfer, encode_transfer_block, encode_transfer_configure, encode_write_abort,
-    transfer_block_read_capacity, transfer_block_write_capacity, Ack, InfoId, Port,
-    TransferConfigureRequest, TransferItem, TransferRequest,
+    mixed_read_capacity, mixed_write_capacity, transfer_block_read_capacity,
+    transfer_block_write_capacity, Ack, InfoId, Port, TransferConfigureRequest, TransferItem,
+    TransferRequest,
 };
 use crate::transport::Probe;
 
@@ -25,11 +26,9 @@ pub const CSYSPWRUPREQ: u32 = 1 << 30;
 /// `CTRL/STAT` bit acknowledging system power-up.
 pub const CSYSPWRUPACK: u32 = 1 << 31;
 
-/// The SWD line-reset-and-select bit sequence value (`0xE79E`) that switches a JTAG-or-SWD
-/// (SWJ) port into SWD mode.
+/// The select value (`0xE79E`) that switches an SWJ port into SWD mode.
 pub const JTAG_TO_SWD_SELECT: u16 = 0xE79E;
 
-// --- Dormant-state wake (ADIv6 parts such as the RP2350) ---
 /// The two halves of the 128-bit CoreSight selection alert, LSB-first.
 const SELECTION_ALERT_LO: u64 = 0x8685_2D95_6209_F392;
 /// Upper half of the selection alert.
@@ -38,11 +37,9 @@ const SELECTION_ALERT_HI: u64 = 0x19BC_0EA2_E3DD_AFE9;
 const SWD_TO_DORMANT: [u8; 4] = [0xBA, 0xBB, 0xBB, 0x33];
 /// 12-bit activation code selecting SWD out of dormant.
 const SWD_ACTIVATION: u16 = 0x1A0;
-/// The 16-bit select value (`0xE73C`) that switches an SWJ port from SWD back into JTAG mode,
-/// the JTAG-direction counterpart of [`JTAG_TO_SWD_SELECT`].
+/// The select value (`0xE73C`) that switches an SWJ port from SWD back into JTAG mode.
 pub const SWD_TO_JTAG_SELECT: u16 = 0xE73C;
-/// JTAG TAP-reset-and-idle bit count: eight TMS-high into Test-Logic-Reset, four low into
-/// Run-Test/Idle, where the CMSIS-DAP JTAG engine expects every scan to start.
+/// JTAG TAP reset (eight TMS-high) then four low into Run-Test/Idle, where DAP JTAG scans start.
 const JTAG_TAP_RESET_IDLE_BITS: u8 = 12;
 /// Data bytes for the JTAG TAP reset + idle (eight high then four low, LSB-first).
 const JTAG_TAP_RESET_IDLE: [u8; 2] = [0xFF, 0x00];
@@ -51,22 +48,15 @@ pub const STM32F401_CM_TAP_IR_LEN: u8 = 4;
 /// IR bit length of the STM32F401 boundary-scan TAP (chain index 1, closest to TDI).
 pub const STM32F401_BS_TAP_IR_LEN: u8 = 5;
 
-// --- Multidrop TARGETSEL (Arm Debug Interface selection protocol), shifted out LSB-first
-// through DAP_SWJ_Sequence.
-
-/// SWD request byte for a DP `TARGETSEL` write: start=1, APnDP=0, RnW=0, A[3:2]=0b11, even
-/// address parity=0, stop=0, park=1 -- LSB-first `0x99`.
+/// SWD request byte for a DP `TARGETSEL` write, LSB-first.
 const TARGETSEL_REQUEST: u8 = 0x99;
-/// The 5 turnaround + ACK + turnaround bits of a `TARGETSEL` write, driven high: `TARGETSEL` has
-/// no acknowledge, so the host never releases SWDIO for them.
+/// The turnaround and ACK bits of a `TARGETSEL` write, host-driven high: `TARGETSEL` has no ACK.
 const TARGETSEL_ACK_WINDOW_HIGH: u64 = 0x1F;
-/// A line reset (51 SWDIO-high cycles, >= the 50 the protocol requires) terminated by three low
-/// cycles, leaving the DP out of the reset state so it frames the next packet.
+/// A 51-cycle line reset terminated by three low cycles, so the DP frames the next packet.
 const LINE_RESET_TERMINATED_BITS: u8 = 54;
 /// Data bytes for the terminated line reset (51 high then 3 low, LSB-first).
 const LINE_RESET_TERMINATED: [u8; 7] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07];
 
-// --- DP register transfer addresses (the two-bit A[3:2] selector) ---
 /// DPIDR (read) / ABORT (write) live at `A[3:2] = 0b00`.
 const DP_A_DPIDR: u8 = 0;
 /// CTRL/STAT lives at `A[3:2] = 0b01` (with `DPBANKSEL = 0`).
@@ -74,7 +64,6 @@ const DP_A_CTRL_STAT: u8 = 1;
 /// SELECT (write) lives at `A[3:2] = 0b10`.
 const DP_A_SELECT: u8 = 2;
 
-// --- MEM-AP register transfer addresses (A[3:2]) and their banks ---
 /// CSW lives at AP offset `0x00` -> `A[3:2] = 0b00`, `APBANKSEL = 0`.
 const AP_A_CSW: u8 = 0;
 /// TAR lives at AP offset `0x04` -> `A[3:2] = 0b01`, `APBANKSEL = 0`.
@@ -88,27 +77,23 @@ const AP_BANK_CORE: u8 = 0x0;
 /// `APBANKSEL` for the MEM-AP IDR register.
 const AP_BANK_IDR: u8 = 0xF;
 
-/// SWD ABORT write clearing every sticky error flag
-/// (`ORUNERRCLR | WDERRCLR | STKERRCLR | STKCMPCLR | DAPABORT`).
-const ABORT_CLEAR_ALL: u32 = 0x1E;
+/// SWD ABORT sticky-error clear; leaves `DAPABORT` and STKCMPCLR (UNPREDICTABLE on MINDP) at 0.
+const ABORT_CLEAR_ALL: u32 = 0x1C;
 
-/// `CTRL/STAT` sticky error flags (`STICKYORUN | STICKYCMP | STICKYERR`); write-one-to-clear
-/// over JTAG, whose ABORT scan implements only `DAPABORT`. Read-only over SWD.
+/// `CTRL/STAT` sticky error flags: write-one-to-clear over JTAG, read-only over SWD.
 const CTRL_STAT_STICKY_W1C: u32 = (1 << 1) | (1 << 4) | (1 << 5);
 
-/// MEM-AP CSW value for the measured transfers: the standard Cortex-M debug `Prot`/`DbgSwEnable`
-/// field (`0x23` in `[31:24]`) + `AddrInc = single(1 << 4)` + `Size = word(0b010)`.
+/// MEM-AP CSW: Cortex-M debug `Prot`/`DbgSwEnable`, single auto-increment, word size.
 const CSW_WORD_ADDRINC: u32 = 0x2300_0002 | (1 << 4);
 
-/// MEM-AP auto-increment wrap boundary, in bytes. The AP TAR only guarantees auto-increment
-/// within a 10-bit (1 KiB) window; crossing it requires a fresh TAR write.
+/// MEM-AP auto-increment wrap boundary, in bytes; crossing it needs a fresh TAR write.
 pub const WRAP_BYTES: usize = 1024;
 
 /// Default SWJ clock when the caller does not specify one.
 pub const DEFAULT_CLOCK_HZ: u32 = 2_000_000;
 
 /// Fallback `DAP_PACKET_SIZE` if the probe reports an unusable (zero) value.
-const FALLBACK_PACKET_SIZE: u16 = 64;
+pub const FALLBACK_PACKET_SIZE: u16 = 64;
 
 /// Per-transfer USB round-trip timeout.
 const TRANSFER_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -132,6 +117,8 @@ pub const DHCSR_C_DEBUGEN: u32 = 1 << 0;
 pub const DHCSR_C_HALT: u32 = 1 << 1;
 /// `DHCSR` status bit: the core reports halted.
 pub const DHCSR_S_HALT: u32 = 1 << 17;
+/// DHCSR status: the core has been reset since the last DHCSR read (sticky, cleared by the read).
+pub const DHCSR_S_RESET_ST: u32 = 1 << 25;
 /// Bound on how long a halt request may take to be acknowledged by `S_HALT`.
 const HALT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -153,8 +140,7 @@ pub struct AttachConfig {
     pub wait_retry: u16,
     /// `DAP_TransferConfigure` match-retry count (probe-internal retries for value-match reads).
     pub match_retry: u16,
-    /// Multidrop `TARGETSEL` to select before the DPIDR read; `None` keeps the single-drop
-    /// entry unchanged.
+    /// Multidrop `TARGETSEL` to select before the DPIDR read; `None` for single-drop.
     pub targetsel: Option<u32>,
 }
 
@@ -175,8 +161,7 @@ impl Default for AttachConfig {
 pub struct JtagAttachConfig {
     /// SWJ clock in Hz for `DAP_SWJ_Clock`.
     pub clock_hz: u32,
-    /// The MEM-AP to select. JTAG attach is ADIv5-only, so this is a bare `APSEL`, not an
-    /// [`ApMode`].
+    /// The MEM-AP `APSEL`; JTAG attach is ADIv5-only.
     pub apsel: u8,
     /// Scan-chain IR lengths, one per TAP, index 0 closest to TDO, for `DAP_JTAG_Configure`.
     pub ir_lengths: Vec<u8>,
@@ -275,8 +260,7 @@ impl fmt::Display for ApIdr {
     }
 }
 
-/// Compose an ADIv5 DP `SELECT` word from `apsel` (`SELECT[31:24]`) and `apbank`
-/// (`APBANKSEL[7:4]`), leaving `DPBANKSEL[3:0] = 0`.
+/// Compose an ADIv5 DP `SELECT` word from `apsel` and `apbank`, `DPBANKSEL = 0`.
 const fn select_word(apsel: u8, apbank: u8) -> u32 {
     ((apsel as u32) << 24) | (((apbank & 0xF) as u32) << 4)
 }
@@ -287,8 +271,7 @@ const fn words_to_wrap(addr: u32) -> usize {
     (WRAP_BYTES - into) / 4
 }
 
-/// The next chunk length (in words) for a block transfer starting at `cur` with `remaining`
-/// words left, bounded by the wrap boundary and the per-packet `max_words` capacity.
+/// Next chunk length in words, bounded by the wrap boundary and `max_words`.
 const fn block_chunk_words(cur: u32, remaining: usize, max_words: usize) -> usize {
     let wrap = words_to_wrap(cur);
     let cap = if max_words == 0 { 1 } else { max_words };
@@ -302,12 +285,71 @@ const fn block_chunk_words(cur: u32, remaining: usize, max_words: usize) -> usiz
     n
 }
 
-/// USB round-trip timeout for the packets [`Adiv5::read_block_depth`]/[`Adiv5::write_block_depth`]
-/// submit directly.
+/// USB round-trip timeout for the pipelined block packets.
 const PIPELINE_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Split `words` at `addr` into the `(chunk_addr, chunk_words)` pieces [`Adiv5::read_block`]
-/// walks, bounded by the wrap boundary and the per-packet capacity `cap`.
+/// Where a transfer re-arms the MEM-AP TAR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TarPolicy {
+    /// One TAR write before every block.
+    #[default]
+    PerChunk,
+    /// One TAR write per 1 KiB window; blocks inside it ride the AP's own increment.
+    PerWindow,
+}
+
+impl TarPolicy {
+    /// Short label used in the JSON and in error text.
+    pub const fn label(self) -> &'static str {
+        match self {
+            TarPolicy::PerChunk => "per-chunk",
+            TarPolicy::PerWindow => "per-window",
+        }
+    }
+}
+
+/// The command shape a planned transfer is issued as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransferShape {
+    /// A `DAP_TransferBlock` per chunk, with its TAR write as a separate `DAP_Transfer`.
+    #[default]
+    Block,
+    /// One `DAP_Transfer` per chunk carrying the TAR write and the chunk's DRW items.
+    Mixed,
+}
+
+impl TransferShape {
+    /// Short label used in the JSON and in error text.
+    pub const fn label(self) -> &'static str {
+        match self {
+            TransferShape::Block => "block",
+            TransferShape::Mixed => "mixed",
+        }
+    }
+
+    /// Words one command carries in this shape at `packet_size`, per direction.
+    pub const fn capacity(self, packet_size: u16, read: bool) -> usize {
+        match (self, read) {
+            (TransferShape::Block, true) => transfer_block_read_capacity(packet_size),
+            (TransferShape::Block, false) => transfer_block_write_capacity(packet_size),
+            (TransferShape::Mixed, true) => mixed_read_capacity(packet_size),
+            (TransferShape::Mixed, false) => mixed_write_capacity(packet_size),
+        }
+    }
+}
+
+/// One planned block transfer: its address, its word count, and whether TAR is written first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockOp {
+    /// First word address of the block.
+    pub addr: u32,
+    /// Words the block moves.
+    pub words: usize,
+    /// Whether a TAR write precedes this block.
+    pub tar: bool,
+}
+
+/// Split `words` at `addr` into `(chunk_addr, chunk_words)` pieces bounded by the wrap and `cap`.
 fn plan_chunks(addr: u32, words: usize, cap: usize) -> Vec<(u32, usize)> {
     let mut chunks = Vec::new();
     let mut cur = addr;
@@ -321,12 +363,48 @@ fn plan_chunks(addr: u32, words: usize, cap: usize) -> Vec<(u32, usize)> {
     chunks
 }
 
-/// The `DAP_Transfer` response length in bytes for a single-item TAR write: command id,
-/// transfer count, status (no read data).
+/// `plan_chunks` plus `policy`'s TAR placement; both policies touch the same addresses in order.
+pub fn plan_ops(addr: u32, words: usize, cap: usize, policy: TarPolicy) -> Vec<BlockOp> {
+    plan_chunks(addr, words, cap)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (chunk_addr, n))| BlockOp {
+            addr: chunk_addr,
+            words: n,
+            tar: match policy {
+                TarPolicy::PerChunk => true,
+                TarPolicy::PerWindow => i == 0 || (chunk_addr as usize).is_multiple_of(WRAP_BYTES),
+            },
+        })
+        .collect()
+}
+
+/// Commands a `words`-word transfer at `addr` costs under `policy`.
+pub fn command_count(addr: u32, words: usize, cap: usize, policy: TarPolicy) -> usize {
+    plan_ops(addr, words, cap, policy)
+        .iter()
+        .map(|op| 1 + usize::from(op.tar))
+        .sum()
+}
+
+/// Commands a `words`-word transfer at `addr` costs under `policy` in `shape`.
+pub fn shaped_command_count(
+    addr: u32,
+    words: usize,
+    cap: usize,
+    policy: TarPolicy,
+    shape: TransferShape,
+) -> usize {
+    match shape {
+        TransferShape::Block => command_count(addr, words, cap, policy),
+        TransferShape::Mixed => plan_ops(addr, words, cap, policy).len(),
+    }
+}
+
+/// `DAP_Transfer` response length for a single-item TAR write.
 const TAR_WRITE_RESPONSE_LEN: usize = 3;
 
-/// The `DAP_TransferBlock` read response length in bytes for `words` data words (command id,
-/// 2-byte count, status header, then `4*words` of payload).
+/// `DAP_TransferBlock` read response length for `words` data words.
 const fn block_read_response_len(words: usize) -> usize {
     4 + 4 * words
 }
@@ -336,72 +414,144 @@ const fn block_write_response_len() -> usize {
     4
 }
 
-/// The pipelined packets over `chunks` -- a TAR write then a `DAP_TransferBlock` each, with
-/// exact response lengths. Every chunk re-arms TAR; `data` is `None` for a read pass.
+/// The pipelined packets over `ops`, with exact response lengths; `data` is `None` for a read.
 fn build_block_requests(
-    chunks: &[(u32, usize)],
+    ops: &[BlockOp],
     data: Option<&[u32]>,
     dap_index: u8,
 ) -> (Vec<Vec<u8>>, Vec<usize>) {
-    let mut requests = Vec::with_capacity(chunks.len() * 2);
-    let mut expected_lens = Vec::with_capacity(chunks.len() * 2);
+    let mut requests = Vec::with_capacity(ops.len() * 2);
+    let mut expected_lens = Vec::with_capacity(ops.len() * 2);
     let mut done = 0;
-    for &(chunk_addr, n) in chunks {
-        requests.push(encode_transfer(
-            dap_index,
-            &[TransferItem {
-                request: TransferRequest::new(true, false, AP_A_TAR),
-                data: Some(chunk_addr),
-            }],
-        ));
-        expected_lens.push(TAR_WRITE_RESPONSE_LEN);
+    for op in ops {
+        if op.tar {
+            requests.push(encode_transfer(
+                dap_index,
+                &[TransferItem {
+                    request: TransferRequest::new(true, false, AP_A_TAR),
+                    data: Some(op.addr),
+                }],
+            ));
+            expected_lens.push(TAR_WRITE_RESPONSE_LEN);
+        }
 
         match data {
             None => {
                 requests.push(encode_transfer_block(
                     dap_index,
-                    n as u16,
+                    op.words as u16,
                     TransferRequest::new(true, true, AP_A_DRW),
                     &[],
                 ));
-                expected_lens.push(block_read_response_len(n));
+                expected_lens.push(block_read_response_len(op.words));
             }
             Some(data) => {
                 requests.push(encode_transfer_block(
                     dap_index,
-                    n as u16,
+                    op.words as u16,
                     TransferRequest::new(true, false, AP_A_DRW),
-                    &data[done..done + n],
+                    &data[done..done + op.words],
                 ));
                 expected_lens.push(block_write_response_len());
-                done += n;
+                done += op.words;
             }
         }
     }
     (requests, expected_lens)
 }
 
-/// Decode and check one pipelined chunk's response pair (TAR write, then block), returning the
-/// block's read words (empty for a write).
-fn check_pipelined_chunk(tar_resp: &[u8], block_resp: &[u8], words: usize) -> Result<Vec<u32>> {
+/// `DAP_Transfer` response length for a mixed chunk of `words` reads.
+const fn mixed_response_len(words: usize) -> usize {
+    3 + 4 * words
+}
+
+/// The mixed packets over `ops`, one `DAP_Transfer` per chunk; `data` is `None` for a read.
+fn build_mixed_requests(
+    ops: &[BlockOp],
+    data: Option<&[u32]>,
+    dap_index: u8,
+) -> (Vec<Vec<u8>>, Vec<usize>) {
+    let mut requests = Vec::with_capacity(ops.len());
+    let mut expected_lens = Vec::with_capacity(ops.len());
+    let mut done = 0;
+    for op in ops {
+        let mut items = Vec::with_capacity(1 + op.words);
+        if op.tar {
+            items.push(TransferItem {
+                request: TransferRequest::new(true, false, AP_A_TAR),
+                data: Some(op.addr),
+            });
+        }
+        let drw = TransferRequest::new(true, data.is_none(), AP_A_DRW);
+        for i in 0..op.words {
+            items.push(TransferItem {
+                request: drw,
+                data: data.map(|d| d[done + i]),
+            });
+        }
+        requests.push(encode_transfer(dap_index, &items));
+        expected_lens.push(mixed_response_len(if data.is_none() {
+            op.words
+        } else {
+            0
+        }));
+        done += op.words;
+    }
+    (requests, expected_lens)
+}
+
+/// Transfer items one mixed chunk asks for: the DRW items plus the TAR write where present.
+const fn mixed_items(op: &BlockOp) -> usize {
+    op.words + if op.tar { 1 } else { 0 }
+}
+
+/// Decode and check one mixed chunk response, returning its read words (empty for a write).
+fn check_mixed(resp: &[u8], op: &BlockOp, read: bool) -> Result<Vec<u32>> {
+    let items = mixed_items(op);
+    let t = decode_transfer(resp).context("decoding mixed DAP_Transfer response failed")?;
+    let words = if read { op.words } else { 0 };
+    if !t.status.is_ok() || t.transfer_count as usize != items || t.read_data.len() != words {
+        bail!(
+            "mixed DAP_Transfer failed after {} of {items} transfers ({})",
+            t.transfer_count,
+            t.status
+        );
+    }
+    Ok(t.read_data)
+}
+
+/// Check one pipelined TAR-write response.
+fn check_pipelined_tar(tar_resp: &[u8]) -> Result<()> {
     let tar = decode_transfer(tar_resp).context("decoding pipelined TAR write response failed")?;
     if !tar.status.is_ok() || tar.transfer_count != 1 {
-        bail!("pipelined TAR write failed (ack {:?})", tar.status.ack());
+        bail!("pipelined TAR write failed ({})", tar.status);
     }
+    Ok(())
+}
+
+/// Decode and check one pipelined block response, returning its read words (empty for a write).
+fn check_pipelined_block(block_resp: &[u8], words: usize) -> Result<Vec<u32>> {
     let block = decode_transfer_block(block_resp)
         .context("decoding pipelined DAP_TransferBlock response failed")?;
     if !block.status.is_ok() || block.transfer_count as usize != words {
         bail!(
-            "pipelined DAP_TransferBlock failed after {} of {words} words (ack {:?})",
+            "pipelined DAP_TransferBlock failed after {} of {words} words ({})",
             block.transfer_count,
-            block.status.ack()
+            block.status
         );
     }
     Ok(block.read_data)
 }
 
-/// How an attach addresses the target access port. Encoding an ADIv6 AP the ADIv5 way reaches a
-/// different register and reads plausible rubbish rather than failing.
+/// `failure`, unless `resp` does not even fit `request`, the deeper fault.
+fn diagnose(request: &[u8], resp: &[u8], failure: anyhow::Error) -> anyhow::Error {
+    match check_reply(request, resp) {
+        Ok(()) => failure,
+        Err(e) => anyhow!(e).context("CMSIS-DAP reply does not fit its request"),
+    }
+}
+
+/// How an attach addresses the AP; an ADIv6 AP addressed the ADIv5 way reads rubbish, not an error.
 #[derive(Debug, Clone, Copy)]
 pub enum ApMode {
     /// ADIv5: `APSEL` in `SELECT[31:24]`, `APBANKSEL` in `SELECT[7:4]`.
@@ -409,8 +559,7 @@ pub enum ApMode {
         /// The MEM-AP index.
         apsel: u8,
     },
-    /// ADIv6: a memory-mapped 4 KiB component frame reached by base address, its MEM-AP
-    /// programmer's model relocated to the `0xD00` page.
+    /// ADIv6: a memory-mapped 4 KiB component frame reached by base address.
     V6 {
         /// The AP's base address.
         ap_base: u32,
@@ -425,8 +574,7 @@ impl Default for ApMode {
     }
 }
 
-/// ADIv6 MEM-AP core page: CSW/TAR/DRW at frame offsets `0xD00/0xD04/0xD0C`, so this is the
-/// 16-byte SELECT window holding all three and `A[3:2]` picks one.
+/// ADIv6 MEM-AP core page holding CSW/TAR/DRW; `A[3:2]` picks one.
 const AP_V6_OFF_CORE: u32 = 0xD00;
 /// ADIv6 MEM-AP IDR byte offset within the AP's 4 KiB component frame (ADIv5 keeps `0xFC`).
 const AP_V6_OFF_IDR: u32 = 0xDFC;
@@ -437,16 +585,12 @@ const DP_BANKSEL_TARGETID: u32 = 0x2;
 /// `DPBANKSEL` exposing `DLPIDR` at the CTRL/STAT transfer slot (ADIv5.2 DPv2 bank 3).
 const DP_BANKSEL_DLPIDR: u32 = 0x3;
 
-/// `TARGETID` fields carried unchanged into `TARGETSEL`: bit 0 (RAO), TDESIGNER `[11:1]`,
-/// TPARTNO `[27:12]`. TREVISION `[31:28]` is excluded.
+/// `TARGETID` fields carried into `TARGETSEL`; TREVISION is excluded.
 const TARGETID_TARGETSEL_MASK: u32 = 0x0FFF_FFFF;
 /// `DLPIDR` field contributing TINSTANCE `[31:28]`, the top nibble of `TARGETSEL`.
 const DLPIDR_TINSTANCE_MASK: u32 = 0xF000_0000;
 
-/// Compose the multidrop `TARGETSEL` selecting a debug port from its `TARGETID` and `DLPIDR`:
-/// `TARGETID` with its TREVISION field replaced by `DLPIDR`'s TINSTANCE. That is the comparison
-/// the DP itself makes, so it is also how a profile's hardcoded literal is checked against
-/// silicon.
+/// `TARGETSEL` from `TARGETID` with TREVISION replaced by `DLPIDR`'s TINSTANCE.
 pub const fn derive_targetsel(targetid: u32, dlpidr: u32) -> u32 {
     (targetid & TARGETID_TARGETSEL_MASK) | (dlpidr & DLPIDR_TINSTANCE_MASK)
 }
@@ -513,8 +657,7 @@ const fn ap_v6_frame_offset(apbank: u8) -> u32 {
     }
 }
 
-/// Split a full ADIv6 AP register address into `SELECT` (bits `[31:4]`, `DPBANKSEL` left zero),
-/// `SELECT1` (bits `[63:32]`), and the transfer address `A[3:2]`.
+/// Split an ADIv6 AP register address into `SELECT`, `SELECT1` and the transfer address `A[3:2]`.
 pub const fn split_ap_addr_v6(addr: u64) -> (u32, u32, u8) {
     (
         (addr as u32) & 0xFFFF_FFF0,
@@ -533,8 +676,7 @@ pub struct SelectV6 {
 /// The DP writes [`SelectV6::plan`] found necessary to address one AP register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectV6Plan {
-    /// `SELECT1` value to write, if it changed. Writing it needs the `DPBANKSEL = 5` detour,
-    /// which clobbers `SELECT`.
+    /// `SELECT1` value to write, if changed; the `DPBANKSEL = 5` detour clobbers `SELECT`.
     pub write_select1: Option<u32>,
     /// `SELECT` value to write, if it changed -- always present after a `SELECT1` write.
     pub write_select: Option<u32>,
@@ -559,8 +701,7 @@ impl SelectV6 {
         } else {
             None
         };
-        // A SELECT1 change forces the SELECT rewrite even when the low word matches: the bank
-        // detour overwrote it.
+        // The `SELECT1` bank detour overwrote `SELECT`, so rewrite it.
         let write_select = if write_select1.is_some() || self.select != Some(select) {
             Some(select)
         } else {
@@ -590,8 +731,7 @@ pub struct Adiv5<'a> {
     ap: ApMode,
     /// Which wire this attach is running over, since sticky-error clearing differs by wire.
     wire: Port,
-    /// DAP index byte carried in every `DAP_Transfer`/`DAP_TransferBlock`/`DAP_WriteABORT`; 0
-    /// over SWD, the selected TAP's chain index over JTAG.
+    /// DAP index byte: 0 over SWD, the selected TAP's chain index over JTAG.
     dap_index: u8,
     /// Cached DP `SELECT` (`None` forces a rewrite on the next AP access).
     select: Option<u32>,
@@ -607,10 +747,14 @@ pub struct Adiv5<'a> {
     idcode: Option<Idcode>,
     /// Multidrop identity read during the attach; `None` on a DPv1 DP or a JTAG attach.
     dp_ident: Option<DpIdent>,
+    /// Where block transfers re-arm TAR.
+    tar_policy: TarPolicy,
+    /// The command shape block transfers are issued as.
+    shape: TransferShape,
 }
 
 impl<'a> Adiv5<'a> {
-    /// A fresh handle with every cache empty, ready for a wire-specific entry sequence.
+    /// Clear SELECT/CSW caches for entry, retaining the supplied AP mode and its selection state.
     fn new_handle(probe: &'a mut Probe, ap: ApMode, packet_size: u16) -> Adiv5<'a> {
         Adiv5 {
             probe,
@@ -624,12 +768,87 @@ impl<'a> Adiv5<'a> {
             ap_idr: ApIdr { raw: 0 },
             idcode: None,
             dp_ident: None,
+            tar_policy: TarPolicy::default(),
+            shape: TransferShape::default(),
         }
+    }
+
+    /// Choose where block transfers re-arm TAR; the default is [`TarPolicy::PerChunk`].
+    pub fn set_tar_policy(&mut self, policy: TarPolicy) {
+        self.tar_policy = policy;
+    }
+
+    /// The TAR policy this handle's block transfers plan against.
+    pub fn tar_policy(&self) -> TarPolicy {
+        self.tar_policy
+    }
+
+    /// Choose the command shape block transfers take; the default is [`TransferShape::Block`].
+    pub fn set_shape(&mut self, shape: TransferShape) {
+        self.shape = shape;
+    }
+
+    /// The command shape this handle's block transfers take.
+    pub fn shape(&self) -> TransferShape {
+        self.shape
+    }
+
+    /// The chunk plan this handle's shape, packet size and TAR policy imply.
+    fn plan(&self, addr: u32, words: usize, read: bool) -> Vec<BlockOp> {
+        let cap = self.shape.capacity(self.packet_size, read);
+        plan_ops(addr, words, cap, self.tar_policy)
+    }
+
+    /// One mixed `DAP_Transfer` per chunk; a refused chunk fails, since a retry re-reads a moved TAR.
+    fn serial_mixed(
+        &mut self,
+        ops: &[BlockOp],
+        mut out: Option<&mut [u32]>,
+        data: Option<&[u32]>,
+    ) -> Result<()> {
+        let (requests, _) = build_mixed_requests(ops, data, self.dap_index);
+        let mut done = 0;
+        for (op, request) in ops.iter().zip(requests) {
+            let resp = self
+                .probe
+                .transfer(&request, TRANSFER_TIMEOUT)
+                .context("mixed DAP_Transfer USB round-trip failed")?;
+            let words =
+                check_mixed(&resp, op, out.is_some()).map_err(|e| diagnose(&request, &resp, e))?;
+            if let Some(buf) = out.as_deref_mut() {
+                buf[done..done + op.words].copy_from_slice(&words);
+            }
+            done += op.words;
+        }
+        Ok(())
+    }
+
+    /// [`Adiv5::serial_mixed`] with up to `depth` chunks outstanding.
+    fn pipelined_mixed(
+        &mut self,
+        ops: &[BlockOp],
+        mut out: Option<&mut [u32]>,
+        data: Option<&[u32]>,
+        depth: usize,
+    ) -> Result<()> {
+        let (requests, expected_lens) = build_mixed_requests(ops, data, self.dap_index);
+        let responses =
+            self.probe
+                .submit_pipelined(&requests, &expected_lens, depth, PIPELINE_TIMEOUT)?;
+        let mut done = 0;
+        for ((op, resp), request) in ops.iter().zip(&responses).zip(&requests) {
+            let words =
+                check_mixed(resp, op, out.is_some()).map_err(|e| diagnose(request, resp, e))?;
+            if let Some(buf) = out.as_deref_mut() {
+                buf[done..done + op.words].copy_from_slice(&words);
+            }
+            done += op.words;
+        }
+        Ok(())
     }
 
     /// SWD bring-up, leaving the MEM-AP programmed for 32-bit auto-incrementing transfers.
     pub fn attach(probe: &'a mut Probe, config: AttachConfig) -> Result<Adiv5<'a>> {
-        // 1. Connect, set the clock, configure the retry budget, query the packet size.
         let packet_size = connect_and_configure(
             probe,
             Port::Swd,
@@ -640,26 +859,21 @@ impl<'a> Adiv5<'a> {
 
         let mut adi = Adiv5::new_handle(probe, config.ap, packet_size);
 
-        // 2 + 3. Line reset / JTAG-to-SWD / line reset / idle (single-drop), or line reset +
-        // terminated line reset + TARGETSEL (multidrop), then the SWD-enabling DPIDR read.
         adi.dpidr = Dpidr {
             raw: match (config.ap, config.targetsel) {
-                // An ADIv6 DP powers up dormant: the line reset and JTAG-to-SWD select the other
-                // paths use are inert against it, so the wake replaces them.
+                // An ADIv6 DP powers up dormant, where line reset and JTAG-to-SWD are inert.
                 (ApMode::V6 { .. }, targetsel) => adi.read_dpidr_dormant(targetsel)?,
                 (_, Some(targetsel)) => adi.read_dpidr_targetsel(targetsel)?,
                 (_, None) => adi.read_dpidr()?,
             },
         };
 
-        // 4 + 5. Power up the debug domains, read the MEM-AP IDR, program CSW.
         adi.finish_attach()?;
 
         Ok(adi)
     }
 
-    /// ADIv5 JTAG-DP bring-up: JTAG entry, `DAP_JTAG_Configure`, then `DAP_JTAG_IDCODE` in place
-    /// of the DPIDR a JTAG-DP does not implement. The IDCODE read also validates the chain.
+    /// ADIv5 JTAG-DP bring-up, reading `DAP_JTAG_IDCODE` in place of DPIDR.
     pub fn attach_jtag(probe: &'a mut Probe, config: JtagAttachConfig) -> Result<Adiv5<'a>> {
         if config.ir_lengths.is_empty() {
             bail!("JTAG attach needs at least one scan-chain IR length");
@@ -672,8 +886,6 @@ impl<'a> Adiv5<'a> {
             );
         }
 
-        // 1. Connect over JTAG, set the clock, configure the retry budget, query the packet
-        // size.
         let packet_size = connect_and_configure(
             probe,
             Port::Jtag,
@@ -692,7 +904,6 @@ impl<'a> Adiv5<'a> {
         adi.wire = Port::Jtag;
         adi.dap_index = config.tap_index;
 
-        // Describe the chain once; every later command selects TAPs against this description.
         probe_command(
             adi.probe,
             encode_jtag_configure(&config.ir_lengths),
@@ -700,8 +911,7 @@ impl<'a> Adiv5<'a> {
         )
         .context("DAP_JTAG_Configure failed")?;
 
-        // 3. JTAG entry + IDCODE through the configured index, retried like the SWD path retries
-        // its DPIDR read (re-issuing the whole entry on a failure).
+        // Retried like the SWD DPIDR read, re-issuing the whole entry on a failure.
         let mut idcode = None;
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..DPIDR_READ_ATTEMPTS {
@@ -744,14 +954,12 @@ impl<'a> Adiv5<'a> {
         }
         adi.idcode = Some(idcode);
 
-        // 4 + 5. The same power-up / IDR / CSW bring-up as the SWD path.
         adi.finish_attach()?;
 
         Ok(adi)
     }
 
-    /// The bring-up shared once the DPIDR/IDCODE read lands: clear sticky errors, power up the
-    /// debug and system domains, read the MEM-AP IDR, program CSW.
+    /// Bring-up after DPIDR/IDCODE: clear sticky errors, power up, read the MEM-AP IDR, program CSW.
     fn finish_attach(&mut self) -> Result<()> {
         self.clear_sticky_errors()
             .context("clearing sticky errors after the entry read failed")?;
@@ -765,13 +973,7 @@ impl<'a> Adiv5<'a> {
         Ok(())
     }
 
-    /// Read `TARGETID` (DP bank 2) and `DLPIDR` (DP bank 3), both at the CTRL/STAT transfer slot,
-    /// returning `None` where the DP refused either. The identity is a diagnostic, so losing it
-    /// must not fail an attach that otherwise reached memory.
-    ///
-    /// Selecting a DP bank means writing `SELECT`, which clobbers the AP addressing bits under
-    /// both ADIv5 and ADIv6 whether or not the reads landed. So the caches are dropped and the AP
-    /// core window re-asserted on both paths, leaving the CSW just programmed addressed.
+    /// Read `TARGETID` and `DLPIDR`, `None` where refused; re-asserts the AP window after.
     fn read_dp_ident(&mut self) -> Result<Option<DpIdent>> {
         let ident = self.read_targetid_dlpidr();
         if ident.is_err() {
@@ -814,8 +1016,7 @@ impl<'a> Adiv5<'a> {
         self.ap_idr
     }
 
-    /// The multidrop identity read during the attach, or `None` on a DPv1 DP or over JTAG. Its
-    /// [`DpIdent::targetsel`] is what a profile's hardcoded `TARGETSEL` literal is checked against.
+    /// The multidrop identity read during the attach; `None` on a DPv1 DP or over JTAG.
     pub fn dp_ident(&self) -> Option<DpIdent> {
         self.dp_ident
     }
@@ -824,8 +1025,6 @@ impl<'a> Adiv5<'a> {
     pub fn packet_size(&self) -> u16 {
         self.packet_size
     }
-
-    // --- Memory primitives ---------------------------------------------------------------------
 
     /// Read a single 32-bit word from `addr` (write TAR, then read DRW).
     pub fn read_mem32(&mut self, addr: u32) -> Result<u32> {
@@ -841,45 +1040,54 @@ impl<'a> Adiv5<'a> {
         self.write_ap(AP_BANK_CORE, AP_A_DRW, value)
     }
 
-    /// Halt the core and wait for `DHCSR.S_HALT`: an ACKed-but-ignored halt request is a real
-    /// failure mode, so the write alone is not trusted.
+    /// Halt the core and wait for `DHCSR.S_HALT`; an ACKed halt request can still be ignored.
     pub fn halt_core(&mut self) -> Result<()> {
-        self.write_mem32(DHCSR, DHCSR_DBGKEY | DHCSR_C_DEBUGEN | DHCSR_C_HALT)
-            .context("DHCSR halt write failed")?;
         let started = Instant::now();
+        let mut request = true;
         loop {
+            if request {
+                self.write_mem32(DHCSR, DHCSR_DBGKEY | DHCSR_C_DEBUGEN | DHCSR_C_HALT)
+                    .context("DHCSR halt write failed")?;
+            }
             let status = self.read_mem32(DHCSR).context("DHCSR status read failed")?;
             if status & DHCSR_S_HALT != 0 {
                 return Ok(());
             }
+            request = status & DHCSR_S_RESET_ST != 0;
             if started.elapsed() >= HALT_TIMEOUT {
                 bail!("core halt not acknowledged (DHCSR S_HALT) within {HALT_TIMEOUT:?}");
             }
         }
     }
 
-    /// Request a system reset (`AIRCR.SYSRESETREQ`). The reboot typically drops the debug
-    /// connection, so a transfer error here is expected and is the caller's to downgrade.
+    /// Request a system reset; the reboot usually drops the link, so a transfer error is expected.
     pub fn system_reset(&mut self) -> Result<()> {
-        self.write_mem32(AIRCR, AIRCR_VECTKEY | AIRCR_SYSRESETREQ)
+        self.write_mem32(AIRCR, AIRCR_VECTKEY | AIRCR_SYSRESETREQ)?;
+        // A posted SWD write commits on later clock edges; this read clocks it out before exit.
+        let _ = self.read_dp(DP_A_CTRL_STAT);
+        Ok(())
     }
 
-    /// Read `out.len()` words from word-aligned `addr`, splitting at each wrap boundary and at
-    /// the per-packet block capacity, so any length is accepted.
+    /// Read `out.len()` words from word-aligned `addr`, split at wrap and packet boundaries.
+    /// Each block retries a WAIT up to eight times before the call fails.
     pub fn read_block(&mut self, addr: u32, out: &mut [u32]) -> Result<()> {
         if !addr.is_multiple_of(4) {
             bail!("read_block address 0x{addr:08X} is not word-aligned");
         }
         self.ensure_csw()?;
-        let max = transfer_block_read_capacity(self.packet_size);
+        let ops = self.plan(addr, out.len(), true);
+        if self.shape == TransferShape::Mixed {
+            return self.serial_mixed(&ops, Some(out), None);
+        }
         let mut done = 0;
-        let mut cur = addr;
-        while done < out.len() {
-            let n = block_chunk_words(cur, out.len() - done, max);
-            self.write_tar(cur)?;
-            self.read_block_raw(&mut out[done..done + n])?;
-            done += n;
-            cur = cur.wrapping_add((n * 4) as u32);
+        for op in ops {
+            if op.tar {
+                self.write_tar(op.addr)?;
+            }
+            // A WAIT retry re-reads from the AP's own TAR, so per-window must re-arm it first.
+            let retry_tar = (!op.tar).then_some(op.addr);
+            self.read_block_raw(&mut out[done..done + op.words], retry_tar)?;
+            done += op.words;
         }
         Ok(())
     }
@@ -890,21 +1098,23 @@ impl<'a> Adiv5<'a> {
             bail!("write_block address 0x{addr:08X} is not word-aligned");
         }
         self.ensure_csw()?;
-        let max = transfer_block_write_capacity(self.packet_size);
+        let ops = self.plan(addr, data.len(), false);
+        if self.shape == TransferShape::Mixed {
+            return self.serial_mixed(&ops, None, Some(data));
+        }
         let mut done = 0;
-        let mut cur = addr;
-        while done < data.len() {
-            let n = block_chunk_words(cur, data.len() - done, max);
-            self.write_tar(cur)?;
-            self.write_block_raw(&data[done..done + n])?;
-            done += n;
-            cur = cur.wrapping_add((n * 4) as u32);
+        for op in ops {
+            if op.tar {
+                self.write_tar(op.addr)?;
+            }
+            let retry_tar = (!op.tar).then_some(op.addr);
+            self.write_block_raw(&data[done..done + op.words], retry_tar)?;
+            done += op.words;
         }
         Ok(())
     }
 
-    /// Read `out.len()` words from `addr` with up to `depth` pairs outstanding; `depth <= 1` is
-    /// [`Adiv5::read_block`]. A `WAIT` fails the call, since a retry would desync the FIFO.
+    /// Read with up to `depth` pairs outstanding; a `WAIT` fails the call, since a retry would desync.
     pub fn read_block_depth(&mut self, addr: u32, out: &mut [u32], depth: usize) -> Result<()> {
         if !addr.is_multiple_of(4) {
             bail!("read_block address 0x{addr:08X} is not word-aligned");
@@ -913,24 +1123,35 @@ impl<'a> Adiv5<'a> {
             return self.read_block(addr, out);
         }
         self.ensure_csw()?;
-        let max = transfer_block_read_capacity(self.packet_size);
-        let chunks = plan_chunks(addr, out.len(), max);
-        let (requests, expected_lens) = build_block_requests(&chunks, None, self.dap_index);
+        let ops = self.plan(addr, out.len(), true);
+        if self.shape == TransferShape::Mixed {
+            return self.pipelined_mixed(&ops, Some(out), None, depth);
+        }
+        let (requests, expected_lens) = build_block_requests(&ops, None, self.dap_index);
         let responses =
             self.probe
                 .submit_pipelined(&requests, &expected_lens, depth, PIPELINE_TIMEOUT)?;
 
-        let mut done = 0;
-        for (i, &(_, n)) in chunks.iter().enumerate() {
-            let words = check_pipelined_chunk(&responses[2 * i], &responses[2 * i + 1], n)?;
-            out[done..done + n].copy_from_slice(&words);
-            done += n;
+        let explain = |pos: usize, e| diagnose(&requests[pos], &responses[pos], e);
+        let (mut done, mut pos) = (0, 0);
+        for op in &ops {
+            if op.tar {
+                check_pipelined_tar(&responses[pos]).map_err(|e| explain(pos, e))?;
+                pos += 1;
+            }
+            let words =
+                check_pipelined_block(&responses[pos], op.words).map_err(|e| explain(pos, e))?;
+            if words.len() != op.words {
+                return Err(explain(pos, anyhow!("DAP_TransferBlock read lost words")));
+            }
+            pos += 1;
+            out[done..done + op.words].copy_from_slice(&words);
+            done += op.words;
         }
         Ok(())
     }
 
-    /// Write `data` at `addr` with up to `depth` command pairs outstanding; chunking, pipelining
-    /// and WAIT handling are [`Adiv5::read_block_depth`]'s.
+    /// Write with up to `depth` pairs outstanding, as [`Adiv5::read_block_depth`].
     pub fn write_block_depth(&mut self, addr: u32, data: &[u32], depth: usize) -> Result<()> {
         if !addr.is_multiple_of(4) {
             bail!("write_block address 0x{addr:08X} is not word-aligned");
@@ -939,23 +1160,29 @@ impl<'a> Adiv5<'a> {
             return self.write_block(addr, data);
         }
         self.ensure_csw()?;
-        let max = transfer_block_write_capacity(self.packet_size);
-        let chunks = plan_chunks(addr, data.len(), max);
-        let (requests, expected_lens) = build_block_requests(&chunks, Some(data), self.dap_index);
+        let ops = self.plan(addr, data.len(), false);
+        if self.shape == TransferShape::Mixed {
+            return self.pipelined_mixed(&ops, None, Some(data), depth);
+        }
+        let (requests, expected_lens) = build_block_requests(&ops, Some(data), self.dap_index);
         let responses =
             self.probe
                 .submit_pipelined(&requests, &expected_lens, depth, PIPELINE_TIMEOUT)?;
 
-        for (i, &(_, n)) in chunks.iter().enumerate() {
-            check_pipelined_chunk(&responses[2 * i], &responses[2 * i + 1], n)?;
+        let explain = |pos: usize, e| diagnose(&requests[pos], &responses[pos], e);
+        let mut pos = 0;
+        for op in &ops {
+            if op.tar {
+                check_pipelined_tar(&responses[pos]).map_err(|e| explain(pos, e))?;
+                pos += 1;
+            }
+            check_pipelined_block(&responses[pos], op.words).map_err(|e| explain(pos, e))?;
+            pos += 1;
         }
         Ok(())
     }
 
-    // --- Bring-up steps ------------------------------------------------------------------------
-
-    /// Wake a DP that powers up in the ADIv6 dormant state, where a line reset and JTAG-to-SWD
-    /// select achieve nothing and every DPIDR read comes back `NoAck`.
+    /// Wake a DP that powers up in the ADIv6 dormant state.
     fn dormant_wake(&mut self) -> Result<()> {
         let ones = [0xFFu8; 8];
         self.swj_sequence(51, &ones)?;
@@ -967,8 +1194,7 @@ impl<'a> Adiv5<'a> {
         Ok(())
     }
 
-    /// Single-drop SWD entry: a >=50-clock line reset, the `0xE79E` JTAG-to-SWD select word,
-    /// a second line reset, then 8 idle clocks (ADIv5 wants >= 2 before the first packet).
+    /// Single-drop SWD entry: line reset, JTAG-to-SWD select, line reset, idle clocks.
     fn line_reset_switch(&mut self) -> Result<()> {
         self.swj_sequence(56, &[0xFF; 7])?;
         self.swj_sequence(16, &JTAG_TO_SWD_SELECT.to_le_bytes())?;
@@ -977,8 +1203,7 @@ impl<'a> Adiv5<'a> {
         Ok(())
     }
 
-    /// JTAG entry over `DAP_SWJ_Sequence` (which drives TMS): a >=50-clock line reset, the
-    /// `0xE73C` SWD-to-JTAG select word, then the TAP reset into Run-Test/Idle.
+    /// JTAG entry: line reset, SWD-to-JTAG select, then TAP reset into Run-Test/Idle.
     fn jtag_entry(&mut self) -> Result<()> {
         self.swj_sequence(56, &[0xFF; 7])?;
         self.swj_sequence(16, &SWD_TO_JTAG_SELECT.to_le_bytes())?;
@@ -986,8 +1211,7 @@ impl<'a> Adiv5<'a> {
         Ok(())
     }
 
-    /// Entry sequence plus the DPIDR read that leaves the reset state and enables SWD; the whole
-    /// pair is retried on a non-`OK` ack.
+    /// Entry sequence plus the DPIDR read, retried as a pair on a non-`OK` ack.
     fn read_dpidr(&mut self) -> Result<u32> {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..DPIDR_READ_ATTEMPTS {
@@ -1002,8 +1226,7 @@ impl<'a> Adiv5<'a> {
         Err(last.unwrap_or_else(|| anyhow!("DPIDR read failed")))
     }
 
-    /// `TARGETSEL` plus the DPIDR read that confirms the selection. A retry re-issues both: a
-    /// reset after `TARGETSEL` would deselect the DP again.
+    /// `TARGETSEL` plus the confirming DPIDR read, retried as a pair.
     fn read_dpidr_targetsel(&mut self, targetsel: u32) -> Result<u32> {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..DPIDR_READ_ATTEMPTS {
@@ -1018,8 +1241,7 @@ impl<'a> Adiv5<'a> {
         Err(last.unwrap_or_else(|| anyhow!("DPIDR read failed")))
     }
 
-    /// Dormant wake, optional `TARGETSEL`, then the DPIDR read. Every attempt re-issues the wake:
-    /// waking once outside the loop leaves every retry after the first inert.
+    /// Dormant wake, optional `TARGETSEL`, then the DPIDR read; every attempt re-issues the wake.
     fn read_dpidr_dormant(&mut self, targetsel: Option<u32>) -> Result<u32> {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 0..DPIDR_READ_ATTEMPTS {
@@ -1041,8 +1263,7 @@ impl<'a> Adiv5<'a> {
         Err(last.unwrap_or_else(|| anyhow!("DPIDR read failed")))
     }
 
-    /// Select one multidrop debug port: terminated line reset, then `TARGETSEL` as one
-    /// host-driven sequence, since `TARGETSEL` has no acknowledge phase.
+    /// Select one multidrop DP: terminated line reset and `TARGETSEL` as one host-driven sequence.
     fn select_target(&mut self, targetsel: u32) -> Result<()> {
         self.swj_sequence(LINE_RESET_TERMINATED_BITS, &LINE_RESET_TERMINATED)?;
         self.swj_sequence(48, &targetsel_sequence(targetsel))?;
@@ -1063,8 +1284,7 @@ impl<'a> Adiv5<'a> {
         bail!("debug power-up not acknowledged within {POWERUP_POLLS} polls")
     }
 
-    /// Clear every sticky error flag: ABORT over SWD, write-one-to-clear CTRL/STAT over JTAG.
-    /// The JTAG arm bypasses [`Adiv5::write_dp`], whose FAULT recovery calls back here.
+    /// Clear every sticky error flag; the JTAG arm bypasses [`Adiv5::write_dp`] to avoid recursion.
     fn clear_sticky_errors(&mut self) -> Result<()> {
         match self.wire {
             Port::Jtag => {
@@ -1083,8 +1303,8 @@ impl<'a> Adiv5<'a> {
                     .context("decoding CTRL/STAT sticky-clear response failed")?;
                 if !decoded.status.is_ok() {
                     bail!(
-                        "CTRL/STAT sticky-clear write not acknowledged (ack {:?})",
-                        decoded.status.ack()
+                        "CTRL/STAT sticky-clear write not acknowledged ({})",
+                        decoded.status
                     );
                 }
                 Ok(())
@@ -1103,8 +1323,6 @@ impl<'a> Adiv5<'a> {
         Ok(ApIdr { raw })
     }
 
-    // --- Register access -----------------------------------------------------------------------
-
     /// Point DP `SELECT` at the AP register window `apbank`, rewriting only on a change.
     fn ensure_select(&mut self, apbank: u8) -> Result<()> {
         match self.ap {
@@ -1120,8 +1338,7 @@ impl<'a> Adiv5<'a> {
         }
     }
 
-    /// Point `SELECT`/`SELECT1` at the ADIv6 AP register at frame byte offset `off`. A `SELECT1`
-    /// change takes the `DPBANKSEL = 5` detour and forces the `SELECT` rewrite it clobbers.
+    /// Point `SELECT`/`SELECT1` at the ADIv6 AP register at frame offset `off`.
     fn ensure_select_v6(&mut self, off: u32) -> Result<()> {
         let plan = match &self.ap {
             ApMode::V6 { ap_base, sel } => sel.plan(u64::from(*ap_base) + u64::from(off)),
@@ -1196,8 +1413,6 @@ impl<'a> Adiv5<'a> {
         Ok(())
     }
 
-    // --- Transfer plumbing ---------------------------------------------------------------------
-
     /// Shift a raw bit sequence out through `DAP_SWJ_Sequence`.
     fn swj_sequence(&mut self, bit_count: u8, data: &[u8]) -> Result<()> {
         probe_command(
@@ -1221,6 +1436,7 @@ impl<'a> Adiv5<'a> {
             if status.is_ok() && decoded.transfer_count as usize == items.len() {
                 return Ok(decoded.read_data);
             }
+            check_reply(&req, &resp).context("DAP_Transfer reply does not fit its request")?;
             match status.ack() {
                 Ack::Wait => continue,
                 Ack::Fault => {
@@ -1231,8 +1447,8 @@ impl<'a> Adiv5<'a> {
                         items.len()
                     );
                 }
-                other => bail!(
-                    "DAP_Transfer failed: ack {other:?} after {} of {} transfers",
+                _ => bail!(
+                    "DAP_Transfer failed: {status} after {} of {} transfers",
                     decoded.transfer_count,
                     items.len()
                 ),
@@ -1242,22 +1458,29 @@ impl<'a> Adiv5<'a> {
     }
 
     /// One `DAP_TransferBlock` read of DRW (TAR pre-armed); `out.len()` must fit one packet.
-    fn read_block_raw(&mut self, out: &mut [u32]) -> Result<()> {
+    fn read_block_raw(&mut self, out: &mut [u32], retry_tar: Option<u32>) -> Result<()> {
         let request = TransferRequest::new(true, true, AP_A_DRW);
-        for _ in 0..=WAIT_RETRIES {
+        for attempt in 0..=WAIT_RETRIES {
+            if attempt > 0 {
+                if let Some(addr) = retry_tar {
+                    self.write_tar(addr)?;
+                }
+            }
             let req = encode_transfer_block(self.dap_index, out.len() as u16, request, &[]);
-            // A full-capacity response is an exact packet multiple: no short packet ends it.
             let resp = self
                 .probe
                 .transfer_expect(&req, 4 + 4 * out.len(), TRANSFER_TIMEOUT)
                 .context("DAP_TransferBlock (read) USB round-trip failed")?;
             let decoded = decode_transfer_block(&resp)
                 .context("decoding DAP_TransferBlock response failed")?;
-            if decoded.status.is_ok() && decoded.transfer_count as usize == out.len() {
+            let complete = decoded.transfer_count as usize == out.len();
+            if decoded.status.is_ok() && complete && decoded.read_data.len() == out.len() {
                 out.copy_from_slice(&decoded.read_data);
                 return Ok(());
             }
-            match decoded.status.ack() {
+            check_reply(&req, &resp).context("DAP_TransferBlock reply does not fit its request")?;
+            let status = decoded.status;
+            match status.ack() {
                 Ack::Wait => continue,
                 Ack::Fault => {
                     let _ = self.clear_sticky_errors();
@@ -1266,18 +1489,22 @@ impl<'a> Adiv5<'a> {
                         decoded.transfer_count
                     );
                 }
-                other => bail!("DAP_TransferBlock (read) failed: ack {other:?}"),
+                _ => bail!("DAP_TransferBlock (read) failed: {status}"),
             }
         }
         bail!("DAP_TransferBlock (read) WAIT retries exhausted")
     }
 
     /// One `DAP_TransferBlock` write of DRW (TAR pre-armed); `data.len()` must fit one packet.
-    fn write_block_raw(&mut self, data: &[u32]) -> Result<()> {
+    fn write_block_raw(&mut self, data: &[u32], retry_tar: Option<u32>) -> Result<()> {
         let request = TransferRequest::new(true, false, AP_A_DRW);
-        for _ in 0..=WAIT_RETRIES {
+        for attempt in 0..=WAIT_RETRIES {
+            if attempt > 0 {
+                if let Some(addr) = retry_tar {
+                    self.write_tar(addr)?;
+                }
+            }
             let req = encode_transfer_block(self.dap_index, data.len() as u16, request, data);
-            // A block-write response is a fixed 4-byte header with no payload.
             let resp = self
                 .probe
                 .transfer_expect(&req, 4, TRANSFER_TIMEOUT)
@@ -1287,7 +1514,9 @@ impl<'a> Adiv5<'a> {
             if decoded.status.is_ok() && decoded.transfer_count as usize == data.len() {
                 return Ok(());
             }
-            match decoded.status.ack() {
+            check_reply(&req, &resp).context("DAP_TransferBlock reply does not fit its request")?;
+            let status = decoded.status;
+            match status.ack() {
                 Ack::Wait => continue,
                 Ack::Fault => {
                     let _ = self.clear_sticky_errors();
@@ -1296,15 +1525,14 @@ impl<'a> Adiv5<'a> {
                         decoded.transfer_count
                     );
                 }
-                other => bail!("DAP_TransferBlock (write) failed: ack {other:?}"),
+                _ => bail!("DAP_TransferBlock (write) failed: {status}"),
             }
         }
         bail!("DAP_TransferBlock (write) WAIT retries exhausted")
     }
 }
 
-/// `DAP_Connect`, `DAP_SWJ_Clock`, `DAP_TransferConfigure`, `DAP_Info(PacketSize)`; returns the
-/// negotiated packet size, or the CMSIS-DAP minimum when the probe reports none.
+/// Connect, set clock and retry budget; returns the packet size, or the minimum when zero.
 fn connect_and_configure(
     probe: &mut Probe,
     want_port: Port,
@@ -1333,7 +1561,6 @@ fn connect_and_configure(
     )
     .context("DAP_TransferConfigure failed")?;
 
-    // The packet size bounds every DAP_TransferBlock, so a zero report is unusable.
     let packet_size = probe_command(
         probe,
         encode_info(InfoId::PacketSize),
@@ -1347,8 +1574,7 @@ fn connect_and_configure(
     })
 }
 
-/// The host-driven `DAP_SWJ_Sequence` payload for a multidrop `TARGETSEL` write: request byte,
-/// the ACK window driven high, the value LSB-first, its even parity -- 46 bits padded to 48.
+/// The `DAP_SWJ_Sequence` payload for a multidrop `TARGETSEL` write, 46 bits padded to 48.
 fn targetsel_sequence(targetsel: u32) -> [u8; 6] {
     let parity = u64::from(targetsel.count_ones() & 1);
     let seq = (parity << 45)
@@ -1370,11 +1596,18 @@ where
     let resp = probe
         .transfer(&request, TRANSFER_TIMEOUT)
         .context("CMSIS-DAP command USB round-trip failed")?;
-    decode(&resp).context("decoding CMSIS-DAP response failed")
+    let value = decode(&resp).context("decoding CMSIS-DAP response failed")?;
+    check_reply(&request, &resp).context("CMSIS-DAP response does not fit its request")?;
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sticky_clear_leaves_dapabort_and_stkcmpclr_clear() {
+        assert_eq!(ABORT_CLEAR_ALL, 0x1C);
+    }
 
     /// ADIv6 relocates CSW/TAR/DRW to one `0xD00`-page SELECT window, IDR to its own.
     #[test]
@@ -1394,8 +1627,7 @@ mod tests {
         assert_ne!(select_word(0x20, AP_BANK_CORE), 0x2D00);
     }
 
-    /// The two RP `TARGETSEL` literals `target.rs` hardcodes are derived values; these pin the
-    /// derivation so a profile's literal can be checked against what silicon reports.
+    /// The RP `TARGETSEL` literals in `target.rs` follow this derivation.
     #[test]
     fn derive_targetsel_matches_the_rp2040_core0_vector() {
         // TARGETID's TREVISION and DLPIDR's PROTVSN are seeded nonzero to prove they are masked.
@@ -1407,7 +1639,6 @@ mod tests {
 
     #[test]
     fn dp_ident_decodes_targetid_and_dlpidr_fields() {
-        // RP2040-shaped: TARGETID 0x0100_2927 (rev 0), DLPIDR TINSTANCE 0, PROTVSN 1.
         let ident = DpIdent {
             targetid: 0x0100_2927,
             dlpidr: 0x0000_0001,
@@ -1453,11 +1684,8 @@ mod tests {
         assert_eq!(TARGETID_TARGETSEL_MASK & DLPIDR_TINSTANCE_MASK, 0);
     }
 
-    /// The only executable check that the ADIv6 constants -- the dormant wake, the `0x2000` AP
-    /// base, the `0xDFC` IDR offset -- are right. Run with
-    /// `DAPBENCH_PROBE=vid:pid:serial cargo test -- --ignored attach_v6_against_hardware`; the
-    /// selector may be omitted only when one probe is attached. The target must be power-cycled
-    /// rather than freshly flashed, since a flash leaves the DP awake and hides the wake.
+    /// Hardware check of the ADIv6 constants: `DAPBENCH_PROBE=vid:pid:serial cargo test -- --ignored`,
+    /// with the target power-cycled so the DP starts dormant.
     #[test]
     #[ignore = "requires a CMSIS-DAP v2 probe wired to a power-cycled RP2350 / Pico 2"]
     fn attach_v6_against_hardware() {
@@ -1486,7 +1714,6 @@ mod tests {
             profile.targetsel,
             "the profile's hardcoded TARGETSEL must be what this silicon answers to"
         );
-        // A word round-trip through SRAM proves the SELECT path reaches memory.
         let addr = profile.sram_base;
         let before = adi.read_mem32(addr).expect("SRAM read");
         adi.write_mem32(addr, before ^ 0xA5A5_5A5A)
@@ -1539,14 +1766,12 @@ mod tests {
 
     #[test]
     fn targetsel_sequence_matches_the_bench_captured_bytes() {
-        // RP2040 core-0 TARGETSEL; captured host trace `99 ff 24 05 20 00`.
+        // RP2040 core-0 TARGETSEL.
         assert_eq!(
             targetsel_sequence(0x0100_2927),
             [0x99, 0xFF, 0x24, 0x05, 0x20, 0x00]
         );
     }
-
-    // -- Pipelined chunk planning and request construction -------------------------------------
 
     #[test]
     fn plan_chunks_splits_at_wrap_and_capacity() {
@@ -1591,10 +1816,190 @@ mod tests {
     }
 
     #[test]
+    fn per_window_reads_cost_76_commands_per_aligned_4_kib() {
+        // 4 KiB read at 15 words/block: 18 blocks in each of 4 windows, one TAR each.
+        let ops = plan_ops(0x0800_0000, 1024, 15, TarPolicy::PerWindow);
+        assert_eq!(ops.len(), 72);
+        assert_eq!(ops.iter().filter(|o| o.tar).count(), 4);
+        assert_eq!(
+            command_count(0x0800_0000, 1024, 15, TarPolicy::PerWindow),
+            76
+        );
+        assert_eq!(
+            command_count(0x0800_0000, 1024, 15, TarPolicy::PerChunk),
+            144
+        );
+    }
+
+    #[test]
+    fn per_window_writes_cost_80_commands_per_aligned_4_kib() {
+        // 14 words/block: 19 blocks per window (18 full plus a 4-word tail), one TAR each.
+        let ops = plan_ops(0x2000_0000, 1024, 14, TarPolicy::PerWindow);
+        assert_eq!(ops.len(), 76);
+        assert_eq!(ops.iter().filter(|o| o.tar).count(), 4);
+        assert_eq!(ops.iter().map(|o| o.words).sum::<usize>(), 1024);
+        assert_eq!(
+            command_count(0x2000_0000, 1024, 14, TarPolicy::PerWindow),
+            80
+        );
+        assert_eq!(
+            command_count(0x2000_0000, 1024, 14, TarPolicy::PerChunk),
+            152
+        );
+    }
+
+    #[test]
+    fn per_window_tar_marks_exactly_the_window_starts() {
+        // Unaligned start: the first block re-arms TAR because it is first, the rest only at a
+        // 1 KiB boundary, and no block spans one.
+        let ops = plan_ops(0x0800_0390, 1024, 15, TarPolicy::PerWindow);
+        assert!(ops[0].tar);
+        let mut cur = 0x0800_0390u32;
+        for (i, op) in ops.iter().enumerate() {
+            assert_eq!(op.addr, cur, "op {i} must be contiguous");
+            let starts_window = (op.addr as usize).is_multiple_of(WRAP_BYTES);
+            assert_eq!(op.tar, i == 0 || starts_window, "op {i} TAR placement");
+            assert!(
+                op.words <= words_to_wrap(op.addr),
+                "op {i} crosses a window"
+            );
+            cur = cur.wrapping_add((op.words * 4) as u32);
+        }
+        // Five windows are touched from an unaligned start, so five TAR writes.
+        assert_eq!(ops.iter().filter(|o| o.tar).count(), 5);
+    }
+
+    #[test]
+    fn per_window_and_per_chunk_plan_the_same_blocks() {
+        for &(addr, words, cap) in &[
+            (0x0800_0000u32, 1024usize, 15usize),
+            (0x0800_0390, 1024, 15),
+            (0x2000_0004, 7, 14),
+            (0x2000_03FC, 1, 15),
+        ] {
+            let chunked = plan_ops(addr, words, cap, TarPolicy::PerChunk);
+            let windowed = plan_ops(addr, words, cap, TarPolicy::PerWindow);
+            assert_eq!(chunked.len(), windowed.len());
+            for (a, b) in chunked.iter().zip(&windowed) {
+                assert_eq!((a.addr, a.words), (b.addr, b.words));
+            }
+            assert!(chunked.iter().all(|o| o.tar));
+        }
+    }
+
+    #[test]
+    fn a_short_per_window_transfer_writes_tar_once() {
+        // A tail that fits one window: one TAR, however many blocks it takes.
+        let ops = plan_ops(0x2000_0000, 40, 15, TarPolicy::PerWindow);
+        assert_eq!(
+            ops.iter().map(|o| o.words).collect::<Vec<_>>(),
+            vec![15, 15, 10]
+        );
+        assert_eq!(ops.iter().filter(|o| o.tar).count(), 1);
+        assert_eq!(command_count(0x2000_0000, 40, 15, TarPolicy::PerWindow), 4);
+    }
+
+    #[test]
+    fn a_mixed_read_chunk_is_the_23_byte_request_and_63_byte_response() {
+        let ops = plan_ops(
+            0x0800_0000,
+            15,
+            mixed_read_capacity(64),
+            TarPolicy::PerChunk,
+        );
+        assert_eq!(ops.len(), 1);
+        let (requests, lens) = build_mixed_requests(&ops, None, 0);
+        // Command id, dap index, item count, the five-byte TAR write, then one byte per read.
+        assert_eq!(requests[0].len(), 23);
+        assert_eq!(requests[0][2], 16);
+        assert_eq!(lens[0], 63);
+        // A write chunk is eleven items of five bytes behind the same TAR write.
+        let data: Vec<u32> = (0..11).collect();
+        let ops = plan_ops(
+            0x2000_0000,
+            11,
+            mixed_write_capacity(64),
+            TarPolicy::PerChunk,
+        );
+        let (requests, lens) = build_mixed_requests(&ops, Some(&data), 0);
+        assert_eq!(requests[0].len(), 63);
+        assert_eq!(requests[0][2], 12);
+        assert_eq!(lens[0], 3);
+    }
+
+    #[test]
+    fn a_mixed_4_kib_transfer_costs_one_command_per_chunk() {
+        // Reads: 72 chunks either way, since the TAR write rides inside the chunk's command.
+        for policy in [TarPolicy::PerChunk, TarPolicy::PerWindow] {
+            assert_eq!(
+                shaped_command_count(
+                    0x0800_0000,
+                    1024,
+                    mixed_read_capacity(64),
+                    policy,
+                    TransferShape::Mixed
+                ),
+                72
+            );
+            // Writes carry eleven words a chunk, so 24 chunks per 1 KiB window.
+            assert_eq!(
+                shaped_command_count(
+                    0x2000_0000,
+                    1024,
+                    mixed_write_capacity(64),
+                    policy,
+                    TransferShape::Mixed
+                ),
+                96
+            );
+        }
+        assert_eq!(
+            shaped_command_count(
+                0x0800_0000,
+                1024,
+                TransferShape::Block.capacity(64, true),
+                TarPolicy::PerChunk,
+                TransferShape::Block
+            ),
+            144
+        );
+    }
+
+    #[test]
+    fn a_per_window_mixed_chunk_drops_only_its_tar_item() {
+        let ops = plan_ops(
+            0x2000_0000,
+            30,
+            mixed_read_capacity(64),
+            TarPolicy::PerWindow,
+        );
+        let (requests, lens) = build_mixed_requests(&ops, None, 0);
+        // Two chunks, both one command; only the first carries the TAR write item.
+        assert_eq!(requests.len(), 2);
+        assert_eq!((requests[0][2], requests[1][2]), (16, 15));
+        assert_eq!(requests[1].len(), 18);
+        assert_eq!(lens, vec![63, 63]);
+    }
+
+    #[test]
+    fn per_window_requests_omit_the_repeated_tar_packets() {
+        let ops = plan_ops(0x2000_0000, 30, 15, TarPolicy::PerWindow);
+        let (requests, lens) = build_block_requests(&ops, None, 0);
+        // TAR, block, block -- the second block rides the AP's auto-increment.
+        assert_eq!(requests.len(), 3);
+        assert_eq!(lens, vec![3, 4 + 4 * 15, 4 + 4 * 15]);
+        assert_eq!(requests[1], vec![0x06, 0x00, 15, 0x00, 0b0000_1111]);
+        assert_eq!(requests[2], vec![0x06, 0x00, 15, 0x00, 0b0000_1111]);
+    }
+
+    #[test]
     fn build_block_requests_read_interleaves_tar_and_block_with_exact_lens() {
-        let chunks = plan_chunks(0x2000_0000, 30, 15);
-        assert_eq!(chunks, vec![(0x2000_0000, 15), (0x2000_003C, 15)]);
-        let (requests, lens) = build_block_requests(&chunks, None, 0);
+        let ops = plan_ops(0x2000_0000, 30, 15, TarPolicy::PerChunk);
+        assert_eq!(
+            ops.iter().map(|o| o.addr).collect::<Vec<_>>(),
+            vec![0x2000_0000, 0x2000_003C]
+        );
+        let (requests, lens) = build_block_requests(&ops, None, 0);
         assert_eq!(requests.len(), 4);
         assert_eq!(lens, vec![3, 4 + 4 * 15, 3, 4 + 4 * 15]);
 
@@ -1615,9 +2020,9 @@ mod tests {
     #[test]
     fn build_block_requests_write_slices_the_data_per_chunk() {
         let data: Vec<u32> = (0..20).collect();
-        let chunks = plan_chunks(0x2000_0000, data.len(), 14);
-        assert_eq!(chunks, vec![(0x2000_0000, 14), (0x2000_0038, 6)]);
-        let (requests, lens) = build_block_requests(&chunks, Some(&data), 0);
+        let ops = plan_ops(0x2000_0000, data.len(), 14, TarPolicy::PerChunk);
+        assert_eq!(ops.iter().map(|o| o.words).collect::<Vec<_>>(), vec![14, 6]);
+        let (requests, lens) = build_block_requests(&ops, Some(&data), 0);
         assert_eq!(requests.len(), 4);
         assert_eq!(lens, vec![3, 4, 3, 4]);
 
@@ -1634,15 +2039,15 @@ mod tests {
     #[test]
     fn build_block_requests_carries_the_dap_index() {
         // Over JTAG the DAP index byte selects the TAP, so every packet carries it (byte 1).
-        let chunks = plan_chunks(0x2000_0000, 20, 15);
-        let (requests, _) = build_block_requests(&chunks, None, 1);
+        let ops = plan_ops(0x2000_0000, 20, 15, TarPolicy::PerChunk);
+        let (requests, _) = build_block_requests(&ops, None, 1);
         for (i, req) in requests.iter().enumerate() {
             assert_eq!(req[1], 1, "packet {i} DAP index");
         }
     }
 
     #[test]
-    fn check_pipelined_chunk_accepts_a_clean_pair_and_rejects_failures() {
+    fn check_pipelined_responses_accept_a_clean_pair_and_reject_failures() {
         // Clean TAR write + clean 2-word block read.
         let tar_ok = [0x05, 0x01, 0x01];
         let block_ok = [
@@ -1650,15 +2055,16 @@ mod tests {
             0xAA, 0xAA, 0xAA, 0xAA, //
             0xBB, 0xBB, 0xBB, 0xBB,
         ];
+        assert!(check_pipelined_tar(&tar_ok).is_ok());
         assert_eq!(
-            check_pipelined_chunk(&tar_ok, &block_ok, 2).unwrap(),
+            check_pipelined_block(&block_ok, 2).unwrap(),
             vec![0xAAAA_AAAA, 0xBBBB_BBBB]
         );
         // A WAIT on the TAR write fails the chunk -- no retry inside a pipelined window.
         let tar_wait = [0x05, 0x00, 0b010];
-        assert!(check_pipelined_chunk(&tar_wait, &block_ok, 2).is_err());
+        assert!(check_pipelined_tar(&tar_wait).is_err());
         // A short block (probe stopped early) fails the chunk.
         let block_short = [0x06, 0x01, 0x00, 0x01, 0xAA, 0xAA, 0xAA, 0xAA];
-        assert!(check_pipelined_chunk(&tar_ok, &block_short, 2).is_err());
+        assert!(check_pipelined_block(&block_short, 2).is_err());
     }
 }

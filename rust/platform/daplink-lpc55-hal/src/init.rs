@@ -1,5 +1,4 @@
-//! MCU-Link probe bring-up: clocks, the high-speed USB1 device and identity, the wired SWD+JTAG
-//! bit-bang dependencies, the SWO capture, and the VCOM UART.
+//! MCU-Link probe bring-up: clocks, USB1, SWD/JTAG pins, SWO capture and the VCOM UART.
 
 use lpc55_hal as hal;
 use lpc55_hal::drivers::clocks::Clocks;
@@ -11,48 +10,40 @@ use static_cell::StaticCell;
 use usb_device::bus::UsbBusAllocator;
 
 use daplink_rs::daplink_core::serial::SERIAL_LEN;
-use daplink_rs::daplink_core::{
-    DapConfig, DAP_HS_PACKET_SIZE, DEFAULT_VCOM_BAUD, SCAN_CHAIN_SLOTS,
-};
+use daplink_rs::daplink_core::{DapConfig, EndpointSize, DEFAULT_VCOM_BAUD, SCAN_CHAIN_SLOTS};
 use daplink_rs::{LateJtagDeps, ScanChainStorage};
 
-#[cfg(feature = "core-96mhz")]
-use crate::clocks::clocks;
-#[cfg(not(feature = "core-96mhz"))]
-use crate::clocks::clocks_150mhz;
-use crate::delay::DynCycleDelay;
 use crate::pin::{self, IoPin};
 use crate::swo::{fc3_swo, Fc3Swo};
 use crate::vcom::Vcom;
+use crate::ClockProfile;
+use crate::DynCycleDelay;
 
-/// The high-speed USB1 device bus type for the MCU-Link probe.
 pub type Bus = UsbBus<EnabledUsbhsDevice>;
 
-/// The wired SWD+JTAG bit-bang dependencies for the MCU-Link's SWD header.
 pub type ProbeDeps = LateJtagDeps<IoPin, DynCycleDelay>;
 
 /// Serial storage: computed once in [`probe_parts`], before any USB descriptor reads it.
 static DEV_SERIAL: StaticCell<[u8; SERIAL_LEN]> = StaticCell::new();
 
-/// The constructed probe pieces returned by [`probe_parts`].
 pub struct ProbeParts {
-    /// The wired SWD+JTAG bit-bang dependencies, ready for the firmware's DAP engine.
     pub deps: ProbeDeps,
-    /// The Flexcomm3 SWO capture, ready for the engine's SWO slot.
     pub swo: Fc3Swo,
-    /// The high-speed USB bus allocator, ready for `DapUsb::new`.
     pub usb_alloc: &'static UsbBusAllocator<Bus>,
     /// The USB device identity, sized for the 512-byte high-speed bulk endpoints.
     pub cfg: DapConfig<'static>,
-    /// USB serial string derived from the factory UUID.
     pub serial: &'static str,
-    /// The VCOM UART (Flexcomm0), bridged to the CDC-ACM serial port by the firmware.
     pub uart: Vcom,
 }
 
-/// Bring the MCU-Link probe up: the core clock tree ([`crate::CPU_HZ`]), the high-speed USB1
-/// device, the SWD pads, the SWO capture and the VCOM UART. Owns `StaticCell`s: call once.
-pub fn probe_parts(dp: hal::raw::Peripherals, delay: DynCycleDelay) -> ProbeParts {
+/// Bring up the MCU-Link resources using the selected clock and matching wire delay; call once.
+pub fn probe_parts(
+    dp: hal::raw::Peripherals,
+    profile: ClockProfile,
+    delay: DynCycleDelay,
+    endpoint: EndpointSize,
+) -> ProbeParts {
+    assert_eq!(daplink_rs::DelayCycles::cpu_clock(&delay), profile.cpu_hz());
     let mut anactrl = hal::Anactrl::from(dp.ANACTRL);
     let mut pmc = hal::Pmc::from(dp.PMC);
     let mut syscon = hal::Syscon::from(dp.SYSCON);
@@ -98,24 +89,18 @@ pub fn probe_parts(dp: hal::raw::Peripherals, delay: DynCycleDelay) -> ProbePart
     // `UsbBus::new` is typed over a `Usb0VbusPin` even on the HS path, which never reads the value.
     let usb0_vbus_pin = pins.pio0_22.into_usb0_vbus_pin(&mut iocon);
 
-    // Full SWJ wiring over the SWD header's buffered pads plus the two JTAG lines.
     static SCAN: ScanChainStorage<SCAN_CHAIN_SLOTS> = ScanChainStorage::new();
     let deps = LateJtagDeps::wired(
         pin::nreset(),
-        IoPin::output(0, 1),
-        IoPin::buffered(0, 2, 0, 28),
-        IoPin::output(0, 0),
-        IoPin::input(0, 3),
+        IoPin::output(0, pin::TDI_PIN as u8),
+        IoPin::buffered(0, pin::SWDIO_PIN as u8, 0, pin::TXEN_PIN as u8),
+        IoPin::output(0, pin::TCK_PIN as u8),
+        IoPin::input(0, pin::TDO_PIN as u8),
         delay,
         &SCAN,
     );
 
-    #[cfg(feature = "core-96mhz")]
-    let clocks = clocks(&mut anactrl, &mut pmc, &mut syscon);
-    // Refusal halts the boot: every CPU-derived constant is built for 150 MHz.
-    #[cfg(not(feature = "core-96mhz"))]
-    let clocks = clocks_150mhz(&dp.FLASH, &mut anactrl, &mut pmc, &mut syscon)
-        .expect("lpc55 150 MHz preflight (see CORE_150MHZ_STATUS)");
+    let clocks = profile.configure(&dp.FLASH, &mut anactrl, &mut pmc, &mut syscon);
 
     let flexcomm0 = hal::peripherals::flexcomm::Flexcomm0::from((
         dp.FLEXCOMM0,
@@ -161,8 +146,7 @@ pub fn probe_parts(dp: hal::raw::Peripherals, delay: DynCycleDelay) -> ProbePart
     );
 
     let serial = crate::uid::serial(DEV_SERIAL.init([0u8; SERIAL_LEN]));
-    // High-speed bulk endpoints carry 512-byte packets; EP0 stays at the required 64.
-    let cfg = DapConfig::daplink(serial).with_packet_size(DAP_HS_PACKET_SIZE);
+    let cfg = DapConfig::daplink(serial, endpoint);
 
     ProbeParts {
         deps,
@@ -174,8 +158,7 @@ pub fn probe_parts(dp: hal::raw::Peripherals, delay: DynCycleDelay) -> ProbePart
     }
 }
 
-/// Bring up the high-speed USB1 controller as a device and return the `'static` bus allocator.
-/// Owns the USB allocator `StaticCell`: callable only once per image.
+/// Bring up USB1 as a high-speed device; callable once, as it owns the allocator `StaticCell`.
 #[allow(clippy::too_many_arguments)]
 fn bringup_usb_device<P: Usb0VbusPin + Sync>(
     ctimer0: hal::raw::CTIMER0,
@@ -211,6 +194,12 @@ fn bringup_usb_device<P: Usb0VbusPin + Sync>(
 
     static USB_ALLOC: StaticCell<UsbBusAllocator<Bus>> = StaticCell::new();
     let alloc = USB_ALLOC.init(UsbBus::new(usb_peripheral, usb0_vbus_pin));
+
+    // Never released: suspend would stop the device clock, and resume then fails.
+    // SAFETY: single-threaded bring-up owns USB1 until the bus is handed to the USB task.
+    unsafe { &*hal::raw::USB1::PTR }
+        .devcmdstat
+        .modify(|_, w| w.force_needclk().set_bit());
 
     // The PHY can come out of bring-up wedged; check and recover at the end of the sequence.
     crate::usb_phy::verify_and_recover();

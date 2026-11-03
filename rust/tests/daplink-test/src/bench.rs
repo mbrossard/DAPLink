@@ -37,8 +37,7 @@ fn default_log_path(elf_path: &Path) -> PathBuf {
     PathBuf::from(format!("{stem}.defmt.log"))
 }
 
-/// Open `via` as a second probe-rs session and stream `elf_path`'s decoded defmt frames to a log
-/// file from a background thread; `Ok(None)` when the ELF carries no defmt table.
+/// Stream `elf_path`'s decoded defmt frames from `via` to a log file; `Ok(None)` without a defmt table.
 pub fn start(via: &str, elf_path: &Path, chip: &str) -> Result<Option<DefmtCapture>, String> {
     let elf = std::fs::read(elf_path)
         .map_err(|e| format!("cannot read probe ELF `{}`: {e}", elf_path.display()))?;
@@ -94,8 +93,7 @@ impl DefmtCapture {
     }
 }
 
-/// Capture-thread body: stream up-channel 0 through the defmt decoder into `file`, flushing per
-/// read so an interrupted run still leaves a usable log, until `stop` is set.
+/// Capture thread: decode up-channel 0 into `file`, flushing per read, until `stop` is set.
 fn capture(
     mut session: Session,
     elf_path: PathBuf,

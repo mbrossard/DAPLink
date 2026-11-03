@@ -6,8 +6,7 @@ use nusb::{DeviceInfo, MaybeFuture};
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// A parsed `vid:pid:serial` PUT selector -- the same syntax `--probe` already uses for probe-rs
-/// transports, reused here to name the PUT's own USB identity.
+/// A `vid:pid:serial` selector naming the PUT's own USB identity, not its transport.
 pub struct Selector {
     pub vid: u16,
     pub pid: u16,
@@ -57,14 +56,20 @@ impl std::fmt::Display for Selector {
     }
 }
 
-/// Wait until the device has been on the bus continuously for `settle`. A probe caught between
-/// its reset and its detach is on the bus too, so presence alone does not mean re-enumerated;
-/// only presence that holds does.
+/// Require sampled presence for `settle`; this does not independently prove a re-enumeration.
 pub fn wait_settled(sel: &Selector, settle: Duration, timeout: Duration) -> bool {
+    wait_settled_with(|| sel.present(), settle, timeout)
+}
+
+fn wait_settled_with(
+    mut present: impl FnMut() -> bool,
+    settle: Duration,
+    timeout: Duration,
+) -> bool {
     let deadline = Instant::now() + timeout;
     let mut since = None;
     loop {
-        match (sel.present(), since) {
+        match (present(), since) {
             (true, Some(t)) if Instant::now().duration_since(t) >= settle => return true,
             (true, None) => since = Some(Instant::now()),
             (false, _) => since = None,
@@ -77,11 +82,15 @@ pub fn wait_settled(sel: &Selector, settle: Duration, timeout: Duration) -> bool
     }
 }
 
-/// Wait until the device leaves the bus, which is the host acknowledging a disconnect.
+/// Wait for absence; enumeration errors currently also appear absent.
 pub fn wait_gone(sel: &Selector, timeout: Duration) -> bool {
+    wait_gone_with(|| sel.present(), timeout)
+}
+
+fn wait_gone_with(mut present: impl FnMut() -> bool, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if !sel.present() {
+        if !present() {
             return true;
         }
         if Instant::now() >= deadline {
@@ -116,15 +125,13 @@ mod tests {
         assert!(parse_selector("nope:0204:abc").is_err());
     }
 
-    /// A selector no device answers must time out rather than settle.
     #[test]
     fn an_absent_device_never_settles() {
-        let sel = parse_selector("dead:beef:NOSUCHDEVICE").unwrap();
-        assert!(!wait_settled(
-            &sel,
+        assert!(!wait_settled_with(
+            || false,
             Duration::from_millis(10),
             Duration::from_millis(50)
         ));
-        assert!(wait_gone(&sel, Duration::from_millis(50)));
+        assert!(wait_gone_with(|| false, Duration::from_millis(50)));
     }
 }

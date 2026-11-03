@@ -2,16 +2,18 @@
 
 extern crate std;
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use dap_rs::swd::{APnDP, Config, DPRegister, Error as SwdErr, Result as SwdResult, Swd};
 use embedded_hal::delay::DelayNs;
 use std::boxed::Box;
+use std::vec::Vec;
 
 use crate::error::Error;
 use crate::flash_algo::{FlashAlgorithm, FlashRegion, RamRegion, SectorInfo, SyscallParams};
-use crate::reset::ResetControl;
+use crate::flash_manager::FlashManager;
 use crate::target::{DefaultCallbacks, Target};
 use crate::target_flash::TargetFlash;
+use crate::ResetControl;
 
 /// Geometry of the target under test: 1 KiB pages, no `Verify` entry (read-back fallback).
 const FLASH_BASE: u32 = 0x0800_0000;
@@ -20,6 +22,7 @@ const PAGE: usize = 0x400;
 const ALGO_START: u32 = 0x2000_0000;
 const INIT_OFF: u32 = 0x20;
 const UNINIT_OFF: u32 = 0x40;
+const PROGRAM_OFF: u32 = 0xA0;
 
 /// Core-debug registers the mock answers specially, and the DCRSR selector for a PC write.
 const DCRSR: u32 = 0xE000_EDF4;
@@ -54,14 +57,15 @@ struct Bus {
     window_hidden: Cell<bool>,
     /// Config: one flash address that reads back as the complement of what was written.
     poison: Cell<Option<u32>>,
+    /// `ProgramPage` calls as `(r0, r1, r2)`: address, length and buffer.
+    programs: RefCell<Vec<(u32, u32, u32)>>,
 }
 
 fn leak_bus() -> &'static Bus {
     Box::leak(Box::new(Bus::default()))
 }
 
-/// SWD driver mock over a flat memory model with ADIv5 posted-read and TAR auto-increment
-/// semantics.
+/// SWD driver mock over flat memory with ADIv5 posted reads and TAR auto-increment.
 struct MockSwd {
     cfg: Config,
     bus: &'static Bus,
@@ -71,6 +75,10 @@ struct MockSwd {
     posted: u32,
     /// Value staged into DCRDR, committed as the routine entry by a PC write.
     pending_dcrdr: u32,
+    /// The last values written to r0..r3.
+    args: [u32; 4],
+    /// Whether the last DCRSR write selected r15 for a read.
+    pc_selected: bool,
 }
 
 impl MockSwd {
@@ -81,13 +89,19 @@ impl MockSwd {
             tar: 0,
             posted: 0,
             pending_dcrdr: 0,
+            args: [0; 4],
+            pc_selected: false,
         }
     }
 
     /// The word stored at `addr` in the model.
     fn mem(&self, addr: u32) -> u32 {
         if addr == DCRDR {
-            return 0;
+            return if self.pc_selected {
+                ALGO.syscall.breakpoint & !1
+            } else {
+                0
+            };
         }
         if !(FLASH_BASE..FLASH_END).contains(&addr) {
             return 0xFFFF_FFFF;
@@ -136,10 +150,18 @@ impl Swd<MockSwd> for MockSwd {
         }
         let addr = self.tar;
         self.tar = self.tar.wrapping_add(4);
+        if addr == DCRSR {
+            self.pc_selected = data == 15;
+        }
         if addr == DCRDR {
             self.pending_dcrdr = data;
+        } else if addr == DCRSR && data & !3 == 1 << 16 {
+            self.args[(data & 3) as usize] = self.pending_dcrdr;
         } else if addr == DCRSR && data == PC_WRITE_SELECT {
-            if self.pending_dcrdr == ALGO_START + INIT_OFF {
+            if self.pending_dcrdr == ALGO_START + PROGRAM_OFF {
+                let [r0, r1, r2, _] = self.args;
+                self.bus.programs.borrow_mut().push((r0, r1, r2));
+            } else if self.pending_dcrdr == ALGO_START + INIT_OFF {
                 self.bus.inits.set(self.bus.inits.get() + 1);
                 self.bus.algo_live.set(true);
             } else if self.pending_dcrdr == ALGO_START + UNINIT_OFF {
@@ -178,7 +200,7 @@ static ALGO: FlashAlgorithm<'static> = FlashAlgorithm {
     uninit: UNINIT_OFF,
     erase_chip: 0x60,
     erase_sector: 0x80,
-    program_page: 0xA0,
+    program_page: PROGRAM_OFF,
     verify: None,
     syscall: SyscallParams {
         breakpoint: ALGO_START,
@@ -197,7 +219,6 @@ static FLASH_REGIONS: [FlashRegion<'static>; 1] = [FlashRegion {
     start: FLASH_BASE,
     end: FLASH_END,
     is_default: true,
-    is_secure: false,
     algo: &ALGO,
 }];
 static RAM_REGIONS: [RamRegion; 1] = [RamRegion {
@@ -306,8 +327,7 @@ fn readback_verify_catches_a_mismatch_mid_page() {
     }
 }
 
-/// A target whose flash is unreadable while its algorithm is initialized still verifies: the
-/// mismatch is retried after the algorithm is torn down.
+/// Flash unreadable while the algorithm is initialized still verifies, by retrying after teardown.
 #[test]
 fn readback_verify_retries_behind_a_hidden_window() {
     let bus = leak_bus();
@@ -322,8 +342,7 @@ fn readback_verify_retries_behind_a_hidden_window() {
     assert_eq!(bus.uninits.get(), 1, "the algorithm was torn down once");
 }
 
-/// What one verified page costs, counted in the steady state (a later page, so neither figure
-/// carries the session's one-time algorithm load).
+/// Per-page verify cost in the steady state, past the one-time algorithm load.
 #[test]
 fn readback_verify_costs_one_transaction_a_word() {
     let marginal =
@@ -339,4 +358,23 @@ fn readback_verify_costs_one_transaction_a_word() {
     run_pages(bus, 3, true);
     assert_eq!(bus.inits.get(), 1, "one Init for the whole session");
     assert_eq!(bus.uninits.get(), 0, "no teardown on a passing verify");
+}
+
+/// A staging buffer below the algorithm's page reaches `ProgramPage` as aligned chunks.
+#[test]
+fn a_buffer_below_the_algorithm_page_programs_in_chunks() {
+    let bus = leak_bus();
+    let target = MockTarget;
+    let mut buf = [0u8; PAGE / 4];
+    let mut mgr = FlashManager::new(flash(bus, &target), &mut buf).expect("manager");
+    mgr.set_verify(true);
+    mgr.write(FLASH_BASE, &page_bytes(FLASH_BASE))
+        .expect("each chunk programs and verifies");
+    let (res, _) = mgr.finish(false);
+    res.expect("finish");
+    let chunk = PAGE as u32 / 4;
+    let chunks: Vec<_> = (0..4)
+        .map(|i| (FLASH_BASE + i * chunk, chunk, ALGO.program_buffer))
+        .collect();
+    assert_eq!(*bus.programs.borrow(), chunks);
 }

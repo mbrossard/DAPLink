@@ -4,11 +4,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use daplink_rs::{BootloaderEntry, KIND_NXP_ISP};
 
-/// Latched by [`Lpc55Boot::arm`], observed by [`reboot_armed`].
 static REBOOT: AtomicBool = AtomicBool::new(false);
 
-/// Whether a reboot-to-bootloader has been armed; the idle loop polls this and enters the ROM
-/// after a short grace so the DAP response drains first.
+/// Whether a reboot-to-bootloader is armed; the idle loop polls it after the DAP response drains.
 pub fn reboot_armed() -> bool {
     REBOOT.load(Ordering::SeqCst)
 }

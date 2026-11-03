@@ -2,26 +2,31 @@
 
 use crate::profile::Req;
 
-/// A named wired target: its probe-rs chip name, an always-readable address for the speed
-/// cases, and the abilities its silicon and wiring actually provide.
+/// A named wired target: probe-rs chip, a readable address for the speed cases, and its abilities.
 #[derive(Debug)]
 pub(crate) struct Target {
     pub(crate) name: &'static str,
     pub(crate) chip: &'static str,
     pub(crate) read_addr: u64,
-    /// `DBGMCU_CR` address for trace-pin routing (TRACE_IOEN bit 5, TRACE_MODE bits 7:6);
-    /// `None` where the silicon has no such register.
+    /// `DBGMCU_CR` address for trace-pin routing; `None` where the silicon has none.
     pub(crate) dbgmcu_cr: Option<u64>,
+    /// An address the silicon maps to nothing, for the fault case; `None` where none is known.
+    pub(crate) fault_addr: Option<u64>,
+    /// JTAG IR lengths in `DAP_JTAG_Configure` order, TDO first; empty for a single TAP or no JTAG-DP.
+    pub(crate) jtag_ir_lens: &'static [u8],
     pub(crate) supports: &'static [Req],
 }
 
-/// Known wired targets.
 pub(crate) const TARGETS: &[Target] = &[
     Target {
         name: "stm32f401",
         chip: "STM32F401CEUx",
         read_addr: 0x0800_0000,
         dbgmcu_cr: Some(0xE004_2004),
+        // FSMC bank 1: the region exists in the family's map and this part has no FSMC.
+        fault_addr: Some(0x6000_0000),
+        // TDO first: the Cortex-M4 debug TAP, then the boundary-scan TAP behind it.
+        jtag_ir_lens: &[4, 5],
         supports: &[Req::Jtag, Req::Swo, Req::Vcom, Req::Nreset],
     },
     Target {
@@ -29,6 +34,9 @@ pub(crate) const TARGETS: &[Target] = &[
         chip: "RP2040",
         read_addr: 0x1000_0000,
         dbgmcu_cr: None,
+        // Between the AHB-lite peripherals and the SIO block, the bus fabric decodes nothing.
+        fault_addr: Some(0x6000_0000),
+        jtag_ir_lens: &[],
         // No JTAG-DP and no ITM on M0+: no jtag, no swo.
         supports: &[Req::Vcom, Req::Nreset],
     },
@@ -37,12 +45,13 @@ pub(crate) const TARGETS: &[Target] = &[
         chip: "RP235x",
         read_addr: 0x1000_0000,
         dbgmcu_cr: None,
+        fault_addr: Some(0x6000_0000),
+        jtag_ir_lens: &[],
         // SWD-only DP, and the M33's ITM has no SWO route to a pin: no jtag, no swo.
         supports: &[Req::Vcom, Req::Nreset],
     },
 ];
 
-/// Look up a target by name.
 pub(crate) fn target(name: &str) -> Option<&'static Target> {
     TARGETS.iter().find(|t| t.name == name)
 }
@@ -51,10 +60,7 @@ pub(crate) fn target(name: &str) -> Option<&'static Target> {
 mod tests {
     use super::*;
 
-    /// `swo::run` reads and writes `dbgmcu_cr` before its sweep, and the case reaches a target
-    /// only through `Req::Swo`: a row claiming the capability without the register would make
-    /// the whole case skip, and one carrying an address outside the debug region would poke
-    /// whatever else lives there.
+    /// A `Req::Swo` target must carry a `dbgmcu_cr` inside the debug region.
     #[test]
     fn a_target_claiming_swo_names_its_trace_register() {
         for t in TARGETS {
@@ -65,6 +71,41 @@ mod tests {
                 assert!(
                     (0xE000_0000..=0xE00F_FFFF).contains(&addr),
                     "{}: dbgmcu_cr {addr:#x} is outside the debug region",
+                    t.name
+                );
+            }
+        }
+    }
+
+    /// The fault address must be unmapped and distinct from the speed cases' address.
+    #[test]
+    fn a_fault_address_is_not_the_readable_one() {
+        for t in TARGETS {
+            if let Some(addr) = t.fault_addr {
+                assert_ne!(
+                    addr, t.read_addr,
+                    "{}: fault address is the read address",
+                    t.name
+                );
+                assert!(addr != 0, "{}: fault address is zero", t.name);
+            }
+        }
+    }
+
+    /// The jtag-chain case needs JTAG and at least two TAPs.
+    #[test]
+    fn a_declared_jtag_chain_has_more_than_one_tap() {
+        for t in TARGETS {
+            if !t.jtag_ir_lens.is_empty() {
+                assert!(
+                    t.supports.contains(&Req::Jtag),
+                    "{}: chain without jtag",
+                    t.name
+                );
+                assert!(t.jtag_ir_lens.len() >= 2, "{}: chain of one TAP", t.name);
+                assert!(
+                    t.jtag_ir_lens.iter().all(|&n| (2..=32).contains(&n)),
+                    "{}",
                     t.name
                 );
             }

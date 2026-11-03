@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::flash_algo::SectorInfo;
 use crate::flash_intf::FlashInterface;
 
-/// Program granularity reported by the mock.
+/// Default program granularity reported by the mock.
 const MOCK_PAGE: u32 = 256;
 
 /// A flash operation the mock observed, in call order.
@@ -56,6 +56,8 @@ pub struct MockFlashBuilder {
     chip_erase: bool,
     sector_erase: bool,
     fail_uninit: bool,
+    page: u32,
+    fail_program_at: Option<u32>,
 }
 
 impl MockFlashBuilder {
@@ -68,7 +70,21 @@ impl MockFlashBuilder {
             chip_erase: true,
             sector_erase: true,
             fail_uninit: false,
+            page: MOCK_PAGE,
+            fail_program_at: None,
         }
+    }
+
+    /// Report and enforce a program granularity of `page` bytes.
+    pub fn page_size(mut self, page: u32) -> Self {
+        self.page = page;
+        self
+    }
+
+    /// Make [`FlashInterface::program_page`] at `addr` fail (while still recording the op).
+    pub fn fail_program_at(mut self, addr: u32) -> Self {
+        self.fail_program_at = Some(addr);
+        self
     }
 
     /// Lay out the whole flash as uniform sectors of `sector_size` bytes.
@@ -153,6 +169,8 @@ impl MockFlashBuilder {
             chip_erase: self.chip_erase,
             sector_erase: self.sector_erase,
             fail_uninit: self.fail_uninit,
+            page: self.page,
+            fail_program_at: self.fail_program_at,
             ops: Vec::new(),
             violations: Vec::new(),
             initialized: false,
@@ -166,12 +184,14 @@ impl MockFlashBuilder {
 pub struct MockFlash {
     base: u32,
     data: Vec<u8>,
-    /// Per-byte erased flag (set by erase, cleared conceptually by program-to-non-0xFF).
+    /// Per-byte erased flag.
     erased: Vec<bool>,
     runs: Vec<SectorInfo>,
     chip_erase: bool,
     sector_erase: bool,
     fail_uninit: bool,
+    page: u32,
+    fail_program_at: Option<u32>,
     ops: Vec<FlashOp>,
     violations: Vec<Violation>,
     initialized: bool,
@@ -208,12 +228,10 @@ impl MockFlash {
         self.data[off..off + len].to_vec()
     }
 
-    /// Whether `addr` is within the flash bounds.
     fn in_bounds(&self, addr: u32, len: u32) -> bool {
         addr >= self.base && (addr + len) <= self.base + self.data.len() as u32
     }
 
-    /// The sector base for `addr`, if it lies in a run (the shared [`SectorInfo`] math).
     fn sector_base(&self, addr: u32) -> Option<u32> {
         self.runs.iter().find_map(|run| run.sector_base_at(addr))
     }
@@ -280,11 +298,14 @@ impl FlashInterface for MockFlash {
         });
         // Enforce the geometry reported through `program_page_min_size`.
         let len = data.len() as u32;
-        if len == 0 || len > MOCK_PAGE || !MOCK_PAGE.is_multiple_of(len) {
+        if len == 0 || len > self.page || !self.page.is_multiple_of(len) {
             return Err(Error::DataTooLarge {
                 size: len,
-                max: MOCK_PAGE,
+                max: self.page,
             });
+        }
+        if self.fail_program_at == Some(addr) {
+            return Err(Error::WriteFailed);
         }
         if !addr.is_multiple_of(len) {
             return Err(Error::AddressNotAligned {
@@ -336,6 +357,9 @@ impl FlashInterface for MockFlash {
 
     fn erase_sector(&mut self, addr: u32) -> Result<(), Error> {
         self.ops.push(FlashOp::EraseSector(addr));
+        if !self.sector_erase {
+            return Err(Error::EraseNotSupported);
+        }
         if !self.initialized {
             self.violations.push(Violation::NotInitialized);
         }
@@ -363,6 +387,9 @@ impl FlashInterface for MockFlash {
 
     fn erase_chip(&mut self) -> Result<(), Error> {
         self.ops.push(FlashOp::EraseChip);
+        if !self.chip_erase {
+            return Err(Error::EraseNotSupported);
+        }
         if !self.initialized {
             self.violations.push(Violation::NotInitialized);
         }
@@ -376,7 +403,7 @@ impl FlashInterface for MockFlash {
     }
 
     fn program_page_min_size(&self, _addr: u32) -> u32 {
-        MOCK_PAGE
+        self.page
     }
 
     fn erase_sector_size(&self, addr: u32) -> Option<u32> {

@@ -10,8 +10,7 @@ impl DapLeds for NoopLeds {
     fn react_to_host_status(&mut self, _status: HostStatus) {}
 }
 
-/// Drives one status LED from the host's connect/running state, lit while either holds. A pin
-/// error is ignored -- a stuck LED must never abort a session. Polarity is chosen at construction.
+/// Drives one status LED, lit while connected or running; pin errors are ignored.
 pub struct StatusLed<P: OutputPin> {
     led: P,
     connected: bool,
@@ -66,8 +65,7 @@ impl<P: OutputPin> DapLeds for StatusLed<P> {
     }
 }
 
-/// A cheap activity/level sink a firmware loop can call on every iteration without cost when
-/// nothing is wired: `()` is the no-op implementation every non-LED build passes.
+/// A cheap activity/level sink; `()` is the no-op implementation.
 pub trait Activity {
     /// Toggle: called once per activity event (a command processed, a byte moved, a tick).
     fn pulse(&mut self) {}
@@ -77,19 +75,17 @@ pub trait Activity {
 
 impl Activity for () {}
 
-/// A `'static mut` no-op [`Activity`], for a call site that needs the trait-object shape (e.g. an
-/// embassy task, which cannot be generic) but has no LED wired on this build.
+/// Claim the single static no-op [`Activity`].
 ///
 /// # Panics
-/// Panics if called a second time from the same call site: each call promotes a fresh function-
-/// local static, so one call site must call it at most once (firmware `main` runs once).
+///
+/// On a second call.
 pub fn noop_activity() -> &'static mut dyn Activity {
     static CELL: static_cell::StaticCell<()> = static_cell::StaticCell::new();
     CELL.init(())
 }
 
-/// One carrier debug-bank LED, wired active-low. [`pulse`](BankLed::pulse) flickers per event;
-/// [`level`](BankLed::level) tracks an explicit state, for a session boundary.
+/// One active-low carrier debug-bank LED, pulsed per event or held at a level.
 pub struct BankLed<P: OutputPin> {
     led: P,
     lit: bool,
@@ -200,14 +196,5 @@ mod tests {
         led.level(false);
 
         led.led.done();
-    }
-
-    /// `()` is the no-op `Activity`: it never panics and never touches hardware.
-    #[test]
-    fn unit_activity_is_a_true_no_op() {
-        let mut sink = ();
-        sink.pulse();
-        sink.level(true);
-        sink.level(false);
     }
 }

@@ -1,4 +1,4 @@
-//! Pre-dispatch bounds guard: answers a truncated request or a response overrun with `0xFF`.
+//! Pre-dispatch guard sized by the engine's reads, not `dap_wire::command_len`: `0xFF` on an overrun.
 
 /// Result of guarding one report: dispatch it, or reply with the invalid-command byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,8 +9,7 @@ pub(crate) enum Verdict {
     Reject,
 }
 
-/// Validate `report` (command id + payload) against `resp_capacity`, the response buffer length.
-/// Unknown and vendor ids dispatch untouched; the engine answers those without unchecked reads.
+/// Validate `report` against `resp_capacity`; unknown and vendor ids dispatch untouched.
 pub(crate) fn check(report: &[u8], resp_capacity: usize) -> Verdict {
     let Some(&cmd) = report.first() else {
         // Empty report: the engine's request parser answers it with no response.
@@ -49,8 +48,7 @@ pub(crate) fn check(report: &[u8], resp_capacity: usize) -> Verdict {
     }
 }
 
-/// `DAP_Transfer` (0x05): 1 request byte per entry plus a u32 for a write/match value or mask.
-/// Response: a 3-byte fixed part, +4 per read value, +4 per requested timestamp.
+/// `DAP_Transfer` (0x05): request and response lengths per transfer item.
 fn check_transfer(report: &[u8], resp_capacity: usize) -> bool {
     if report.len() < 3 {
         return false;
@@ -65,7 +63,6 @@ fn check_transfer(report: &[u8], resp_capacity: usize) -> bool {
         off += 1;
         let read = req & (1 << 1) != 0;
         let vmatch = req & (1 << 4) != 0;
-        let mmask = req & (1 << 5) != 0;
         let timestamp = req & (1 << 7) != 0;
         if read {
             if vmatch {
@@ -77,8 +74,9 @@ fn check_transfer(report: &[u8], resp_capacity: usize) -> bool {
                 resp += 4;
             }
         } else {
+            // dap-rs's JTAG writes take bit 4 as the mask, so bit 5 can still reply a timestamp.
             off += 4; // write value or new match mask
-            if !mmask && timestamp {
+            if timestamp {
                 resp += 4;
             }
         }
@@ -89,8 +87,7 @@ fn check_transfer(report: &[u8], resp_capacity: usize) -> bool {
     resp <= resp_capacity
 }
 
-/// `DAP_TransferBlock` (0x06): fixed 5-byte header; a write needs `count` u32 request values,
-/// a read produces `count` u32 response values after the 4-byte fixed response part.
+/// `DAP_TransferBlock` (0x06): a 5-byte header, then `count` words to write or read.
 fn check_transfer_block(report: &[u8], resp_capacity: usize) -> bool {
     if report.len() < 5 {
         return false;
@@ -104,8 +101,7 @@ fn check_transfer_block(report: &[u8], resp_capacity: usize) -> bool {
     }
 }
 
-/// `DAP_JTAG_Sequence` (0x14): per sequence, 1 info byte plus `ceil(cycles/8)` TDI bytes (0 = 64).
-/// A capture sequence produces the same byte count after the 2-byte fixed response part.
+/// `DAP_JTAG_Sequence` (0x14): an info byte plus `ceil(cycles/8)` TDI bytes per sequence (0 = 64).
 fn check_jtag_sequence(report: &[u8], resp_capacity: usize) -> bool {
     if report.len() < 2 {
         return false;
@@ -133,8 +129,7 @@ fn check_jtag_sequence(report: &[u8], resp_capacity: usize) -> bool {
     resp <= resp_capacity
 }
 
-/// `DAP_SWD_Sequence` (0x1D): 1 info byte per sequence; an output carries `ceil(cycles/8)` (0 = 64).
-/// The engine bounds-checks the data and response sides, so only the info positions matter here.
+/// `DAP_SWD_Sequence` (0x1D): only the info byte positions need checking here.
 fn check_swd_sequence(report: &[u8]) -> bool {
     if report.len() < 2 {
         return false;
@@ -162,13 +157,20 @@ fn check_swd_sequence(report: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    extern crate std;
+    use self::std::vec;
+    use self::std::vec::Vec;
 
     const CAP: usize = 64;
 
     fn dispatches(report: &[u8]) -> bool {
-        check(report, CAP) == Verdict::Dispatch
+        dispatches_at(report, CAP)
+    }
+
+    fn dispatches_at(report: &[u8], cap: usize) -> bool {
+        check(report, cap) == Verdict::Dispatch
     }
 
     #[test]
@@ -255,9 +257,7 @@ mod tests {
 
     #[test]
     fn transfer_write_payloads_must_be_present() {
-        // One write with its word present.
         assert!(dispatches(&[0x05, 0, 1, 0x00, 1, 2, 3, 4]));
-        // One write missing its word.
         assert!(!dispatches(&[0x05, 0, 1, 0x00]));
         // Value-match read consumes a word from the request, produces none.
         assert!(dispatches(&[0x05, 0, 1, (1 << 1) | (1 << 4), 1, 2, 3, 4]));
@@ -330,9 +330,7 @@ mod tests {
 
     #[test]
     fn swd_sequence_info_bytes_must_exist() {
-        // One 8-cycle output sequence with its data byte.
         assert!(dispatches(&[0x1D, 1, 8, 0xAA]));
-        // Output data missing.
         assert!(!dispatches(&[0x1D, 1, 8]));
         // Input sequence carries no request data.
         assert!(dispatches(&[0x1D, 1, 0x88]));
@@ -352,5 +350,172 @@ mod tests {
         assert!(dispatches(&[0x9F, 1, 2, 3]));
         assert!(dispatches(&[0x7F]));
         assert!(dispatches(&[0x42]));
+    }
+
+    /// The two response capacities in the fleet: a full-speed packet and the MCU-Link's.
+    pub(crate) const CAPACITIES: [usize; 2] = [64, 512];
+
+    /// A just-long-enough report per command id, with the first prefix length that dispatches.
+    pub(crate) fn canonical(cmd: u8) -> (Vec<u8>, usize) {
+        match cmd {
+            0x00 => (vec![0x00, 0xFE], 2),
+            0x01 => (vec![0x01, 0, 0], 3),
+            0x02 => (vec![0x02, 1], 2),
+            0x04 => (vec![0x04, 0, 0, 0, 0, 0], 6),
+            0x05 => (vec![0x05, 0, 1, 0x00, 1, 2, 3, 4], 8),
+            0x06 => (vec![0x06, 0, 2, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8], 13),
+            0x08 => (vec![0x08, 0, 1, 2, 3, 4], 6),
+            0x09 => (vec![0x09, 0, 0], 3),
+            0x10 => (vec![0x10, 0, 0, 0, 0, 0, 0], 7),
+            0x11 => (vec![0x11, 1, 2, 3, 4], 5),
+            0x12 => (vec![0x12, 8, 0xAA], 2),
+            0x13 => (vec![0x13, 0], 2),
+            0x14 => (vec![0x14, 1, 8, 0xAA], 4),
+            0x15 => (vec![0x15, 2, 4, 5], 4),
+            0x16 | 0x17 | 0x18 | 0x1A => (vec![cmd, 0], 2),
+            0x19 => (vec![0x19, 1, 2, 3, 4], 5),
+            0x1C => (vec![0x1C, 0, 0], 3),
+            0x1D => (vec![0x1D, 1, 8, 0xAA], 4),
+            // Id-only commands and the ids the pinned engine does not know.
+            _ => (vec![cmd], 1),
+        }
+    }
+
+    #[test]
+    fn every_truncated_prefix_of_every_command_is_judged_by_its_own_rule() {
+        for cap in CAPACITIES {
+            for cmd in 0x00u8..=0x1E {
+                let (full, min) = canonical(cmd);
+                for len in 0..=full.len() {
+                    // An empty report carries no id and is left to the engine's parser.
+                    let want = if len == 0 || len >= min {
+                        Verdict::Dispatch
+                    } else {
+                        Verdict::Reject
+                    };
+                    assert_eq!(
+                        check(&full[..len], cap),
+                        want,
+                        "cmd {cmd:#04x} prefix {len} at capacity {cap}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn response_budgets_follow_the_capacity_rather_than_a_fixed_packet() {
+        for cap in CAPACITIES {
+            // DAP_Transfer plain reads: a 3-byte fixed part plus 4 per read value.
+            let fits = (cap - 3) / 4;
+            for (count, want) in [(fits, true), (fits + 1, false)] {
+                let mut r = vec![0u8; 3 + count];
+                r[0] = 0x05;
+                r[2] = count as u8;
+                for e in r[3..].iter_mut() {
+                    *e = 1 << 1;
+                }
+                assert_eq!(dispatches_at(&r, cap), want, "transfer {count} at {cap}");
+            }
+
+            // DAP_TransferBlock reads: a 4-byte fixed part plus 4 per word.
+            let fits = (cap - 4) / 4;
+            for (count, want) in [(fits, true), (fits + 1, false)] {
+                let n = (count as u16).to_le_bytes();
+                assert_eq!(
+                    dispatches_at(&[0x06, 0, n[0], n[1], 1 << 1], cap),
+                    want,
+                    "block {count} at {cap}"
+                );
+            }
+
+            // DAP_JTAG_Sequence captures: a 2-byte fixed part plus 8 per 64-cycle sequence.
+            let fits = (cap - 2) / 8;
+            for (count, want) in [(fits, true), (fits + 1, false)] {
+                let mut r = vec![0u8; 2 + 9 * count];
+                r[0] = 0x14;
+                r[1] = count as u8;
+                for c in r[2..].chunks_mut(9) {
+                    c[0] = 0x80; // capture, 64 cycles
+                }
+                assert_eq!(dispatches_at(&r, cap), want, "jtag {count} at {cap}");
+            }
+        }
+    }
+
+    /// A deterministic linear congruential generator, so a failing report is reproducible.
+    pub(crate) struct Lcg(u64);
+
+    impl Lcg {
+        pub(crate) fn new(seed: u64) -> Self {
+            Lcg(seed)
+        }
+
+        pub(crate) fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 16
+        }
+
+        /// One arbitrary report of at most `cap` bytes.
+        pub(crate) fn report(&mut self, cap: usize) -> Vec<u8> {
+            let len = (self.next() as usize) % (cap + 1);
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// The fixed-length request layouts, as the shortest report that may be dispatched.
+    pub(crate) fn fixed_minimum(cmd: u8) -> Option<usize> {
+        Some(match cmd {
+            0x00 | 0x02 | 0x12 | 0x13 | 0x16 | 0x17 | 0x18 | 0x1A => 2,
+            0x01 | 0x09 | 0x1C => 3,
+            0x04 | 0x08 => 6,
+            0x10 => 7,
+            0x11 | 0x19 => 5,
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn arbitrary_reports_never_panic_and_never_dispatch_a_short_fixed_command() {
+        for cap in CAPACITIES {
+            let mut rng = Lcg::new(0x0DA9_1147);
+            for _ in 0..10_000 {
+                let report = rng.report(cap);
+                let verdict = check(&report, cap);
+                assert_eq!(verdict, check(&report, cap), "the guard is a pure function");
+                let Some(&cmd) = report.first() else {
+                    assert_eq!(verdict, Verdict::Dispatch);
+                    continue;
+                };
+                if let Some(min) = fixed_minimum(cmd) {
+                    let want = if report.len() >= min {
+                        Verdict::Dispatch
+                    } else {
+                        Verdict::Reject
+                    };
+                    assert_eq!(verdict, want, "cmd {cmd:#04x} len {}", report.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vendor_and_unknown_ids_dispatch_at_every_length_and_capacity() {
+        for cap in CAPACITIES {
+            for cmd in 0x1Fu8..=0xFF {
+                for len in 0..4usize {
+                    let mut r = vec![0xFFu8; len + 1];
+                    r[0] = cmd;
+                    assert!(
+                        dispatches_at(&r, cap),
+                        "cmd {cmd:#04x} len {} at {cap}",
+                        r.len()
+                    );
+                }
+            }
+        }
     }
 }

@@ -11,6 +11,8 @@ use nusb::descriptors::TransferType;
 use nusb::transfer::{Buffer, Bulk, Direction, In, Out};
 use nusb::{Endpoint, Interface, MaybeFuture};
 
+use crate::dap::{decode_info_packet_size, encode_info, InfoId};
+
 /// Interface string substring that identifies a CMSIS-DAP v2 bulk interface.
 const CMSIS_DAP_SIGNATURE: &str = "CMSIS-DAP";
 
@@ -20,8 +22,8 @@ const VENDOR_SPECIFIC_CLASS: u8 = 0xFF;
 /// Timeout for the control transfers used to read string descriptors during discovery.
 const STRING_DESCRIPTOR_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// Response read size, before rounding up to a multiple of the endpoint's max packet size.
-const RESPONSE_BUFFER_HINT: usize = 4096;
+/// Timeout for the `DAP_Info(PacketSize)` query that sizes every response read.
+const PACKET_SIZE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The one-byte reply a CMSIS-DAP engine sends for a command it will not run.
 pub const INVALID_COMMAND: u8 = 0xFF;
@@ -29,8 +31,7 @@ pub const INVALID_COMMAND: u8 = 0xFF;
 /// Environment variable selecting the transport trace level.
 pub const TRACE_ENV: &str = "DAPBENCH_TRACE";
 
-/// Environment variable suppressing the claim-time boundary flush, so a hardware repro can tell
-/// a leftover response apart from the cancelled read that removes it.
+/// Environment variable suppressing the claim-time boundary flush.
 pub const NO_CLAIM_FLUSH_ENV: &str = "DAPBENCH_NO_CLAIM_FLUSH";
 
 /// Environment variable naming the probe for callers that take no `--probe` flag.
@@ -75,7 +76,7 @@ pub struct ProbeInfo {
     device_info: nusb::DeviceInfo,
 }
 
-/// Enumerate every CMSIS-DAP v2 bulk interface currently attached to the host.
+/// Find the first qualifying default-alt CMSIS-DAP v2 bulk interface per accessible USB device.
 pub fn enumerate() -> Vec<ProbeInfo> {
     let devices = match nusb::list_devices().wait() {
         Ok(devices) => devices,
@@ -222,8 +223,7 @@ pub fn select<'a>(probes: &'a [ProbeInfo], selector: &ProbeSelector) -> Result<&
     }
 }
 
-/// One indexed line per probe, for an error that has to say which ones it could not choose
-/// between.
+/// One indexed line per probe, for an ambiguous-selection error.
 fn list_candidates(probes: &[&ProbeInfo]) -> String {
     probes
         .iter()
@@ -240,9 +240,7 @@ fn list_candidates(probes: &[&ProbeInfo]) -> String {
         .join("\n")
 }
 
-/// The probe `spec` names, or the only one attached. Several probes and no `spec` is an error,
-/// `chooser` naming how this caller is told which one: a caller with no way to say which rig it
-/// meant must not attach to another lane's.
+/// The probe `spec` names, or the only one attached; several and no `spec` is an error.
 fn select_sole<'a>(
     probes: &'a [ProbeInfo],
     spec: Option<&str>,
@@ -265,12 +263,12 @@ fn select_sole<'a>(
     }
 }
 
-/// [`select_sole`] for a command-line tool, which says which probe it meant with `--probe`.
+/// The sole matching probe, for a command-line tool, which says which probe it meant with `--probe`.
 pub fn select_cli<'a>(probes: &'a [ProbeInfo], spec: Option<&str>) -> Result<&'a ProbeInfo> {
     select_sole(probes, spec, "pass --probe VID:PID[:SERIAL]")
 }
 
-/// [`select_sole`] for a caller that can take no command-line selector.
+/// The sole matching probe, for a caller that can take no command-line selector.
 pub fn select_only<'a>(probes: &'a [ProbeInfo], spec: Option<&str>) -> Result<&'a ProbeInfo> {
     select_sole(probes, spec, &format!("set {PROBE_ENV}=VID:PID[:SERIAL]"))
 }
@@ -389,8 +387,7 @@ pub struct Misalignment {
     pub resp_len: usize,
     /// The response was the engine's one-byte invalid-command reply.
     pub invalid_command: bool,
-    /// Signed offset to the nearest position whose request id matches `found`; `None` when no
-    /// request in the batch carries it.
+    /// Signed offset to the nearest position whose request id matches `found`.
     pub shift: Option<isize>,
 }
 
@@ -420,8 +417,7 @@ pub fn command_id(buf: &[u8]) -> Option<u8> {
     buf.first().copied()
 }
 
-/// Check the response at `pos` against the request submitted there. Every CMSIS-DAP response
-/// echoes its request's command id in byte 0, bar the one-byte `0xFF` invalid-command reply.
+/// Check the response at `pos` echoes its request's command id (or is a `0xFF` reply).
 pub fn check_pair(requests: &[Vec<u8>], pos: usize, response: &[u8]) -> Option<Misalignment> {
     let expected = command_id(requests.get(pos)?)?;
     let found = command_id(response)?;
@@ -451,6 +447,55 @@ pub fn shift_hint(requests: &[Vec<u8>], pos: usize, found: u8) -> Option<isize> 
         })
 }
 
+/// URB order for a single outstanding command; depth >= 2 always posts IN first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubmitPolicy {
+    /// OUT to completion, then IN; the default.
+    #[default]
+    Lockstep,
+    /// IN posted before OUT, so the receive buffer is armed when the device answers.
+    InFirst,
+}
+
+impl SubmitPolicy {
+    /// Short label used in the JSON and in error text.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SubmitPolicy::Lockstep => "lockstep",
+            SubmitPolicy::InFirst => "in-first",
+        }
+    }
+}
+
+/// When a completed pipelined command's credit is replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefillPolicy {
+    /// After the response has been recorded in the history and traced; the default.
+    #[default]
+    AfterHistory,
+    /// Immediately after the response's mandatory validation, before any history or formatting.
+    Prompt,
+}
+
+impl RefillPolicy {
+    /// Short label used in the JSON and in error text.
+    pub const fn label(self) -> &'static str {
+        match self {
+            RefillPolicy::AfterHistory => "after-history",
+            RefillPolicy::Prompt => "prompt",
+        }
+    }
+}
+
+/// The `(start, len)` batches of `depth` commands an OUT-burst run submits.
+fn burst_batches(total: usize, depth: usize) -> Vec<(usize, usize)> {
+    let depth = depth.max(1);
+    (0..total)
+        .step_by(depth)
+        .map(|start| (start, depth.min(total - start)))
+        .collect()
+}
+
 /// An open CMSIS-DAP v2 bulk probe, ready for strict-serial command submission.
 pub struct Probe {
     info: ProbeInfo,
@@ -463,9 +508,16 @@ pub struct Probe {
     history: VecDeque<XferRecord>,
     /// A response may be stranded on the probe; the next command flushes before it is sent.
     desynced: bool,
-    /// Packets the claim-time flush discarded; non-zero means a previous handle left the wire
-    /// dirty.
+    /// Packets the claim-time flush discarded; non-zero means a previous handle left the wire dirty.
     stale_on_claim: usize,
+    /// URB order for a depth-1 exchange.
+    submit_policy: SubmitPolicy,
+    /// Diagnostic: hold every batch's IN URBs back until all its OUTs have completed.
+    out_burst: bool,
+    /// When a completed pipelined command's credit is replaced.
+    refill: RefillPolicy,
+    /// Every response read's length: the DAP packet size, as other CMSIS-DAP hosts read.
+    read_len: usize,
 }
 
 impl Probe {
@@ -488,6 +540,7 @@ impl Probe {
             .endpoint::<Bulk, In>(info.in_endpoint)
             .context("failed to open bulk IN endpoint")?;
 
+        let mps = info.max_packet_size;
         let mut probe = Probe {
             info,
             _interface: interface,
@@ -498,19 +551,35 @@ impl Probe {
             history: VecDeque::with_capacity(HISTORY_LEN),
             desynced: false,
             stale_on_claim: 0,
+            submit_policy: SubmitPolicy::default(),
+            out_burst: false,
+            refill: RefillPolicy::default(),
+            read_len: response_read_len(mps, mps),
         };
 
         // A fresh claim is not a fresh wire: a leftover response would shift every match.
         if !env_flag(NO_CLAIM_FLUSH_ENV) {
             probe.stale_on_claim = probe.flush_boundary();
         }
+        let reported = probe
+            .transfer(&encode_info(InfoId::PacketSize), PACKET_SIZE_TIMEOUT)
+            .ok()
+            .and_then(|r| decode_info_packet_size(&r).ok());
+        if reported.is_none() {
+            probe.desynced = true;
+        }
+        // A probe that cannot say is taken to fit a DAP packet in one bulk packet.
+        probe.read_len =
+            response_read_len(reported.filter(|&n| n > 0).map_or(mps, usize::from), mps);
         if probe.trace >= TraceLevel::Boundary {
             eprintln!(
-                "trace: claim iface {} ep_out 0x{:02X} ep_in 0x{:02X} mps {} stale_on_claim {}",
+                "trace: claim iface {} ep_out 0x{:02X} ep_in 0x{:02X} mps {} read_len {} \
+                 stale_on_claim {}",
                 probe.info.interface_number,
                 probe.info.out_endpoint,
                 probe.info.in_endpoint,
                 probe.info.max_packet_size,
+                probe.read_len,
                 probe.stale_on_claim,
             );
         }
@@ -522,9 +591,19 @@ impl Probe {
         &self.info
     }
 
-    /// The trace level this handle read from [`TRACE_ENV`] when it was opened.
-    pub fn trace_level(&self) -> TraceLevel {
-        self.trace
+    /// Choose the depth-1 URB order; the default is [`SubmitPolicy::Lockstep`].
+    pub fn set_submit_policy(&mut self, policy: SubmitPolicy) {
+        self.submit_policy = policy;
+    }
+
+    /// Hold each batch's IN URBs until all its OUTs complete; needs a `depth`-deep response ring.
+    pub fn set_out_burst(&mut self, out_burst: bool) {
+        self.out_burst = out_burst;
+    }
+
+    /// Choose when a completed pipelined command's credit is replaced.
+    pub fn set_refill_policy(&mut self, policy: RefillPolicy) {
+        self.refill = policy;
     }
 
     /// Packets the claim-time boundary flush discarded.
@@ -537,8 +616,7 @@ impl Probe {
         self.desynced
     }
 
-    /// Record a response that did not belong to its request; decode-level mismatches are
-    /// invisible to the transport, and the next command must flush the stranded response.
+    /// Record a response that did not belong to its request; the next command flushes the wire.
     pub fn mark_desynced(&mut self) {
         self.desynced = true;
     }
@@ -554,13 +632,7 @@ impl Probe {
         Ok(discarded)
     }
 
-    /// The transfer records the handle still remembers, oldest first.
-    pub fn history(&self) -> impl Iterator<Item = &XferRecord> {
-        self.history.iter()
-    }
-
-    /// Discard packets until the IN endpoint goes quiet; a cancelled read is the success case,
-    /// and anything that does arrive answered a command this handle never sent.
+    /// Discard packets until the IN endpoint goes quiet, returning how many arrived.
     fn flush_boundary(&mut self) -> usize {
         let mps = self.info.max_packet_size.max(1);
         let mut discarded = 0;
@@ -591,8 +663,7 @@ impl Probe {
         discarded
     }
 
-    /// Bring both endpoints idle: `nusb`'s `transfer_blocking` panics if anything is pending, so
-    /// an incomplete drain must become an error here.
+    /// Bring both endpoints idle: `nusb`'s `transfer_blocking` panics if anything is pending.
     fn ensure_idle(&mut self) -> Result<()> {
         if self.out.pending() == 0 && self.in_.pending() == 0 {
             return Ok(());
@@ -653,15 +724,13 @@ impl Probe {
         eprintln!("trace: --- end window ---");
     }
 
-    /// Submit one command and read back one response. The IN read length must be a multiple of
-    /// the max packet size, and completes on the short packet that ends the response.
+    /// Submit one command and read back one response, ended by a short packet or a full buffer.
+    /// A failure after delivery marks the handle desynchronized; the next command flushes first.
     pub fn transfer(&mut self, out: &[u8], timeout: Duration) -> Result<Vec<u8>> {
-        let read_len = round_up(RESPONSE_BUFFER_HINT, self.info.max_packet_size.max(1));
-        self.serial(out, read_len, timeout)
+        self.serial(out, self.read_len, timeout)
     }
 
-    /// Submit one command and read back a known-length response, so a full-capacity response --
-    /// an exact packet multiple -- does not stall waiting for a short packet.
+    /// [`Probe::transfer`] for a response of at most `expected_len` bytes.
     pub fn transfer_expect(
         &mut self,
         out: &[u8],
@@ -674,33 +743,21 @@ impl Probe {
         if expected_len == 0 {
             bail!("expected response length must not be zero");
         }
-        let read_len = round_up(expected_len, self.info.max_packet_size.max(1));
-        self.serial(out, read_len, timeout)
+        let response = self.serial(out, self.read_len, timeout)?;
+        check_len(&response, expected_len)?;
+        Ok(response)
     }
 
-    /// One strict-serial exchange: OUT the command, IN exactly `read_len` bytes. A failure after
-    /// delivery strands the response, so the handle is marked desynchronized.
+    /// One strict-serial exchange; a failure after delivery marks the handle desynchronized.
     fn serial(&mut self, out: &[u8], read_len: usize, timeout: Duration) -> Result<Vec<u8>> {
         if out.is_empty() {
             bail!("command buffer must not be empty");
         }
         self.prepare()?;
 
-        let out_completion = self.out.transfer_blocking(Buffer::from(out), timeout);
-        if let Err(e) = out_completion.status {
-            // The command may have reached the probe: assume it did.
-            self.desynced = true;
-            return Err(anyhow!(e)).context("bulk OUT transfer failed");
-        }
-
-        let in_completion = self.in_.transfer_blocking(Buffer::new(read_len), timeout);
-        let response = match in_completion.into_result() {
-            Ok(buffer) => buffer.into_vec(),
-            Err(e) => {
-                self.desynced = true;
-                self.dump_window("a failed serial bulk IN transfer");
-                return Err(anyhow!(e)).context("bulk IN transfer failed");
-            }
+        let response = match self.submit_policy {
+            SubmitPolicy::Lockstep => self.serial_lockstep(out, read_len, timeout)?,
+            SubmitPolicy::InFirst => self.serial_in_first(out, read_len, timeout)?,
         };
 
         self.record(XferRecord {
@@ -716,8 +773,71 @@ impl Probe {
         Ok(response)
     }
 
-    /// Submit `requests` with up to `depth` pairs outstanding; CMSIS-DAP answers queued commands
-    /// FIFO, so position is the only match. `depth` must not exceed `DAP_PACKET_COUNT`.
+    /// OUT to completion, then IN.
+    fn serial_lockstep(
+        &mut self,
+        out: &[u8],
+        read_len: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        let out_completion = self.out.transfer_blocking(Buffer::from(out), timeout);
+        if let Err(e) = out_completion.status {
+            self.desynced = true;
+            return Err(anyhow!(e)).context("bulk OUT transfer failed");
+        }
+
+        let in_completion = self.in_.transfer_blocking(Buffer::new(read_len), timeout);
+        match in_completion.into_result() {
+            Ok(buffer) => Ok(buffer.into_vec()),
+            Err(e) => {
+                self.desynced = true;
+                self.dump_window("a failed serial bulk IN transfer");
+                Err(anyhow!(e)).context("bulk IN transfer failed")
+            }
+        }
+    }
+
+    /// IN posted before OUT, one command outstanding.
+    fn serial_in_first(
+        &mut self,
+        out: &[u8],
+        read_len: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        self.in_.submit(Buffer::new(read_len));
+        self.out.submit(Buffer::from(out));
+
+        let out_completion = self
+            .out
+            .wait_next_complete(timeout)
+            .ok_or_else(|| anyhow!("bulk OUT transfer timed out"));
+        let out_status = match out_completion {
+            Ok(c) => c.status.map_err(|e| anyhow!(e)),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = out_status {
+            // The command may have reached the probe, and an armed IN may still collect it.
+            self.desynced = true;
+            self.cancel_and_drain();
+            return Err(e).context("bulk OUT transfer failed");
+        }
+
+        let in_completion = self
+            .in_
+            .wait_next_complete(timeout)
+            .ok_or_else(|| anyhow!("bulk IN transfer timed out"));
+        match in_completion.and_then(|c| c.into_result().map_err(|e| anyhow!(e))) {
+            Ok(buffer) => Ok(buffer.into_vec()),
+            Err(e) => {
+                self.desynced = true;
+                self.cancel_and_drain();
+                self.dump_window("a failed serial bulk IN transfer");
+                Err(e).context("bulk IN transfer failed")
+            }
+        }
+    }
+
+    /// Submit `requests` with up to `depth` pairs outstanding, matched by FIFO position.
     pub fn submit_pipelined(
         &mut self,
         requests: &[Vec<u8>],
@@ -782,15 +902,17 @@ impl Probe {
         depth: usize,
         timeout: Duration,
     ) -> Result<Vec<Vec<u8>>> {
-        let mps = self.info.max_packet_size.max(1);
+        if self.out_burst {
+            return self.pipelined_out_burst(requests, expected_lens, depth, timeout);
+        }
+        let read_len = self.read_len;
         let total = requests.len();
         let mut responses = Vec::with_capacity(total);
         let mut submitted = 0;
 
         let submit_pair =
             |out: &mut Endpoint<Bulk, Out>, in_: &mut Endpoint<Bulk, In>, i: usize| {
-                // IN first, so a fast response always finds a receive buffer pending.
-                in_.submit(Buffer::new(round_up(expected_lens[i], mps)));
+                in_.submit(Buffer::new(read_len));
                 out.submit(Buffer::from(requests[i].as_slice()));
             };
 
@@ -800,7 +922,6 @@ impl Probe {
         }
 
         while responses.len() < total {
-            // OUT[i] always completes before response i, so this never waits on the wrong end.
             let out_completion = self
                 .out
                 .wait_next_complete(timeout)
@@ -819,6 +940,18 @@ impl Probe {
 
             let pos = responses.len();
             let response = in_completion.buffer.into_vec();
+            // The echoed command id is the cheapest proof the streams are still paired.
+            let mismatch = check_pair(requests, pos, &response);
+            let overlong = check_len(&response, expected_lens[pos]);
+            // A prompt refill replaces the credit before the history entry is built.
+            if self.refill == RefillPolicy::Prompt
+                && mismatch.is_none()
+                && overlong.is_ok()
+                && submitted < total
+            {
+                submit_pair(&mut self.out, &mut self.in_, submitted);
+                submitted += 1;
+            }
             self.record(XferRecord {
                 kind: XferKind::Pipelined,
                 batch: self.batch,
@@ -829,13 +962,13 @@ impl Probe {
                 resp_len: response.len(),
                 resp_head: head(&response),
             });
-            // The echoed command id is the cheapest proof the streams are still paired.
-            if let Some(m) = check_pair(requests, pos, &response) {
+            if let Some(m) = mismatch {
                 bail!("pipelined response/request mismatch: {m}");
             }
+            overlong?;
             responses.push(response);
 
-            if submitted < total {
+            if self.refill == RefillPolicy::AfterHistory && submitted < total {
                 submit_pair(&mut self.out, &mut self.in_, submitted);
                 submitted += 1;
             }
@@ -844,8 +977,64 @@ impl Probe {
         Ok(responses)
     }
 
-    /// Cancel and reap every outstanding transfer, reporting whether both endpoints reached
-    /// idle; a transfer left pending would turn the next serial command into a `nusb` panic.
+    /// The `--out-burst` diagnostic: per batch, complete every OUT before posting any IN.
+    fn pipelined_out_burst(
+        &mut self,
+        requests: &[Vec<u8>],
+        expected_lens: &[usize],
+        depth: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut responses = Vec::with_capacity(requests.len());
+
+        for (start, len) in burst_batches(requests.len(), depth) {
+            for request in requests.iter().skip(start).take(len) {
+                self.out.submit(Buffer::from(request.as_slice()));
+            }
+            for _ in 0..len {
+                let out_completion = self
+                    .out
+                    .wait_next_complete(timeout)
+                    .ok_or_else(|| anyhow!("bulk OUT transfer timed out"))?;
+                out_completion
+                    .status
+                    .context("pipelined bulk OUT transfer failed")?;
+            }
+
+            for _ in 0..len {
+                self.in_.submit(Buffer::new(self.read_len));
+            }
+            for pos in start..start + len {
+                let in_completion = self
+                    .in_
+                    .wait_next_complete(timeout)
+                    .ok_or_else(|| anyhow!("bulk IN transfer timed out"))?;
+                in_completion
+                    .status
+                    .context("pipelined bulk IN transfer failed")?;
+                let response = in_completion.buffer.into_vec();
+                self.record(XferRecord {
+                    kind: XferKind::Pipelined,
+                    batch: self.batch,
+                    pos,
+                    req_id: command_id(&requests[pos]),
+                    req_len: requests[pos].len(),
+                    resp_id: command_id(&response),
+                    resp_len: response.len(),
+                    resp_head: head(&response),
+                });
+                if let Some(m) = check_pair(requests, pos, &response) {
+                    bail!("pipelined response/request mismatch: {m}");
+                }
+                check_len(&response, expected_lens[pos])?;
+                responses.push(response);
+            }
+        }
+
+        Ok(responses)
+    }
+
+    /// Cancel and reap every outstanding transfer, reporting whether both endpoints reached idle.
     fn cancel_and_drain(&mut self) -> bool {
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
         /// Cancellation rounds before the endpoint is declared stuck.
@@ -869,6 +1058,22 @@ impl Probe {
         }
         idle
     }
+}
+
+/// The response read length for a `dap_packet`-byte DAP packet; `nusb` needs whole packets.
+fn response_read_len(dap_packet: usize, mps: usize) -> usize {
+    round_up(dap_packet.max(1), mps.max(1))
+}
+
+/// Fail a response longer than the `expected` bytes its command can produce.
+fn check_len(response: &[u8], expected: usize) -> Result<()> {
+    if response.len() > expected {
+        bail!(
+            "response of {} bytes exceeds the {expected} its command can produce",
+            response.len()
+        );
+    }
+    Ok(())
 }
 
 /// Round `len` up to the next multiple of `granularity`.
@@ -1001,6 +1206,44 @@ mod tests {
         assert_eq!(head(&[1, 2, 3]), vec![1, 2, 3]);
         assert_eq!(head(&[7u8; 40]).len(), TRACE_HEAD_BYTES);
         assert!(head(&[]).is_empty());
+    }
+
+    #[test]
+    fn burst_batches_cover_every_command_in_order() {
+        // The last batch is short when the total is not a multiple of the depth.
+        assert_eq!(burst_batches(10, 4), vec![(0, 4), (4, 4), (8, 2)]);
+        assert_eq!(burst_batches(8, 4), vec![(0, 4), (4, 4)]);
+        assert_eq!(burst_batches(3, 4), vec![(0, 3)]);
+        assert_eq!(burst_batches(0, 4), vec![]);
+        // A zero depth would loop forever; it is treated as one.
+        assert_eq!(burst_batches(2, 0), vec![(0, 1), (1, 1)]);
+        let batches = burst_batches(76, 4);
+        assert_eq!(batches.iter().map(|&(_, n)| n).sum::<usize>(), 76);
+        assert!(batches.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0));
+    }
+
+    #[test]
+    fn policy_labels_match_the_flag_values() {
+        assert_eq!(SubmitPolicy::default().label(), "lockstep");
+        assert_eq!(SubmitPolicy::InFirst.label(), "in-first");
+        assert_eq!(RefillPolicy::default().label(), "after-history");
+        assert_eq!(RefillPolicy::Prompt.label(), "prompt");
+    }
+
+    #[test]
+    fn responses_are_read_into_a_whole_dap_packet() {
+        assert_eq!(response_read_len(512, 64), 512);
+        assert_eq!(response_read_len(64, 64), 64);
+        assert_eq!(response_read_len(1024, 512), 1024);
+        assert_eq!(response_read_len(100, 64), 128);
+        assert_eq!(response_read_len(0, 64), 64);
+    }
+
+    #[test]
+    fn a_response_may_be_shorter_than_expected_but_not_longer() {
+        assert!(check_len(&[0; 4], 4).is_ok());
+        assert!(check_len(&[0; 3], 4).is_ok());
+        assert!(check_len(&[0; 5], 4).is_err());
     }
 
     #[test]

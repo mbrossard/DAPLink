@@ -1,8 +1,7 @@
-//! Fault handlers that record a reason in the [`ResetStamp`](crate::stamp::ResetStamp) and reset
-//! the probe, rather than stopping it off the bus.
+//! Single-core terminal fault handlers with bounded retained recording.
 
-/// Compose the panic and hard-fault handlers once, at a firmware's crate root, and only where it
-/// links no other panic handler. `with_location` keeps every panic site's path string in the image.
+/// Compose the panic and hard-fault handlers once, at the crate root; `with_location` keeps paths.
+/// The invoking crate must depend on `cortex-m` and `cortex-m-rt`.
 #[macro_export]
 macro_rules! fault_reset_handlers {
     (with_location) => {
@@ -36,9 +35,10 @@ macro_rules! __fault_reset_handlers {
 
         #[panic_handler]
         fn __daplink_panic($info: &::core::panic::PanicInfo) -> ! {
-            // Never the message: rendering it needs the core formatting machinery.
+            ::cortex_m::interrupt::disable();
             let location = $location;
-            if $crate::stamp::latch_panic(location).resets() {
+            // SAFETY: the single-core handler never resumes interrupted code.
+            if unsafe { $crate::stamp::terminal_panic(location) }.resets() {
                 ::cortex_m::peripheral::SCB::sys_reset()
             }
             __daplink_fault_halt()
@@ -46,8 +46,9 @@ macro_rules! __fault_reset_handlers {
 
         #[::cortex_m_rt::exception]
         unsafe fn HardFault(frame: &::cortex_m_rt::ExceptionFrame) -> ! {
-            // The stacked program counter is the whole record, resolved against the image's ELF.
-            if $crate::stamp::latch_hard_fault(frame.pc()).resets() {
+            ::cortex_m::interrupt::disable();
+            // SAFETY: the single-core handler never resumes interrupted code.
+            if unsafe { $crate::stamp::terminal_hard_fault(frame.pc()) }.resets() {
                 ::cortex_m::peripheral::SCB::sys_reset()
             }
             __daplink_fault_halt()

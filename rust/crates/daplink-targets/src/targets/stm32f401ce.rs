@@ -9,8 +9,7 @@ use crate::{FlashRegion, RamRegion, SectorInfo, Target};
 /// Official Microsoft UF2 family id for the STM32F4 family (`uf2families.json`, "ST STM32F401").
 pub const STM32F4_UF2_FAMILY: u32 = 0x5775_5A57;
 
-/// Identity probe: `DBGMCU_IDCODE` at `0xE004_2000` (RM0368 8.6.1). The mask is deliberately
-/// `0x0FFD`, clearing `DEV_ID` bit 1 so both F401xD/xE (`0x433`) and F411 (`0x431`) pass.
+/// Identity: `DBGMCU_IDCODE`, masked so F401xD/xE (`0x433`) and F411 (`0x431`) both pass.
 pub static IDENTITY_PROBES: [IdentityProbe; 1] =
     [IdentityProbe::new(0xE004_2000, 0x0000_0FFD, 0x0000_0431)];
 
@@ -19,7 +18,6 @@ pub static FLASH_REGIONS: [FlashRegion<'static>; 1] = [FlashRegion {
     start: 0x0800_0000,
     end: 0x0808_0000,
     is_default: true,
-    is_secure: false,
     algo: &STM32F4_ALGO,
 }];
 
@@ -29,8 +27,7 @@ pub static RAM_REGIONS: [RamRegion; 1] = [RamRegion {
     end: 0x2001_8000,
 }];
 
-/// Sector layout, one entry per uniform sector group. The F4 map is non-uniform: four 16 KiB
-/// sectors, then one 64 KiB sector, then three 128 KiB sectors -- 512 KiB in eight sectors.
+/// F4 sector map: four 16 KiB, one 64 KiB, then three 128 KiB sectors.
 pub static SECTORS: [SectorInfo; 3] = [
     SectorInfo {
         start: 0x0800_0000,
@@ -50,7 +47,7 @@ pub static SECTORS: [SectorInfo; 3] = [
 ];
 
 /// Page-staging scratch size: the algorithm's 1 KiB program buffer, not the 16 KiB erase unit.
-pub const PROGRAM_BUFFER_SIZE: usize = 0x400;
+pub const PROGRAM_BUFFER_SIZE: usize = STM32F4_ALGO.program_buffer_size as usize;
 
 /// The target description type for this device.
 #[derive(Clone, Copy, Debug, Default)]

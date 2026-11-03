@@ -2,25 +2,18 @@
 
 use crate::error::Error;
 
-/// Sink for decoded image fragments. The consumer (a virtual-FS transfer engine, tests)
-/// implements this; a decoder calls `write_fragment` with an absolute target address and the
-/// bytes to place there.
+/// Receives decoded image fragments at absolute target addresses.
 pub trait DecoderContext {
-    /// Place `data` at absolute address `addr`.
+    /// Place `data` at `addr`; an error stops the decoder, leaving earlier fragments placed.
     fn write_fragment(&mut self, addr: u32, data: &[u8]) -> Result<(), Error>;
 
-    /// Report the UF2 family id of the block about to be written, or `None` when the block
-    /// declares no family. The UF2 decoder calls this once per block, immediately before the
-    /// block's [`write_fragment`](Self::write_fragment), so a consumer can cross-check the
-    /// family against a target before accepting the bytes. The default is a no-op; formats
-    /// without a family concept (raw binary, Intel-hex) never call it.
-    fn set_uf2_family(&mut self, _family: Option<u32>) {}
+    /// Report each parsed UF2 block's family, `None` when undeclared; `false` disregards the block.
+    fn set_uf2_family(&mut self, _family: Option<u32>) -> bool {
+        true
+    }
 }
 
-/// A streaming image decoder. The caller feeds arbitrary `data` chunks and supplies a
-/// caller-owned `scratchpad` used to re-assemble records/blocks that span chunk boundaries; the
-/// scratchpad's contents MUST persist across `input` calls for a given decoder instance. Decoded
-/// output is delivered through `context`.
+/// A streaming image decoder; preserve its scratchpad contents across input calls.
 pub trait Decoder {
     /// Consume the next `data` chunk.
     fn input(

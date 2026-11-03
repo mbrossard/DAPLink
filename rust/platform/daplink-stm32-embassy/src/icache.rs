@@ -1,8 +1,8 @@
-//! Instruction-cache bring-up (ART ICACHE), and the H5 MPU region its enable depends on.
+//! Instruction-cache bring-up, and the H5 MPU region its enable depends on.
 
 use cortex_m::asm::{dsb, isb};
 
-/// The factory OTP + read-only flash window: one 4 KiB region.
+/// The factory OTP and read-only flash window.
 const FACTORY_RO_BASE: u32 = 0x08FF_F000;
 const FACTORY_RO_LAST: u32 = 0x08FF_FFFF;
 
@@ -11,19 +11,18 @@ const _: () = assert!(
     "ARMv8-M MPU regions are 32-byte granular"
 );
 
-/// MPU region and MAIR attribute index used for the factory window; nothing else programs the MPU.
+/// MPU region and MAIR index for the factory window; nothing else programs the MPU.
 const FACTORY_RO_REGION: u32 = 0;
 const FACTORY_RO_ATTR_INDEX: u32 = 0;
 
 /// `MAIR` byte: Normal memory, outer and inner non-cacheable.
 const MAIR_NORMAL_NON_CACHEABLE: u32 = 0x44;
-/// `MPU_RBAR.AP` = read-only at any privilege level (the window is factory read-only anyway).
+/// `MPU_RBAR.AP`: read-only at any privilege level.
 const RBAR_AP_READ_ONLY: u32 = 0b11 << 1;
-/// `MPU_RBAR.XN`: nothing is ever fetched from the factory window.
 const RBAR_XN: u32 = 0x1;
 const RLAR_ENABLE: u32 = 0x1;
 const MPU_CTRL_ENABLE: u32 = 0x1;
-/// `MPU_CTRL.PRIVDEFENA`: keep the default memory map in force outside the programmed region.
+/// `MPU_CTRL.PRIVDEFENA`: the default memory map outside programmed regions.
 const MPU_CTRL_PRIVDEFENA: u32 = 0x4;
 
 // Raw addresses: the typed cortex-m block compiles these fields only for ARMv8-M.
@@ -33,38 +32,32 @@ const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
 const MPU_RLAR: *mut u32 = 0xE000_EDA0 as *mut u32;
 const MPU_MAIR0: *mut u32 = 0xE000_EDC0 as *mut u32;
 
-/// Iterations of the `ICACHE_SR.BUSYF` poll before the enable gives up waiting.
 const BUSYF_POLL_LIMIT: u32 = 100_000;
 
-// The ICACHE block sits at the same address on every part served here.
 const ICACHE_CR: *mut u32 = 0x4003_0400 as *mut u32;
 const ICACHE_SR: *const u32 = 0x4003_0404 as *const u32;
-/// `ICACHE_CR.EN`.
 const CR_EN: u32 = 0x1;
-/// `ICACHE_SR.BUSYF`; bit 1 is `BSYENDF`, which latches on completion and never clears itself.
+/// `ICACHE_SR.BUSYF`; `BSYENDF` (bit 1) latches and never clears itself.
 const SR_BUSYF: u32 = 0x1;
 
-/// Outcome of [`enable_instruction_cache`], reported so a cache that fails to come up is visible.
+/// Outcome of [`enable_instruction_cache`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum IcacheEnable {
-    /// Any pending invalidation finished within the budget and `CR.EN` read back set.
+    /// Invalidation finished and `CR.EN` read back set.
     Enabled,
-    /// The `BUSYF` poll timed out; `EN` was set anyway (enabling while busy is not an error).
+    /// The `BUSYF` poll timed out; `EN` was set anyway.
     BusyTimeout {
-        /// Last `ICACHE_SR` sampled by the poll.
+        /// Last `ICACHE_SR` sampled.
         sr: u32,
     },
-    /// `CR.EN` did not read back as set after the write.
     NotEnabled {
-        /// `ICACHE_CR` as read back after the enabling write.
+        /// `ICACHE_CR` as read back.
         cr: u32,
     },
 }
 
-#[allow(dead_code)]
 impl IcacheEnable {
-    /// A short static description, for a firmware's bring-up log.
+    /// A short description for a bring-up log.
     pub fn describe(&self) -> &'static str {
         match self {
             IcacheEnable::Enabled => "enabled",
@@ -73,7 +66,7 @@ impl IcacheEnable {
         }
     }
 
-    /// The register word that explains the outcome; zero when there is nothing to explain.
+    /// The register word explaining the outcome; zero for `Enabled`.
     pub fn detail(&self) -> u32 {
         match *self {
             IcacheEnable::Enabled => 0,
@@ -83,12 +76,9 @@ impl IcacheEnable {
     }
 }
 
-/// Mark the factory read-only window non-cacheable and enable the MPU, default map retained.
-/// Call before [`enable_instruction_cache`] and before any access to that window.
+/// Mark the factory window non-cacheable and enable the MPU; call before touching that window.
 pub fn configure_factory_ro_region() {
-    // RBAR: BASE[31:5] | SH[4:3] (non-shareable, 0) | AP[2:1] | XN[0].
     let rbar = (FACTORY_RO_BASE & !0x1F) | RBAR_AP_READ_ONLY | RBAR_XN;
-    // RLAR: LIMIT[31:5] (the region's LAST byte) | AttrIndx[3:1] | EN[0].
     let rlar = (FACTORY_RO_LAST & !0x1F) | (FACTORY_RO_ATTR_INDEX << 1) | RLAR_ENABLE;
 
     // SAFETY: architectural MPU addresses, programmed with the MPU off before any task exists.
@@ -107,8 +97,7 @@ pub fn configure_factory_ro_region() {
     isb();
 }
 
-/// Enable the instruction cache, waiting out (bounded) the reset-launched invalidation. Call
-/// after `embassy_stm32::init`, and on the H5 after [`configure_factory_ro_region`].
+/// Enable the instruction cache; on the H5, call after [`configure_factory_ro_region`].
 #[must_use]
 pub fn enable_instruction_cache() -> IcacheEnable {
     let mut spins = 0u32;
@@ -117,7 +106,7 @@ pub fn enable_instruction_cache() -> IcacheEnable {
         spins += 1;
         if spins >= BUSYF_POLL_LIMIT {
             let sr = unsafe { core::ptr::read_volatile(ICACHE_SR) };
-            // Enabling during an invalidation is not an error; spinning forever is a dead board.
+            // Enabling during an invalidation is not an error; spinning forever would be.
             unsafe {
                 let cr = core::ptr::read_volatile(ICACHE_CR);
                 core::ptr::write_volatile(ICACHE_CR, cr | CR_EN);

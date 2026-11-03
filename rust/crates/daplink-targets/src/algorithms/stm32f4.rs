@@ -1,4 +1,5 @@
 //! Generated from Keil.STM32F4xx_DFP@3.1.1 `STM32F4xx_512.FLM`, 512 KiB only. Do not edit by hand.
+// License and notice: README.md in this directory.
 
 use crate::{FlashAlgorithm, SyscallParams};
 

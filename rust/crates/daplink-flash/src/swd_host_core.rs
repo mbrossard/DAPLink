@@ -5,8 +5,8 @@ use core::marker::PhantomData;
 use dap_rs::swd::{APnDP, DPRegister, Swd};
 
 use crate::error::Error;
-use crate::reset::ResetControl;
 use crate::target::{ApAddressing, DebugPort, DpWake};
+use crate::ResetControl;
 
 /// Number of WAIT retries handed to the `dap-rs` transfer helpers.
 const WAIT_RETRIES: usize = 100;
@@ -16,8 +16,8 @@ pub(crate) const CSYSPWRUPREQ: u32 = 1 << 30;
 pub(crate) const CDBGPWRUPREQ: u32 = 1 << 28;
 pub(crate) const CSYSPWRUPACK: u32 = 1 << 31;
 pub(crate) const CDBGPWRUPACK: u32 = 1 << 29;
-/// ABORT register: clear all sticky error flags.
-pub(crate) const ABORT_CLEAR_ALL: u32 = 0x1E;
+/// ABORT register: clear the sticky error flags; STKCMPCLR stays 0, UNPREDICTABLE on a MINDP DP.
+pub(crate) const ABORT_CLEAR_ALL: u32 = 0x1C;
 /// ABORT register: `DAPABORT`; an AP transaction that never completed answers WAIT until this runs.
 pub(crate) const ABORT_DAP: u32 = 0x01;
 
@@ -38,12 +38,13 @@ pub(crate) const C_DEBUGEN: u32 = 1 << 0;
 pub(crate) const C_HALT: u32 = 1 << 1;
 pub(crate) const S_REGRDY: u32 = 1 << 16;
 pub(crate) const S_HALT: u32 = 1 << 17;
+pub(crate) const S_LOCKUP: u32 = 1 << 19;
 
 pub(crate) const DEMCR: u32 = 0xE000_EDFC;
 /// Halt the core on reset (reset vector catch).
 pub(crate) const VC_CORERESET: u32 = 1 << 0;
-/// Trace/debug enable; left set while a session is active.
-pub(crate) const TRCENA: u32 = 1 << 24;
+/// Halt on a HardFault, so an algorithm fault never runs the application's handler.
+pub(crate) const VC_HARDERR: u32 = 1 << 10;
 
 /// Poll budget for register-ready waits.
 pub(crate) const REGRDY_POLLS: u32 = 10_000;
@@ -56,13 +57,11 @@ pub(crate) const SWD_TO_DORMANT: [u8; 4] = [0xBA, 0xBB, 0xBB, 0x33];
 /// 4 idle cycles + 8-bit SWD activation code `0x1A`, sent after the selection alert.
 pub(crate) const SWD_ACTIVATION: u16 = 0x1A0;
 
-/// Multidrop selection verify masks: `TARGETID` carries the low 28 bits of `TARGETSEL`,
-/// `DLPIDR` carries the top nibble (target instance).
+/// Multidrop verify masks: `TARGETID` holds `TARGETSEL`'s low 28 bits, `DLPIDR` its top nibble.
 pub(crate) const TARGETID_MASK: u32 = 0x0FFF_FFFF;
 pub(crate) const DLPIDR_MASK: u32 = 0xF000_0000;
 
-/// Dormant-state exit preamble for a DP that powers up dormant (ADIv6): line reset, forced
-/// dormant entry, selection alert, then SWD activation.
+/// Dormant exit for an ADIv6 DP: line reset, forced dormant entry, selection alert, activation.
 pub fn swd_dormant_wake_preamble<S, DEPS>(swd: &mut S) -> dap_rs::swd::Result<()>
 where
     S: Swd<DEPS>,
@@ -77,6 +76,9 @@ where
     swd.write_sequence(12, &SWD_ACTIVATION.to_le_bytes())?;
     Ok(())
 }
+
+/// Fixed wire rate for bring-up and the flash session; the engine clamps what it cannot reach.
+pub(crate) const BRINGUP_HZ: u32 = 25_000_000;
 
 /// SWD wake preamble: line reset, JTAG-to-SWD switch, second line reset, idle cycles.
 pub fn swd_wake_preamble<S, DEPS>(swd: &mut S) -> dap_rs::swd::Result<()>
@@ -93,8 +95,7 @@ where
     Ok(())
 }
 
-/// Map an AP-register byte offset to the 2-bit transfer address `A[3:2]` encoded as a
-/// [`DPRegister`]: `0x00 -> DPIDR`, `0x04 -> CTRLSTAT`, `0x08 -> SELECT`, `0x0C -> RDBUFF`.
+/// Map an AP-register byte offset to the [`DPRegister`] carrying the same `A[3:2]`.
 fn ap_transfer_reg(addr: u8) -> DPRegister {
     match (addr >> 2) & 0x3 {
         0 => DPRegister::DPIDR,
@@ -104,8 +105,7 @@ fn ap_transfer_reg(addr: u8) -> DPRegister {
     }
 }
 
-/// Whether a failed transfer is worth one sticky-error recovery attempt (FAULT/NoAck/protocol
-/// error, not a parity error or exhausted WAIT budget).
+/// Whether a failed transfer merits one sticky-error recovery (not parity or exhausted WAIT).
 fn recoverable(err: dap_rs::swd::Error) -> bool {
     use dap_rs::swd::Error as E;
     matches!(err, E::AckFault | E::NoAck | E::AckProtocol)
@@ -170,8 +170,7 @@ where
         self.abort_transaction();
     }
 
-    /// Cancel an outstanding access-port transaction and acknowledge the flags a failed one
-    /// latched: `DAPABORT`, then `ABORT_CLEAR_ALL`. Neither substitutes for the other.
+    /// Cancel an outstanding AP transaction: `DAPABORT`, then `ABORT_CLEAR_ALL`; both are needed.
     pub(crate) fn abort_transaction(&mut self) {
         let _ = self
             .swd
@@ -182,8 +181,7 @@ where
         self.csw = None;
     }
 
-    /// Read a word during target detection, where a failure is ordinary traffic: one recovered
-    /// retry via [`detect_abort`](Self::detect_abort), and the port is left usable either way.
+    /// Retry a failed detection read after best-effort abort; failed recovery is not a usable-port proof.
     pub(crate) fn detect_read_word(&mut self, addr: u32) -> Result<u32, Error> {
         match self.read_word(addr) {
             Ok(value) => Ok(value),
@@ -222,8 +220,7 @@ where
         self.transfer_with_recovery(false, |swd, retries| swd.write_dp(retries, reg, value))
     }
 
-    /// Run one transfer, retrying it once after sticky-error recovery if it faults. A failed
-    /// recovery or retry surfaces the original error.
+    /// Run one transfer, retried once after sticky-error recovery; failure reports the original error.
     fn transfer_with_recovery<T>(
         &mut self,
         ap_mem: bool,
@@ -242,8 +239,7 @@ where
         }
     }
 
-    /// Clear the latched sticky flags and re-arm the transfer context: ABORT, re-issue cached
-    /// SELECT, and -- for an AP memory access -- the cached CSW.
+    /// Clear sticky flags and re-issue the cached SELECT and, for memory access, CSW.
     fn recover_sticky(&mut self, ap_mem: bool) -> dap_rs::swd::Result<()> {
         self.swd
             .write_dp(self.wait_retries, DPRegister::DPIDR, ABORT_CLEAR_ALL)?;
@@ -261,8 +257,7 @@ where
         Ok(())
     }
 
-    /// Ensure SELECT addresses the target AP's CSW/TAR/DRW register window (ADIv5: `APSEL` in
-    /// `SELECT[31:24]`; ADIv6: AP base in `SELECT[31:4]` relocated to the 0xD00 page).
+    /// Ensure SELECT addresses the target AP's CSW/TAR/DRW window (ADIv6: the 0xD00 page).
     fn ensure_select(&mut self) -> Result<(), Error> {
         let want = match self.dp.ap {
             ApAddressing::V5 => self.apsel << 24,
@@ -291,8 +286,7 @@ where
         })
     }
 
-    /// Read a raw AP register at `apsel`/byte-offset `addr`, bypassing the memory-AP `SELECT`
-    /// caching so a vendor access port (e.g. Nordic CTRL-AP) can be reached directly.
+    /// Read a raw AP register, bypassing the cached memory-AP `SELECT`.
     pub(crate) fn ap_read_raw(&mut self, apsel: u8, addr: u8) -> Result<u32, Error> {
         let select = (u32::from(apsel) << 24) | (u32::from(addr) & 0xF0);
         self.write_dp(DPRegister::SELECT, select)?;
@@ -367,8 +361,7 @@ where
         })
     }
 
-    /// Read `words` words from `addr`, handing each `(address, value)` to `sink` as it arrives;
-    /// `sink` returns `false` to stop early.
+    /// Read `words` words from `addr` into `sink`, which returns `false` to stop early.
     pub(crate) fn read_words(
         &mut self,
         addr: u32,
@@ -393,8 +386,7 @@ where
         Ok(())
     }
 
-    /// The pipelined block read behind [`read_words`](Self::read_words); failure is left for
-    /// that caller to recover from.
+    /// The pipelined block read behind [`read_words`](Self::read_words); the caller recovers.
     fn read_words_posted(
         &mut self,
         addr: u32,
@@ -427,8 +419,7 @@ where
         Ok(())
     }
 
-    /// Post one DRW read; no single-transfer sticky recovery, since retrying inside a pipeline
-    /// would deliver a different word and leave TAR ahead of the caller's count.
+    /// Post one DRW read; no per-transfer recovery, since a retry would desync the pipeline.
     fn posted_read(&mut self) -> Result<u32, Error> {
         self.swd
             .read(self.wait_retries, APnDP::AP, DPRegister::RDBUFF)
@@ -508,8 +499,7 @@ where
         Ok(())
     }
 
-    /// Emit a line reset then the `TARGETSEL` write for `targetsel`; no target drives the
-    /// acknowledge phase, but SWDIO must still be released across that window.
+    /// Line reset then an unacknowledged `TARGETSEL` write, with SWDIO released for the ACK window.
     fn write_targetsel(&mut self, targetsel: u32) -> Result<(), Error> {
         // 51 cycles high then 3 low: without the low cycles the DP stays in the reset state.
         self.wire_seq(54, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x07])?;
@@ -520,8 +510,7 @@ where
         Ok(())
     }
 
-    /// Confirm the selected DP matches `targetsel` by reading `TARGETID` (DP bank 2) and
-    /// `DLPIDR` (DP bank 3). Leaves `SELECT` invalidated.
+    /// Confirm the selected DP matches `targetsel` via `TARGETID` and `DLPIDR`; invalidates `SELECT`.
     fn verify_targetsel(&mut self, targetsel: u32) -> Result<(), Error> {
         self.write_dp(DPRegister::SELECT, 2)?;
         let target_id = self.read_dp(DPRegister::CTRLSTAT)?;
@@ -543,14 +532,13 @@ where
         Ok(())
     }
 
-    /// Perform the SWD line reset / JTAG-to-SWD switch, read DPIDR, power up the debug
-    /// domains and clear sticky errors.
+    /// Wake the DP, read DPIDR, power up the debug domains and clear sticky errors.
     pub(crate) fn init_debug(&mut self) -> Result<(), Error> {
         self.select = None;
         self.csw = None;
 
         // Fixed rate for bring-up keeps multidrop TARGETSEL direction flips predictable.
-        self.swd.set_clock(10_000_000);
+        self.swd.set_clock(BRINGUP_HZ);
 
         #[cfg(feature = "defmt")]
         defmt::info!(
@@ -611,7 +599,16 @@ where
             return Err(Error::PowerUpTimeout);
         }
 
+        #[cfg(feature = "defmt")]
+        self.log_core_debug_state("attached");
+
         Ok(())
+    }
+
+    /// Log DEMCR at `stage`; DHCSR is left to the halt poll, as its reset and retire bits clear on read.
+    #[cfg(feature = "defmt")]
+    pub(crate) fn log_core_debug_state(&mut self, stage: &str) {
+        crate::debug_status::log_demcr(stage, self.read_word(DEMCR).unwrap_or(u32::MAX));
     }
 
     /// Read the debug port's own CTRL/STAT register, for diagnostics.
@@ -621,9 +618,10 @@ where
         self.read_dp(DPRegister::CTRLSTAT)
     }
 
-    /// Ask the core to halt (set C_HALT | C_DEBUGEN via DHCSR) and return without waiting; the
-    /// caller must poll DHCSR for `S_HALT` (needs a delay source, so belongs to `SwdHost`).
+    /// Request a halt via DHCSR without waiting; the caller polls `S_HALT`.
     pub(crate) fn request_halt(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "defmt")]
+        self.log_core_debug_state("pre-halt");
         self.write_word(DHCSR, DBGKEY | C_HALT | C_DEBUGEN)
     }
 

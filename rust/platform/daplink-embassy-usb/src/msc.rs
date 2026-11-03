@@ -1,15 +1,17 @@
 //! USB mass-storage (Bulk-Only Transport) class over the virtual volume.
 
-use daplink_rs::daplink_core::msc_proto::{parse_cbw, Sense, CBW_LEN, SENSE_NONE};
+use daplink_rs::daplink_core::msc_proto::{parse_cbw, Sense, CBW_LEN, OP_WRITE_10, SENSE_NONE};
 use daplink_rs::daplink_core::{
     NoUsbReconnect, UsbReconnect, MSC_BULK_ONLY_RESET, MSC_GET_MAX_LUN, MSC_INTERFACE_CLASS,
     MSC_SECTOR_SIZE,
 };
-use daplink_vfs::msc_bot::{run_command, BulkIn, BulkOut, MsClock};
-use daplink_vfs::{DirectIo, SectorIo, TransferSink, Vfs, VfsObserver};
+use daplink_vfs::msc_bot::{run_command, BulkIn, BulkOut, DeadlineSleep, MsClock};
+use daplink_vfs::{DirectIo, SectorIo, SectorPoll, TransferSink, Vfs, VfsObserver};
 use embassy_futures::select::{select, select3, Either, Either3};
+use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::Instant;
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::{Driver, Endpoint, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, Handler};
@@ -17,7 +19,6 @@ use embassy_usb::{Builder, Handler};
 /// A host-issued Bulk-Only Reset, raised on the control endpoint and consumed by the class task.
 pub type BotReset = Signal<CriticalSectionRawMutex, ()>;
 
-/// Greatest common divisor, reducing the tick-rate fraction below at compile time.
 const fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 {
         a
@@ -26,8 +27,7 @@ const fn gcd(a: u64, b: u64) -> u64 {
     }
 }
 
-/// Milliseconds per embassy tick, as the reduced fraction `MS_NUM`/`MS_DEN` of `1000 / TICK_HZ`:
-/// a ticks-per-millisecond integer cannot express every tick rate (32_768 gives 32.768).
+/// Milliseconds per embassy tick as the reduced fraction `MS_NUM`/`MS_DEN`.
 const MS_NUM: u32 = (1000 / gcd(1000, embassy_time::TICK_HZ)) as u32;
 /// Denominator of the [`MS_NUM`] fraction, and the unit of the clock's carried remainder.
 const MS_DEN: u32 = (embassy_time::TICK_HZ / gcd(1000, embassy_time::TICK_HZ)) as u32;
@@ -37,12 +37,20 @@ const _: () = assert!(embassy_time::TICK_HZ / gcd(1000, embassy_time::TICK_HZ) <
 // The fraction must be exactly 1000/TICK_HZ, cross-multiplied so no division rounds here.
 const _: () = assert!(MS_NUM as u64 * embassy_time::TICK_HZ == MS_DEN as u64 * 1000);
 
-/// Time off the bus for a forced re-enumeration: long enough that every host unmounts the volume.
+/// Requested off-bus interval for forced re-enumeration; host unmount is not observed here.
 const USB_RECONNECT_DETACH_MS: u64 = 500;
 
-/// Newtype so the bulk-transport traits can be implemented over the driver's endpoints. A pending
-/// reset resolves the transfer as an error, which ends the command at that packet boundary without
-/// a CSW; it is polled before the endpoint, so a packet already buffered cannot outrun it.
+/// Sleeps a parked sector write to the backend's deadline, yielding the executor.
+struct TimerSleep;
+
+impl DeadlineSleep for TimerSleep {
+    async fn sleep_until_us(&mut self, wake_us: u64) {
+        // A deadline already past fires at once; the caller only sleeps genuine future waits.
+        embassy_time::Timer::at(Instant::from_micros(wake_us)).await;
+    }
+}
+
+/// Newtype over the driver's endpoints; a pending reset, polled first, ends the transfer.
 struct In<'e, E: EndpointIn> {
     ep: &'e mut E,
     reset: &'e BotReset,
@@ -86,8 +94,7 @@ pub struct MscControlHandler<'d> {
 }
 
 impl<'d> MscControlHandler<'d> {
-    /// Create the handler over the signal the class task observes; the interface number is filled
-    /// in at registration time.
+    /// Create the handler over the class task's reset signal; the interface is set at registration.
     pub const fn new(reset: &'d BotReset) -> Self {
         Self { iface: None, reset }
     }
@@ -113,8 +120,7 @@ impl Handler for MscControlHandler<'_> {
 
     fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
         if self.is_for_us(&req) && req.request == MSC_BULK_ONLY_RESET {
-            // Every byte of transport state lives in the class task, so the reset is signalled to
-            // it rather than applied here. Endpoint toggles stay the host's to clear.
+            // Transport state lives in the class task, so the reset is signalled to it.
             self.reset.signal(());
             Some(OutResponse::Accepted)
         } else {
@@ -160,8 +166,7 @@ where
     msc_task_with_reconnect(eps, vfs, NoUsbReconnect).await
 }
 
-/// [`msc_task`] with a hardware [`UsbReconnect`]: each remount also forces a detach/reattach, for
-/// hosts that never poll TEST UNIT READY on a mounted volume. This owns the detach timing.
+/// Forever MSC task owning requested USB detach/reattach; cancellation can leave USB detached.
 pub async fn msc_task_with_reconnect<'d, D, S, O, R, const EP: usize>(
     eps: &mut MscEndpoints<'d, D, EP>,
     vfs: &mut Vfs<'_, S, O>,
@@ -175,14 +180,26 @@ where
 {
     let reset = eps.reset;
     let mut clock = MsClock::new(embassy_time::Instant::now().as_ticks());
+    let mut sleeper = TimerSleep;
     let mut sense: Sense = SENSE_NONE;
     let mut ua_pending = false;
+    let mut ejected = false;
     let mut sector = [0u8; MSC_SECTOR_SIZE];
     let mut cbw_buf = [0u8; EP];
     loop {
         vfs.tick(clock.advance_to::<MS_NUM, MS_DEN>(embassy_time::Instant::now().as_ticks()));
+        // Pump the teardown `tick` deferred, sleeping to each deadline.
+        while vfs.sink_mut().advance(Instant::now().as_micros()) == SectorPoll::Pending {
+            match vfs.sink().deferred_wake_us() {
+                Some(wake) => embassy_time::Timer::at(Instant::from_micros(wake)).await,
+                None => yield_now().await,
+            }
+        }
         // Latch a media-changed remount edge; it persists until a TEST UNIT READY reports it.
-        ua_pending |= DirectIo::new(vfs).media_changed();
+        if DirectIo::new(vfs).media_changed() {
+            ua_pending = true;
+            ejected = false;
+        }
         if vfs.take_needs_reconnect() {
             reconnect.detach();
             embassy_time::Timer::after_millis(USB_RECONNECT_DETACH_MS).await;
@@ -196,13 +213,17 @@ where
         )
         .await
         {
-            // Between commands a reset has nothing to abandon, but it must still be consumed here
-            // or the next command would be cut short by it.
+            // A reset between commands abandons nothing but must still be consumed here.
             Either3::First(()) => continue,
             Either3::Second(Ok(n)) => n,
-            // The endpoint errors whenever the interface is down: park until the host re-enables it.
+            // The endpoint errors whenever the interface is down; `vfs.tick` keeps running meanwhile.
             Either3::Second(Err(_)) => {
-                eps.ep_out.wait_enabled().await;
+                ejected = false;
+                select(
+                    eps.ep_out.wait_enabled(),
+                    embassy_time::Timer::after_millis(100),
+                )
+                .await;
                 continue;
             }
             // Idle tick: loop back so `vfs.tick` advances the remount/timeout cycle.
@@ -218,8 +239,8 @@ where
         let Some(cbw) = parsed else {
             continue;
         };
-        let mut io = DirectIo::new(vfs);
-        run_command::<_, _, _, EP>(
+        let mut io = DirectIo::with_clock(vfs, || Instant::now().as_micros());
+        run_command::<_, _, _, _, EP>(
             &mut In {
                 ep: &mut eps.ep_in,
                 reset,
@@ -229,17 +250,23 @@ where
                 reset,
             },
             &mut io,
+            &mut sleeper,
             &mut sector,
             &mut sense,
             &mut ua_pending,
+            &mut ejected,
             &cbw,
         )
         .await;
+        // A WRITE's own duration, stalls included, is not host idleness.
+        if cbw.cb[0] == OP_WRITE_10 {
+            let _ = clock.advance_to::<MS_NUM, MS_DEN>(embassy_time::Instant::now().as_ticks());
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use core::cell::RefCell;
     use core::future::Future;
@@ -267,7 +294,7 @@ mod tests {
     const EP_CHUNK: usize = 64;
 
     /// The mock time driver is one process-wide clock, so the tests that advance it take turns.
-    fn clock_guard() -> MutexGuard<'static, ()> {
+    pub(crate) fn clock_guard() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -283,8 +310,7 @@ mod tests {
         }
     }
 
-    /// Poll the never-returning class task `polls` times, advancing the clock between polls. One
-    /// poll runs the loop until something is genuinely pending, so a parked read ends it.
+    /// Poll the never-returning class task `polls` times, advancing the clock between polls.
     fn drive<F: Future>(f: F, polls: usize, step_ms: u64) {
         let mut cx = Context::from_waker(Waker::noop());
         let mut f = pin!(f);
@@ -298,7 +324,6 @@ mod tests {
 
     /// One scripted host-to-device event on the bulk OUT endpoint.
     enum OutStep {
-        /// A packet the host sends.
         Packet(Vec<u8>),
         /// A read that fails the way a disabled interface fails one.
         Disabled,
@@ -308,13 +333,11 @@ mod tests {
         Park,
     }
 
-    /// Shorthand for a scripted host packet.
     fn pkt(bytes: &[u8]) -> OutStep {
         OutStep::Packet(bytes.to_vec())
     }
 
-    /// Delivers scripted host-to-device packets, raising `reset` once `reset_after` are consumed.
-    /// A script that runs out reads as a torn-down interface, the way a disabled endpoint does.
+    /// Scripted OUT packets, raising `reset` after `reset_after`; running out reads as disabled.
     struct MockOut<'a> {
         info: EndpointInfo,
         steps: Vec<OutStep>,
@@ -344,6 +367,9 @@ mod tests {
         }
         async fn wait_enabled(&mut self) {
             self.enables += 1;
+            if matches!(self.steps.get(self.idx), Some(OutStep::Park)) {
+                core::future::pending::<()>().await;
+            }
         }
     }
 
@@ -444,8 +470,7 @@ mod tests {
         }
     }
 
-    /// A driver whose endpoints are the mocks above, so the class task runs on the host. Only
-    /// endpoint allocation is exercised; the bus and control pipe belong to the USB stack task.
+    /// A driver over the mocks above; only endpoint allocation is exercised.
     struct TestDriver<'a> {
         reset: &'a BotReset,
     }
@@ -641,7 +666,7 @@ mod tests {
 
     /// A TEST UNIT READY command wrapper: no data phase, so the CSW is the whole answer.
     fn tur(tag: u32) -> [u8; CBW_LEN] {
-        cbw_packet(tag, 0, false, &[0x00])
+        cbw_packet(tag, 0, false, &[0x00; 6])
     }
 
     /// The endpoint pair the class task drives, over the scripted host `steps`.
@@ -689,7 +714,10 @@ mod tests {
         root[28..32].copy_from_slice(&512u32.to_le_bytes());
         vfs.write_sector(131, &root);
         vfs.write_sector(fat::DATA_START_LBA, &uf2_block(0x0800_0000, &[1, 2, 3, 4]));
-        assert_eq!(vfs.tick(1), MediaState::Detached);
+        assert_eq!(
+            vfs.tick(daplink_vfs::MSC_TIMEOUT_FINISHABLE_MS),
+            MediaState::Detached
+        );
     }
 
     /// A class request aimed at the mass-storage interface.
@@ -726,7 +754,7 @@ mod tests {
         let mut ua_pending = true;
         let cbw = parse_cbw(&cbw_packet(1, 512, false, &rw10(0x2A, 0, 1))).expect("valid CBW");
 
-        block_on(run_command::<_, _, _, EP_CHUNK>(
+        block_on(run_command::<_, _, _, _, EP_CHUNK>(
             &mut In {
                 ep: &mut ep_in,
                 reset: &reset,
@@ -736,9 +764,11 @@ mod tests {
                 reset: &reset,
             },
             &mut io,
+            &mut TimerSleep,
             &mut sector,
             &mut sense,
             &mut ua_pending,
+            &mut false,
             &cbw,
         ));
 
@@ -774,7 +804,7 @@ mod tests {
         let mut ua_pending = false;
         let cbw = parse_cbw(&cbw_packet(1, 512, false, &rw10(0x2A, 0, 1))).expect("valid CBW");
 
-        block_on(run_command::<_, _, _, EP_CHUNK>(
+        block_on(run_command::<_, _, _, _, EP_CHUNK>(
             &mut In {
                 ep: &mut ep_in,
                 reset: &reset,
@@ -784,9 +814,11 @@ mod tests {
                 reset: &reset,
             },
             &mut io,
+            &mut TimerSleep,
             &mut sector,
             &mut sense,
             &mut ua_pending,
+            &mut false,
             &cbw,
         ));
 
@@ -805,7 +837,7 @@ mod tests {
         let mut ua_pending = false;
         let cbw = parse_cbw(&cbw_packet(1, 512, true, &rw10(0x28, 0, 1))).expect("valid CBW");
 
-        block_on(run_command::<_, _, _, EP_CHUNK>(
+        block_on(run_command::<_, _, _, _, EP_CHUNK>(
             &mut In {
                 ep: &mut ep_in,
                 reset: &reset,
@@ -815,9 +847,11 @@ mod tests {
                 reset: &reset,
             },
             &mut io,
+            &mut TimerSleep,
             &mut sector,
             &mut sense,
             &mut ua_pending,
+            &mut false,
             &cbw,
         ));
 
@@ -962,8 +996,7 @@ mod tests {
 
     #[test]
     fn an_invalid_cbw_is_met_with_silence_where_the_spec_asks_for_a_stall() {
-        // BOT 1.0 section 6.6.1 wants both bulk pipes stalled until a Bulk-Only Reset. Stalling
-        // belongs to the USB stack task, not this one, so the command after it is served instead.
+        // BOT 6.6.1 stalls both pipes, but that is the USB stack's; the next command is served.
         let mut bad = tur(1);
         bad[0] ^= 0xFF;
         assert_eq!(
@@ -1026,8 +1059,7 @@ mod tests {
         let mut vfs: Vfs<'_, _, _> =
             Vfs::new(VfsConfig::default(), &mut files[..], NullSink, NoObserver);
         drop_image_and_detach(&mut vfs);
-        // Two hundred commands with the clock stopped: the volume is still off the air for all
-        // of them, so no turn of the loop can have credited the remount countdown any time.
+        // Two hundred commands with the clock stopped: no turn may credit the remount countdown.
         drive(msc_task(&mut eps, &mut vfs), 1, 0);
         let csws = eps.ep_in.csws();
         assert_eq!(csws.len(), 200);
@@ -1049,8 +1081,7 @@ mod tests {
             Vfs::new(VfsConfig::default(), &mut files[..], NullSink, NoObserver);
         drop_image_and_detach(&mut vfs);
         drive(msc_task(&mut eps, &mut vfs), 21, 100);
-        // Both fail: a remount would have spent its one UNIT ATTENTION on the first and passed
-        // the second, so a pair of NOT READY answers is what still-detached looks like.
+        // Both fail: a remount would have passed the second after one UNIT ATTENTION.
         assert_eq!(eps.ep_in.csws(), [(1, 0, CSW_FAILED), (2, 0, CSW_FAILED)]);
     }
 
@@ -1104,5 +1135,500 @@ mod tests {
             down_ms >= USB_RECONNECT_DETACH_MS,
             "the bus stayed down {down_ms} ms"
         );
+    }
+
+    /// A flash backend deferring begin, program and finish across `step` calls.
+    struct StepFlash {
+        ranges: [(u32, u32); 1],
+        programmed: Vec<u8>,
+        pending: u32,
+        finishing: bool,
+        finished: bool,
+    }
+
+    impl StepFlash {
+        fn new() -> Self {
+            Self {
+                ranges: [(0x0800_0000, 0x0801_0000)],
+                programmed: Vec::new(),
+                pending: 0,
+                finishing: false,
+                finished: false,
+            }
+        }
+    }
+
+    impl daplink_rs::daplink_core::FlashBackend for StepFlash {
+        fn begin(&mut self) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            Ok(())
+        }
+        fn begin_start(
+            &mut self,
+            _family: Option<u32>,
+        ) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.pending = 2;
+            Ok(())
+        }
+        fn program(
+            &mut self,
+            _addr: u32,
+            data: &[u8],
+        ) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.programmed.extend_from_slice(data);
+            Ok(())
+        }
+        fn program_chunk(
+            &mut self,
+            _addr: u32,
+            data: &[u8],
+        ) -> Result<usize, daplink_rs::daplink_core::FlashPhase> {
+            self.programmed.extend_from_slice(data);
+            self.pending = 1;
+            Ok(data.len())
+        }
+        fn step(&mut self, _now_us: u64) -> daplink_rs::daplink_core::FlashPoll {
+            if self.pending > 0 {
+                self.pending -= 1;
+                return daplink_rs::daplink_core::FlashPoll::Pending { wake_at_us: 0 };
+            }
+            if self.finishing {
+                self.finishing = false;
+                self.finished = true;
+            }
+            daplink_rs::daplink_core::FlashPoll::Done
+        }
+        fn settle(&mut self) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.pending = 0;
+            if self.finishing {
+                self.finishing = false;
+                self.finished = true;
+            }
+            Ok(())
+        }
+        fn finish_start(
+            &mut self,
+            _success: bool,
+            _reset: bool,
+        ) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.finishing = true;
+            self.pending = 2;
+            Ok(())
+        }
+        fn finish(&mut self, _success: bool) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.finished = true;
+            Ok(())
+        }
+        fn finish_with_reset(
+            &mut self,
+            _success: bool,
+            _reset: bool,
+        ) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.finished = true;
+            Ok(())
+        }
+        fn flash_ranges(&self) -> &[(u32, u32)] {
+            &self.ranges
+        }
+    }
+
+    /// One WRITE(10) of a single sector: the CBW followed by the sector split into bulk packets.
+    fn write10(tag: u32, lba: u32, sector: &[u8; 512]) -> Vec<OutStep> {
+        let mut steps = vec![pkt(&cbw_packet(tag, 512, false, &rw10(0x2A, lba, 1)))];
+        for chunk in sector.chunks(EP_CHUNK) {
+            steps.push(pkt(chunk));
+        }
+        steps
+    }
+
+    /// A drop over the deferring backend parks writes and flush; both land exactly once.
+    #[test]
+    fn a_deferred_drop_parks_and_is_pumped_to_completion() {
+        let _clock = clock_guard();
+        let reset = BotReset::new();
+        // An unsized entry completes on the idle timeout, so its teardown arrives from `tick`.
+        let mut root = [0u8; 512];
+        root[0..11].copy_from_slice(b"APP     UF2");
+        root[11] = 0x20;
+        root[26..28].copy_from_slice(&2u16.to_le_bytes());
+        let data = uf2_block(0x0800_0000, &[1, 2, 3, 4]);
+
+        let mut steps = write10(1, 131, &root);
+        steps.extend(write10(2, fat::DATA_START_LBA, &data));
+        steps.extend((0..60).map(|_| OutStep::Idle));
+        steps.push(OutStep::Park);
+
+        let mut eps = endpoints(&reset, steps);
+        let mut files: [&mut dyn VfsFile; 0] = [];
+        let mut vfs = Vfs::new(
+            VfsConfig::default(),
+            &mut files[..],
+            daplink_vfs::FlashSink::new(StepFlash::new()),
+            NoObserver,
+        );
+        drive(msc_task(&mut eps, &mut vfs), 120, 100);
+
+        let sink = vfs.sink();
+        assert_eq!(
+            sink.backend().programmed,
+            [1, 2, 3, 4],
+            "the payload reached the backend exactly once"
+        );
+        assert!(
+            sink.backend().finished,
+            "the teardown the tick pumped ran to completion"
+        );
+        assert_eq!(sink.outcome(), Some(TransferOutcome::Done));
+    }
+
+    /// The volume's timers keep running with the bus down; the polled pass ticks regardless.
+    #[test]
+    fn an_absent_host_does_not_freeze_the_volume_timers() {
+        let _clock = clock_guard();
+        let reset = BotReset::new();
+        let mut root = [0u8; 512];
+        root[0..11].copy_from_slice(b"APP     UF2");
+        root[11] = 0x20;
+        root[26..28].copy_from_slice(&2u16.to_le_bytes());
+        let data = uf2_block(0x0800_0000, &[1, 2, 3, 4]);
+        let mut steps = write10(1, 131, &root);
+        steps.extend(write10(2, fat::DATA_START_LBA, &data));
+        steps.push(OutStep::Disabled);
+        steps.push(OutStep::Park);
+        let mut eps = endpoints(&reset, steps);
+        let mut files: [&mut dyn VfsFile; 0] = [];
+        let mut vfs = Vfs::new(
+            VfsConfig::default(),
+            &mut files[..],
+            daplink_vfs::FlashSink::new(StepFlash::new()),
+            NoObserver,
+        );
+        drive(msc_task(&mut eps, &mut vfs), 120, 100);
+        assert_eq!(vfs.sink().outcome(), Some(TransferOutcome::Done));
+    }
+
+    /// A FAT write 100 ms after `Done` lands, and a TEST UNIT READY storm does not keep the
+    /// medium: it leaves once the host has written nothing for the sized idle window.
+    #[test]
+    fn a_tail_write_after_done_lands_and_a_tur_storm_does_not_hold_the_medium() {
+        let _clock = clock_guard();
+        let reset = BotReset::new();
+        let mut root = [0u8; 512];
+        root[0..11].copy_from_slice(b"APP     UF2");
+        root[11] = 0x20;
+        root[26..28].copy_from_slice(&2u16.to_le_bytes());
+        root[28..32].copy_from_slice(&512u32.to_le_bytes());
+        let mut steps = write10(1, 131, &root);
+        steps.extend(write10(
+            2,
+            fat::DATA_START_LBA,
+            &uf2_block(0x1000_0000, &[0xA5; 256]),
+        ));
+        steps.push(OutStep::Idle);
+        steps.extend(write10(3, 1, &[0xF8; 512]));
+        for tag in 10..30u32 {
+            steps.push(pkt(&tur(tag)));
+            steps.push(OutStep::Idle);
+        }
+        steps.push(OutStep::Park);
+        let mut eps = endpoints(&reset, steps);
+        let mut files: [&mut dyn VfsFile; 0] = [];
+        let mut vfs: Vfs<'_, _, _> =
+            Vfs::new(VfsConfig::default(), &mut files[..], NullSink, NoObserver);
+        drive(msc_task(&mut eps, &mut vfs), 400, 10);
+        let csws = eps.ep_in.csws();
+        let status = |tag: u32| csws.iter().find(|c| c.0 == tag).map(|c| c.2);
+        assert_eq!(status(2), Some(CSW_PASSED), "the drop itself");
+        assert_eq!(status(3), Some(CSW_PASSED), "the FAT tail lands");
+        let turs: Vec<u8> = csws.iter().filter(|c| c.0 >= 10).map(|c| c.2).collect();
+        let passed = turs.iter().take_while(|&&s| s == CSW_PASSED).count();
+        assert!(
+            (3..=6).contains(&passed),
+            "about 500 ms of TURs, got {passed}"
+        );
+        assert!(turs[passed..].iter().all(|&s| s == CSW_FAILED), "then gone");
+    }
+
+    /// F401 geometry with per-erase stalls taken from the test, modelling `HwBackend`'s flush.
+    struct StallFlash {
+        ranges: [(u32, u32); 1],
+        erase_16k_us: u64,
+        erase_64k_us: u64,
+        erase_128k_us: u64,
+        page_us: u64,
+        page_bytes: usize,
+        uniform: bool,
+        erased: Vec<u32>,
+        staged: usize,
+        due_us: u64,
+        deadline: Option<u64>,
+        programmed: u32,
+    }
+
+    impl StallFlash {
+        fn new(e16: u64, e64: u64, e128: u64, page_us: u64) -> Self {
+            Self {
+                ranges: [(0x0800_0000, 0x0808_0000)],
+                erase_16k_us: e16,
+                erase_64k_us: e64,
+                erase_128k_us: e128,
+                page_us,
+                page_bytes: 1024,
+                uniform: false,
+                erased: Vec::new(),
+                staged: 0,
+                due_us: 0,
+                deadline: None,
+                programmed: 0,
+            }
+        }
+        fn rp(erase_us: u64, page_us: u64) -> Self {
+            let mut s = Self::new(erase_us, 0, 0, page_us);
+            s.ranges = [(0x1000_0000, 0x1020_0000)];
+            s.page_bytes = 4096;
+            s.uniform = true;
+            s
+        }
+        fn sector(addr: u32) -> (u32, u32) {
+            let rel = addr - 0x0800_0000;
+            if rel < 0x1_0000 {
+                (rel / 0x4000 * 0x4000, 0x4000)
+            } else if rel < 0x2_0000 {
+                (0x1_0000, 0x1_0000)
+            } else {
+                (rel / 0x2_0000 * 0x2_0000, 0x2_0000)
+            }
+        }
+    }
+
+    impl daplink_rs::daplink_core::FlashBackend for StallFlash {
+        fn begin(&mut self) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            Ok(())
+        }
+        fn begin_start(
+            &mut self,
+            _f: Option<u32>,
+        ) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            Ok(())
+        }
+        fn program(
+            &mut self,
+            _a: u32,
+            d: &[u8],
+        ) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.programmed += d.len() as u32;
+            Ok(())
+        }
+        fn program_chunk(
+            &mut self,
+            addr: u32,
+            d: &[u8],
+        ) -> Result<usize, daplink_rs::daplink_core::FlashPhase> {
+            self.programmed += d.len() as u32;
+            self.staged += d.len();
+            // A full 1 KiB page flushes: its sector's first erase, then program and verify.
+            if self.staged >= self.page_bytes {
+                self.staged = 0;
+                let (base, size) = if self.uniform {
+                    (addr & !0xFFF, 0x4000)
+                } else {
+                    Self::sector(addr)
+                };
+                self.due_us = self.page_us;
+                if !self.erased.contains(&base) {
+                    self.erased.push(base);
+                    self.due_us += match size {
+                        0x4000 => self.erase_16k_us,
+                        0x1_0000 => self.erase_64k_us,
+                        _ => self.erase_128k_us,
+                    };
+                }
+            }
+            Ok(d.len())
+        }
+        fn step(&mut self, now_us: u64) -> daplink_rs::daplink_core::FlashPoll {
+            use daplink_rs::daplink_core::FlashPoll;
+            if self.due_us == 0 && self.deadline.is_none() {
+                return FlashPoll::Done;
+            }
+            let at = *self.deadline.get_or_insert(now_us + self.due_us);
+            self.due_us = 0;
+            if now_us >= at {
+                self.deadline = None;
+                return FlashPoll::Done;
+            }
+            FlashPoll::Pending { wake_at_us: at }
+        }
+        fn settle(&mut self) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            self.due_us = 0;
+            self.deadline = None;
+            Ok(())
+        }
+        fn finish(&mut self, _ok: bool) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            Ok(())
+        }
+        fn finish_with_reset(
+            &mut self,
+            _ok: bool,
+            _r: bool,
+        ) -> Result<(), daplink_rs::daplink_core::FlashPhase> {
+            Ok(())
+        }
+        fn flash_ranges(&self) -> &[(u32, u32)] {
+            &self.ranges
+        }
+    }
+
+    /// A well-formed block: payload 256, address, sequence and total.
+    fn block(n: u32, total: u32, base: u32) -> [u8; 512] {
+        let mut b = uf2_block(base + n * 256, &[0xA5; 256]);
+        b[20..24].copy_from_slice(&n.to_le_bytes());
+        b[24..28].copy_from_slice(&total.to_le_bytes());
+        b
+    }
+
+    /// One WRITE(10) carrying `sectors` consecutive blocks from `lba`.
+    fn write_many(tag: u32, lba: u32, sectors: &[[u8; 512]]) -> Vec<OutStep> {
+        let n = sectors.len() as u32;
+        let mut steps = vec![pkt(&cbw_packet(
+            tag,
+            n * 512,
+            false,
+            &rw10(0x2A, lba, n as u16),
+        ))];
+        for s in sectors {
+            steps.extend(s.chunks(EP_CHUNK).map(pkt));
+        }
+        steps
+    }
+
+    fn dirent_sector(size: u32, cluster: u16) -> [u8; 512] {
+        let mut root = [0u8; 512];
+        root[0..11].copy_from_slice(b"APP     UF2");
+        root[11] = 0x20;
+        root[26..28].copy_from_slice(&cluster.to_le_bytes());
+        root[28..32].copy_from_slice(&size.to_le_bytes());
+        root
+    }
+
+    /// Run the real class task over `steps`; report outcome and payload accepted.
+    fn run_stall(
+        backend: StallFlash,
+        steps: Vec<OutStep>,
+        polls: usize,
+    ) -> (Option<TransferOutcome>, u32) {
+        let reset = BotReset::new();
+        let mut eps = endpoints(&reset, steps);
+        let mut files: [&mut dyn VfsFile; 0] = [];
+        let mut vfs = Vfs::new(
+            VfsConfig::default(),
+            &mut files[..],
+            daplink_vfs::FlashSink::new(backend),
+            NoObserver,
+        );
+        drive(msc_task(&mut eps, &mut vfs), polls, 10);
+        (vfs.sink().outcome(), vfs.sink().programmed())
+    }
+
+    /// A whole image through WRITE(10)s of `per_cmd` sectors, sized first or by a final entry.
+    fn whole_image(
+        b: StallFlash,
+        blocks: &[[u8; 512]],
+        per_cmd: usize,
+        sized_first: bool,
+        polls: usize,
+    ) -> (Option<TransferOutcome>, u32) {
+        let total = blocks.len() as u32 * 512;
+        let mut steps = Vec::new();
+        if sized_first {
+            steps.extend(write10(9000, 131, &dirent_sector(total, 2)));
+        }
+        let mut lba = fat::DATA_START_LBA;
+        for (tag, chunk) in blocks.chunks(per_cmd).enumerate() {
+            steps.extend(write_many(tag as u32 + 1, lba, chunk));
+            lba += chunk.len() as u32;
+        }
+        if !sized_first {
+            steps.extend(write10(9001, 131, &dirent_sector(total, 2)));
+        }
+        steps.extend((0..4).map(|_| OutStep::Idle));
+        steps.push(OutStep::Park);
+        run_stall(b, steps, polls)
+    }
+
+    /// F401 sector classes at typical and maximum erase times.
+    #[test]
+    fn f401_erase_stalls_do_not_read_as_host_idleness() {
+        let _clock = clock_guard();
+        let n = 480 * 4u32;
+        let blocks: Vec<_> = (0..n).map(|i| block(i, n, 0x0800_0000)).collect();
+        for (e16, e64, e128) in [
+            (400_000u64, 1_200_000u64, 2_000_000u64),
+            (800_000, 2_400_000, 4_000_000),
+        ] {
+            for per_cmd in [1usize, 8, 64, 128, 200, 240, 512, 1024, 2048] {
+                for sized in [false, true] {
+                    let b = StallFlash::new(e16, e64, e128, 19_000);
+                    assert_eq!(
+                        whole_image(b, &blocks, per_cmd, sized, 12_000),
+                        (Some(TransferOutcome::Done), n * 256),
+                        "e128={e128} per_cmd={per_cmd} sized={sized}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// RP geometry, 1 MiB: 4 KiB erase plus upload, program and verify per page.
+    #[test]
+    fn rp_erase_stalls_do_not_read_as_host_idleness() {
+        let _clock = clock_guard();
+        let n = 1024 * 4u32;
+        let blocks: Vec<_> = (0..n).map(|i| block(i, n, 0x1000_0000)).collect();
+        for (e, page) in [(45_000u64, 75_000u64), (400_000, 120_000)] {
+            for per_cmd in [64usize, 240, 512, 1024, 2048] {
+                assert_eq!(
+                    whole_image(StallFlash::rp(e, page), &blocks, per_cmd, false, 90_000),
+                    (Some(TransferOutcome::Done), n * 256),
+                    "erase={e} per_cmd={per_cmd}"
+                );
+            }
+        }
+    }
+
+    /// With `numBlocks` 0 an early idle completion has nothing to check: a silent short `Done`.
+    #[test]
+    fn an_uncounted_stream_is_not_ended_by_an_erase_stall() {
+        let _clock = clock_guard();
+        let n = 480 * 4u32;
+        let blocks: Vec<_> = (0..n).map(|i| block(i, 0, 0x0800_0000)).collect();
+        let b = StallFlash::new(800_000, 2_400_000, 4_000_000, 19_000);
+        assert_eq!(
+            whole_image(b, &blocks, 240, false, 12_000),
+            (Some(TransferOutcome::Done), n * 256)
+        );
+    }
+
+    /// A sized stream that healed a gap earlier survives a long erase after it.
+    #[test]
+    fn a_healed_gap_survives_a_later_erase_stall() {
+        let _clock = clock_guard();
+        for t_ms in [900u64, 1_200, 4_000] {
+            let blocks: Vec<_> = (0..8).map(|i| block(i, 8, 0x0802_0000)).collect();
+            let d = fat::DATA_START_LBA;
+            let mut steps = write10(90, 131, &dirent_sector(8 * 512, 2));
+            steps.extend(write10(1, d, &blocks[0]));
+            steps.extend(write10(2, d + 2, &blocks[2]));
+            for i in 1..8u32 {
+                steps.extend(write10(10 + i, d + i, &blocks[i as usize]));
+            }
+            steps.extend((0..4).map(|_| OutStep::Idle));
+            steps.push(OutStep::Park);
+            let b = StallFlash::new(0, 0, t_ms * 1000, 0);
+            assert_eq!(
+                run_stall(b, steps, 1500),
+                (Some(TransferOutcome::Done), 8 * 256),
+                "stall_ms={t_ms}"
+            );
+        }
     }
 }

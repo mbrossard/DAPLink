@@ -41,7 +41,6 @@ fn flash_region_is_2m_qspi() {
     assert_eq!(r.end, 0x1020_0000);
     assert_eq!(r.end - r.start, 2 * 1024 * 1024);
     assert!(r.is_default);
-    assert!(!r.is_secure);
 }
 
 #[test]
@@ -84,8 +83,7 @@ fn rom_blob_is_non_empty_and_word_sized() {
     assert_eq!(RP2040_ROM_BLOB.len() % 4, 0);
 }
 
-/// Offsets fall inside the blob for whichever algorithm the region references, proving they are
-/// load-relative offsets and not absolute RAM addresses.
+/// Entry points are load-relative offsets inside the referenced blob.
 #[test]
 fn rom_algo_entries_are_offsets_not_addresses() {
     let algo = &RP2040_ROM_ALGO;
@@ -105,8 +103,7 @@ fn rom_algo_entries_are_offsets_not_addresses() {
     }
 }
 
-/// Shared RAM/layout invariants any RP2040 flash algorithm must satisfy, exercised over each
-/// compiled algorithm (the ROM-call shim always, the vendor-pack algorithm when retained).
+/// RAM/layout invariants any RP2040 flash algorithm must satisfy.
 fn assert_algo_ram_invariants(algo: &crate::FlashAlgorithm<'_>, blob_len: u32) {
     // The algorithm loads into main SRAM (a 16 KiB window from the SRAM base).
     let ram = RamRegion {
@@ -119,7 +116,6 @@ fn assert_algo_ram_invariants(algo: &crate::FlashAlgorithm<'_>, blob_len: u32) {
     assert!(ram.contains(algo.syscall.static_base));
     assert!(ram.contains(algo.algo_start));
 
-    // Program buffer lies fully within RAM.
     assert!(ram.contains(algo.program_buffer));
     let pb_end = algo.program_buffer + algo.program_buffer_size;
     assert!(pb_end <= ram.end);
@@ -137,7 +133,7 @@ fn rom_algo_ram_invariants() {
     assert_algo_ram_invariants(&RP2040_ROM_ALGO, RP2040_ROM_BLOB.len() as u32);
 }
 
-/// The flash region resolves to the ROM-call shim, the only algorithm this reduced crate carries.
+/// The flash region resolves to the ROM-call shim.
 #[test]
 fn target_resolves_selected_algo_handle() {
     let target = RP2040;
@@ -150,6 +146,8 @@ fn target_resolves_selected_algo_handle() {
 #[derive(Default)]
 struct RecOps {
     ops: std::vec::Vec<Op>,
+    /// Scripted `(address, value)` reads; any other address reads 0.
+    reads: std::vec::Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -169,7 +167,11 @@ impl ResetOps for RecOps {
     }
     fn read_word(&mut self, addr: u32) -> Result<u32, Error> {
         self.ops.push(Op::Read(addr));
-        Ok(0)
+        Ok(self
+            .reads
+            .iter()
+            .find(|&&(a, _)| a == addr)
+            .map_or(0, |&(_, v)| v))
     }
     fn trigger_reset(&mut self, reset_type: ResetType) -> Result<(), Error> {
         self.ops.push(Op::Reset(reset_type));
@@ -198,8 +200,21 @@ where
     ops.ops
 }
 
-/// The RP2040 supplies its own reset sequence (not the shared generic instance), proving the
-/// per-target seam is wired through `Target::reset_sequence`.
+/// Drive `ResetProgram` against the scripted `reads`, returning its result and op stream.
+fn reset_program(reads: &[(u32, u32)]) -> (Result<(), Error>, std::vec::Vec<Op>) {
+    let mut ops = RecOps {
+        reads: reads.to_vec(),
+        ..RecOps::default()
+    };
+    let r = RP2040.reset_sequence().set_target_state(
+        &mut ops,
+        TargetState::ResetProgram,
+        ResetType::Hardware,
+    );
+    (r, ops.ops)
+}
+
+/// The RP2040 supplies its own reset sequence through `Target::reset_sequence`.
 #[test]
 fn target_supplies_custom_reset_sequence() {
     let target = RP2040;
@@ -211,19 +226,66 @@ fn target_supplies_custom_reset_sequence() {
     ));
 }
 
-/// `ResetProgram` is halt-only; the remaining non-reset transitions match the generic op stream.
+/// RP2040 `RESETS.RESET_DONE` with DMA out of reset.
+const DMA_DONE: (u32, u32) = (0x4000_C008, 1 << 2);
+/// `DHCSR` with `S_REGRDY` set.
+const REGRDY: (u32, u32) = (0xE000_EDF0, 1 << 16);
+
+/// RP2040 `PSM.FRCE_OFF` with `PROC1` set.
+const PROC1_OFF: (u32, u32) = (0x4001_0004, 1 << 16);
+
+/// `ResetProgram` halts, then stops the watchdog, core 1 and DMA, without resetting the chip.
 #[test]
-fn rp2040_reset_program_is_halt_only_others_generic() {
-    let target = RP2040;
-    let seq = target.reset_sequence();
+fn rp2040_reset_program_halts_and_quiesces() {
+    let (r, ops) = reset_program(&[PROC1_OFF, DMA_DONE, REGRDY]);
+    r.expect("rp2040 sequence");
+    assert_eq!(
+        ops,
+        [
+            Op::Halt,
+            // DEMCR: VC_HARDERR, so an algorithm fault halts.
+            Op::Write(0xE000_EDFC, 1 << 10),
+            // WATCHDOG.CTRL.ENABLE cleared through the CLR alias.
+            Op::Write(0x4005_B000, 1 << 30),
+            // PSM.FRCE_OFF.PROC1 set, read back, then released.
+            Op::Write(0x4001_2004, 1 << 16),
+            Op::Read(0x4001_0004),
+            Op::Write(0x4001_3004, 1 << 16),
+            // RESETS.RESET.DMA pulsed, then RESET_DONE.DMA awaited.
+            Op::Write(0x4000_E000, 1 << 2),
+            Op::Write(0x4000_F000, 1 << 2),
+            Op::Read(0x4000_C008),
+            // MPU_CTRL, then CONTROL and PRIMASK through DCRDR and DCRSR.
+            Op::Write(0xE000_ED94, 0),
+            Op::Write(0xE000_EDF8, 0),
+            Op::Write(0xE000_EDF4, 0x1_0014),
+            Op::Read(0xE000_EDF0),
+        ]
+    );
+}
 
-    // ResetProgram diverges from the generic reset-and-halt: it just halts the running core.
-    let reset_program = run_sequence(|ops| {
-        seq.set_target_state(ops, TargetState::ResetProgram, ResetType::Hardware)
-            .expect("rp2040 sequence");
-    });
-    assert_eq!(reset_program, [Op::Halt], "ResetProgram is halt-only");
+/// A `FRCE_OFF` write that never reads back fails the session, but is still released.
+#[test]
+fn rp2040_core1_stuck_fails_after_releasing_it() {
+    let (r, ops) = reset_program(&[DMA_DONE]);
+    assert_eq!(r, Err(Error::Timeout));
+    assert_eq!(ops.last(), Some(&Op::Write(0x4001_3004, 1 << 16)));
+}
 
+/// `PSM.DONE` is never consulted, so neither reading of it can fail the session.
+#[test]
+fn rp2040_done_cannot_fail_the_quiesce() {
+    for done in [0, 1 << 16] {
+        let (r, ops) = reset_program(&[PROC1_OFF, DMA_DONE, REGRDY, (0x4001_000C, done)]);
+        r.expect("rp2040 sequence");
+        assert!(!ops.contains(&Op::Read(0x4001_000C)));
+    }
+}
+
+/// The non-reset transitions match the generic op stream.
+#[test]
+fn rp2040_non_reset_transitions_are_generic() {
+    let seq = RP2040.reset_sequence();
     // Non-reset transitions still match the generic op stream under the target's reset type.
     for state in [TargetState::ResetHold, TargetState::Halt] {
         let custom = run_sequence(|ops| {
@@ -239,15 +301,13 @@ fn rp2040_reset_program_is_halt_only_others_generic() {
     }
 }
 
-/// Reset-to-run is the generic release with the reset type pinned to software, whatever the
-/// caller passes -- never an nRESET pulse.
+/// Reset-to-run is the generic release pinned to a software reset, never an nRESET pulse.
 #[test]
 fn rp2040_post_flash_reset_is_forced_software_reset() {
     // CoreSight debug-register values the release sequence writes (architectural constants).
     const DHCSR: u32 = 0xE000_EDF0;
     const DBGKEY: u32 = 0xA05F_0000;
     const DEMCR: u32 = 0xE000_EDFC;
-    const TRCENA: u32 = 1 << 24;
 
     let target = RP2040;
     let seq = target.reset_sequence();
@@ -261,7 +321,7 @@ fn rp2040_post_flash_reset_is_forced_software_reset() {
         assert_eq!(
             ops,
             [
-                Op::Write(DEMCR, TRCENA),
+                Op::Write(DEMCR, 0),
                 Op::Write(DHCSR, DBGKEY),
                 Op::Reset(ResetType::SoftwareSysReset),
             ],

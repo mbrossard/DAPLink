@@ -2,7 +2,8 @@
 
 use crate::msc_proto::{
     Sense, CBW_LEN, CBW_SIGNATURE, CSW_FAILED, CSW_PASSED, CSW_PHASE_ERROR, SENSE_ILLEGAL,
-    SENSE_LBA_RANGE, SENSE_LUN_NOT_SUPPORTED, SENSE_MEDIUM_CHANGED, SENSE_NONE,
+    SENSE_INVALID_CDB, SENSE_LBA_RANGE, SENSE_LUN_NOT_SUPPORTED, SENSE_MEDIUM_CHANGED, SENSE_NONE,
+    SENSE_NO_MEDIUM,
 };
 use crate::{MSC_SECTOR_SIZE, VFS_TOTAL_SECTORS};
 
@@ -13,8 +14,7 @@ pub enum StallIntent {
     None,
     /// The device-to-host endpoint is stalled: a declared data-IN phase that sends no bytes.
     In,
-    /// The host-to-device endpoint is stalled: a declared data-OUT phase that reads none. Only a
-    /// stalling transport enforces this variant; an OUT row yields a non-stalling one no packet.
+    /// The host-to-device endpoint is stalled; only a stalling transport enforces it.
     Out,
 }
 
@@ -26,6 +26,8 @@ pub struct BotCase {
     pub cbw: [u8; CBW_LEN],
     /// Zero-filled 64-byte host-to-device packets the harness supplies, and expects consumed.
     pub out_packets: usize,
+    /// Whether the medium is present when the CBW arrives.
+    pub media_ready: bool,
     /// Whether a UNIT ATTENTION is pending when the CBW arrives.
     pub ua_before: bool,
     /// Whether it must still be pending once the command has been answered.
@@ -57,15 +59,13 @@ impl BotCase {
         }
     }
 
-    /// Whether a transport that cannot stall must end the data phase with a zero-length packet:
-    /// exactly the rows where a stalling one stalls IN, a declared data-IN phase with no bytes.
+    /// Whether a non-stalling transport must end the data phase with a zero-length packet.
     pub const fn ends_with_zlp(&self) -> bool {
         matches!(self.stall, StallIntent::In)
     }
 }
 
-/// Build the 31 CBW bytes. Taking the command block by value keeps the table free of references
-/// to temporaries, which a `const` initializer cannot hold.
+/// Build the 31 CBW bytes.
 const fn cbw<const N: usize>(
     tag: u32,
     data_len: u32,
@@ -139,18 +139,88 @@ const READ_CAPACITY: [u8; 10] = [0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 const SYNC_CACHE: [u8; 10] = [0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 /// START STOP UNIT with LOEJ set: the eject a host sends when unmounting.
 const START_STOP_EJECT: [u8; 6] = [0x1B, 0x00, 0x00, 0x00, 0x02, 0x00];
+/// START STOP UNIT with LOEJ and START set: load the medium back.
+const START_STOP_LOAD: [u8; 6] = [0x1B, 0x00, 0x00, 0x00, 0x03, 0x00];
+/// START STOP UNIT with neither bit: a host spinning the unit down, not an eject.
+const START_STOP_STOP: [u8; 6] = [0x1B, 0x00, 0x00, 0x00, 0x00, 0x00];
 /// One sector's worth of declared transfer length.
 const SECTOR: u32 = MSC_SECTOR_SIZE as u32;
 /// Full-speed bulk packets in one sector, which is how many OUT packets a write row supplies.
 const SECTOR_PACKETS: usize = MSC_SECTOR_SIZE / 64;
 
-/// The case table, driven row by row from a transport's own harness. Rows 4, 8, 9, 10 and the
-/// UNIT ATTENTION shapes are the ones whose failure desynchronizes or wedges the stream.
+/// Known truncated commands with populated undeclared fields and each declared data phase.
+pub fn truncated_cases() -> impl Iterator<Item = BotCase> {
+    [
+        (0x00, 6),
+        (0x03, 6),
+        (0x12, 6),
+        (0x1A, 6),
+        (0x1B, 6),
+        (0x1E, 6),
+        (0x23, 10),
+        (0x25, 10),
+        (0x28, 10),
+        (0x2A, 10),
+        (0x2F, 10),
+        (0x35, 10),
+        (0x91, 16),
+    ]
+    .into_iter()
+    .flat_map(|(op, minimum)| {
+        (1..minimum).flat_map(move |len| {
+            [false, true].into_iter().flat_map(move |ready| {
+                [(false, 0), (true, 36), (false, SECTOR)].into_iter().map(
+                    move |(dir_in, data_len)| {
+                        let mut cb = [0xA5; 16];
+                        cb[0] = op;
+                        cb[2..6].copy_from_slice(&5u32.to_be_bytes());
+                        cb[7..9].copy_from_slice(&1u16.to_be_bytes());
+                        match op {
+                            0x03 | 0x1A => cb[4] = 18,
+                            0x12 => cb[3..5].copy_from_slice(&256u16.to_be_bytes()),
+                            _ => {}
+                        }
+                        let mut packet = cbw(
+                            0x1000 + u32::from(op) * 16 + u32::from(len),
+                            data_len,
+                            dir_in,
+                            0,
+                            cb,
+                        );
+                        packet[14] = len;
+                        BotCase {
+                            name: "known truncated CDB",
+                            cbw: packet,
+                            out_packets: 0,
+                            media_ready: ready,
+                            ua_before: true,
+                            ua_after: true,
+                            data_len: 0,
+                            status: CSW_FAILED,
+                            residue: data_len,
+                            sense: SENSE_INVALID_CDB,
+                            stall: if data_len == 0 {
+                                StallIntent::None
+                            } else if dir_in {
+                                StallIntent::In
+                            } else {
+                                StallIntent::Out
+                            },
+                        }
+                    },
+                )
+            })
+        })
+    })
+}
+
+/// The case table, driven row by row from a transport's own harness.
 pub static BOT_CASES: &[BotCase] = &[
     BotCase {
         name: "1 Hn=Dn: TEST UNIT READY, no data phase",
         cbw: cbw(0x01, 0, false, 0, TUR),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -163,6 +233,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "2 Hn<Di: INQUIRY under a CBW declaring no data phase",
         cbw: cbw(0x02, 0, true, 0, inquiry(36)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -175,6 +246,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "2b Hn<Di: READ(10) under a CBW declaring no data phase",
         cbw: cbw(0x03, 0, true, 0, rw10(OP_READ, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -187,6 +259,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "3 Hn<Do: WRITE(10) under a CBW declaring no data phase",
         cbw: cbw(0x04, 0, false, 0, rw10(OP_WRITE, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -199,6 +272,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "4 Hi>Dn: TEST UNIT READY declaring a data-IN phase",
         cbw: cbw(0x05, 36, true, 0, TUR),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -211,6 +285,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "5 Hi>Di: INQUIRY replying short of the declared length",
         cbw: cbw(0x06, 64, true, 0, inquiry(36)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 36,
@@ -223,6 +298,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "6 Hi=Di: READ(10) of one sector",
         cbw: cbw(0x07, SECTOR, true, 0, rw10(OP_READ, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: MSC_SECTOR_SIZE,
@@ -235,6 +311,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "6b Hi=Di: INQUIRY matching the declared length",
         cbw: cbw(0x08, 36, true, 0, inquiry(36)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 36,
@@ -247,6 +324,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "7 Hi<Di: INQUIRY clamped to the shorter declared length",
         cbw: cbw(0x09, 16, true, 0, inquiry(36)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 16,
@@ -259,6 +337,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "7b Hi<Di: READ(10) of two sectors declaring one",
         cbw: cbw(0x0A, SECTOR, true, 0, rw10(OP_READ, 5, 2)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -271,6 +350,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "8 Hi<>Do: WRITE(10) under a data-IN direction bit",
         cbw: cbw(0x0B, SECTOR, true, 0, rw10(OP_WRITE, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -283,6 +363,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "9 Ho>Dn: TEST UNIT READY declaring a data-OUT phase",
         cbw: cbw(0x0C, SECTOR, false, 0, TUR),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -295,6 +376,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "10 Ho<>Di: READ(10) under a data-OUT direction bit",
         cbw: cbw(0x0D, SECTOR, false, 0, rw10(OP_READ, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -307,6 +389,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "11 Ho>Do: WRITE(10) of one sector declaring two",
         cbw: cbw(0x0E, 2 * SECTOR, false, 0, rw10(OP_WRITE, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -319,6 +402,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "12 Ho=Do: WRITE(10) of one sector",
         cbw: cbw(0x0F, SECTOR, false, 0, rw10(OP_WRITE, 5, 1)),
         out_packets: SECTOR_PACKETS,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -331,6 +415,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "13 Ho<Do: WRITE(10) of two sectors declaring one",
         cbw: cbw(0x10, SECTOR, false, 0, rw10(OP_WRITE, 5, 2)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -343,6 +428,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "UA clean: TEST UNIT READY reports the pending attention",
         cbw: cbw(0x11, 0, false, 0, TUR),
         out_packets: 0,
+        media_ready: true,
         ua_before: true,
         ua_after: false,
         data_len: 0,
@@ -355,6 +441,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "UA violation: TEST UNIT READY declaring a data-IN phase keeps the attention",
         cbw: cbw(0x12, 36, true, 0, TUR),
         out_packets: 0,
+        media_ready: true,
         ua_before: true,
         ua_after: true,
         data_len: 0,
@@ -367,6 +454,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Reply clamped to nothing: INQUIRY with a zero allocation length",
         cbw: cbw(0x13, 36, true, 0, inquiry(0)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -379,6 +467,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Absent LUN: a CBW addressed to LUN 1 declaring a data-IN phase",
         cbw: cbw(0x14, 36, true, 1, inquiry(36)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -391,6 +480,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Dispatch failure: an unknown opcode declaring a data-IN phase",
         cbw: cbw(0x15, 36, true, 0, UNKNOWN_OP),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -403,6 +493,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Absent LUN: a CBW addressed to LUN 1 declaring a data-OUT phase",
         cbw: cbw(0x16, SECTOR, false, 1, rw10(OP_WRITE, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -415,6 +506,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Dispatch failure: an unknown opcode declaring a data-OUT phase",
         cbw: cbw(0x17, SECTOR, false, 0, UNKNOWN_OP),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -427,6 +519,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Dispatch failure: an unknown opcode with no data phase declared",
         cbw: cbw(0x18, 0, false, 0, UNKNOWN_OP),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -439,6 +532,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "7c Hi>Di: READ(10) of one sector declaring two",
         cbw: cbw(0x19, 2 * SECTOR, true, 0, rw10(OP_READ, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -451,6 +545,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "7d Hi<Di: READ(10) of one sector declaring a non-multiple of the sector size",
         cbw: cbw(0x1A, 64, true, 0, rw10(OP_READ, 5, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -463,6 +558,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "6c Hi=Di: READ(10) of two sectors",
         cbw: cbw(0x1B, 2 * SECTOR, true, 0, rw10(OP_READ, 5, 2)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 2 * MSC_SECTOR_SIZE,
@@ -475,6 +571,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "12b Ho=Do: WRITE(10) of two sectors",
         cbw: cbw(0x1C, 2 * SECTOR, false, 0, rw10(OP_WRITE, 5, 2)),
         out_packets: 2 * SECTOR_PACKETS,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -487,6 +584,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Zero sector count: READ(10) of no sectors under no data phase",
         cbw: cbw(0x1D, 0, false, 0, rw10(OP_READ, 5, 0)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -499,6 +597,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Zero sector count: WRITE(10) of no sectors declaring a data-OUT phase",
         cbw: cbw(0x1E, SECTOR, false, 0, rw10(OP_WRITE, 5, 0)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -517,6 +616,7 @@ pub static BOT_CASES: &[BotCase] = &[
             rw10(OP_READ, VFS_TOTAL_SECTORS - 1, 2),
         ),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -529,6 +629,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Out of range: WRITE(10) one block past the end",
         cbw: cbw(0x20, SECTOR, false, 0, rw10(OP_WRITE, VFS_TOTAL_SECTORS, 1)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -538,9 +639,23 @@ pub static BOT_CASES: &[BotCase] = &[
         stall: StallIntent::Out,
     },
     BotCase {
+        name: "Medium absent: WRITE(10) of one sector with no medium",
+        cbw: cbw(0x2C, SECTOR, false, 0, rw10(OP_WRITE, 5, 1)),
+        out_packets: 0,
+        media_ready: false,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_FAILED,
+        residue: SECTOR,
+        sense: SENSE_NO_MEDIUM,
+        stall: StallIntent::Out,
+    },
+    BotCase {
         name: "Residue: REQUEST SENSE matching the 18-byte descriptor",
         cbw: cbw(0x21, 18, true, 0, request_sense(18)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 18,
@@ -553,6 +668,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Residue: REQUEST SENSE allocating more than the descriptor holds",
         cbw: cbw(0x22, 64, true, 0, request_sense(64)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 18,
@@ -565,6 +681,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Residue: MODE SENSE(6) write-protect probe allocating 192 bytes",
         cbw: cbw(0x23, 0xC0, true, 0, mode_sense6(0xC0)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 4,
@@ -577,6 +694,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Residue: READ FORMAT CAPACITIES allocating 252 bytes",
         cbw: cbw(0x24, 0xFC, true, 0, read_format_capacities(0xFC)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 12,
@@ -589,6 +707,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "6d Hi=Di: READ CAPACITY(10) matching its eight-byte reply",
         cbw: cbw(0x25, 8, true, 0, READ_CAPACITY),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 8,
@@ -601,6 +720,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "7e Hi<Di: READ CAPACITY(10) clamped to a shorter declared length",
         cbw: cbw(0x26, 4, true, 0, READ_CAPACITY),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 4,
@@ -613,6 +733,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Over-long transfer: INQUIRY declaring the whole 32-bit length",
         cbw: cbw(0x27, u32::MAX, true, 0, inquiry(36)),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 36,
@@ -625,6 +746,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "UA held: INQUIRY does not spend the pending attention",
         cbw: cbw(0x28, 36, true, 0, inquiry(36)),
         out_packets: 0,
+        media_ready: true,
         ua_before: true,
         ua_after: true,
         data_len: 36,
@@ -637,6 +759,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Absent LUN: reserved LUN bits must not alias LUN 0",
         cbw: cbw(0x29, 0, false, 0x10, TUR),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -649,6 +772,7 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Unmount path: SYNCHRONIZE CACHE(10), no data phase",
         cbw: cbw(0x2A, 0, false, 0, SYNC_CACHE),
         out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -661,6 +785,102 @@ pub static BOT_CASES: &[BotCase] = &[
         name: "Unmount path: START STOP UNIT with LOEJ, no data phase",
         cbw: cbw(0x2B, 0, false, 0, START_STOP_EJECT),
         out_packets: 0,
+        media_ready: true,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_PASSED,
+        residue: 0,
+        sense: SENSE_NONE,
+        stall: StallIntent::None,
+    },
+];
+
+/// Rows run in order on one transport, carrying its state but starting each from a clean sense.
+pub static EJECT_SEQUENCE: &[BotCase] = &[
+    BotCase {
+        name: "Eject: a plain STOP",
+        cbw: cbw(0x70, 0, false, 0, START_STOP_STOP),
+        out_packets: 0,
+        media_ready: true,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_PASSED,
+        residue: 0,
+        sense: SENSE_NONE,
+        stall: StallIntent::None,
+    },
+    BotCase {
+        name: "Eject: TEST UNIT READY after a plain STOP",
+        cbw: cbw(0x71, 0, false, 0, TUR),
+        out_packets: 0,
+        media_ready: true,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_PASSED,
+        residue: 0,
+        sense: SENSE_NONE,
+        stall: StallIntent::None,
+    },
+    BotCase {
+        name: "Eject: START STOP UNIT with LOEJ",
+        cbw: cbw(0x72, 0, false, 0, START_STOP_EJECT),
+        out_packets: 0,
+        media_ready: true,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_PASSED,
+        residue: 0,
+        sense: SENSE_NONE,
+        stall: StallIntent::None,
+    },
+    BotCase {
+        name: "Eject: TEST UNIT READY after the eject",
+        cbw: cbw(0x73, 0, false, 0, TUR),
+        out_packets: 0,
+        media_ready: true,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_FAILED,
+        residue: 0,
+        sense: SENSE_NO_MEDIUM,
+        stall: StallIntent::None,
+    },
+    BotCase {
+        name: "Eject: READ(10) after the eject",
+        cbw: cbw(0x74, SECTOR, true, 0, rw10(OP_READ, 5, 1)),
+        out_packets: 0,
+        media_ready: true,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_FAILED,
+        residue: SECTOR,
+        sense: SENSE_NO_MEDIUM,
+        stall: StallIntent::In,
+    },
+    BotCase {
+        name: "Eject: START STOP UNIT with LOEJ and START",
+        cbw: cbw(0x75, 0, false, 0, START_STOP_LOAD),
+        out_packets: 0,
+        media_ready: true,
+        ua_before: false,
+        ua_after: false,
+        data_len: 0,
+        status: CSW_PASSED,
+        residue: 0,
+        sense: SENSE_NONE,
+        stall: StallIntent::None,
+    },
+    BotCase {
+        name: "Eject: TEST UNIT READY after the load",
+        cbw: cbw(0x76, 0, false, 0, TUR),
+        out_packets: 0,
+        media_ready: true,
         ua_before: false,
         ua_after: false,
         data_len: 0,
@@ -699,8 +919,7 @@ mod tests {
 
     #[test]
     fn a_passing_row_accounts_for_every_declared_byte() {
-        // Residue is what the CBW declared minus what moved, so a row that does not add up is a
-        // wrong expectation rather than a transport bug, and would be read as the latter.
+        // Residue is declared minus moved, so a row that does not add up is a wrong expectation.
         for case in BOT_CASES {
             if case.status != CSW_PASSED {
                 continue;
@@ -726,6 +945,19 @@ mod tests {
             assert_eq!(case.data_len, 0, "{}", case.name);
             assert_eq!(case.out_packets, 0, "{}", case.name);
             assert_eq!(case.residue, parsed.data_len, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn only_a_medium_absent_row_expects_the_no_medium_sense() {
+        // The medium flag and the sense it produces are one fact, split across two columns.
+        for case in BOT_CASES {
+            assert_eq!(
+                !case.media_ready,
+                case.sense == SENSE_NO_MEDIUM,
+                "{}",
+                case.name
+            );
         }
     }
 

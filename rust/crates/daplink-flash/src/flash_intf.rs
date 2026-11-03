@@ -1,5 +1,7 @@
 //! The [`FlashInterface`] seam: the minimal flashing surface the manager drives.
 
+use crate::reset_sequence::StepPoll;
+use crate::swd_host::SyscallRun;
 use crate::Error;
 
 /// A programmable flash device, decoupled from how programming is performed.
@@ -7,15 +9,14 @@ pub trait FlashInterface {
     /// Begin a flashing session (connect / halt / prepare the algorithm). Idempotent.
     fn init(&mut self) -> Result<(), Error>;
 
-    /// End a flashing session (release the target). Idempotent, and valid with no session open.
+    /// End a flashing session, releasing the target best-effort: `Ok` does not prove release.
+    /// Idempotent, and valid with no session open.
     fn uninit(&mut self) -> Result<(), Error>;
 
-    /// Select whether [`uninit`](Self::uninit) releases the target to run (`true`) or leaves it
-    /// halted (`false`).
+    /// Whether [`uninit`](Self::uninit) releases the target to run or leaves it halted.
     fn set_post_flash_reset(&mut self, enabled: bool);
 
-    /// Program `data` at absolute `addr`. `addr` must be aligned to the program granularity in
-    /// force and `data` exactly that many bytes.
+    /// Program `data` at `addr`: aligned to, and exactly, the program granularity in force.
     fn program_page(&mut self, addr: u32, data: &[u8]) -> Result<(), Error>;
 
     /// Verify that `data` is what is stored at absolute `addr` (the page just programmed).
@@ -46,6 +47,45 @@ pub trait FlashInterface {
     fn set_flash_algorithm(&mut self, _addr: u32) -> Result<(), Error> {
         Ok(())
     }
+
+    /// Begin a resumable sector erase; the default runs it to completion inline.
+    /// Every `*_begin` may do its staging, such as loading a page into target RAM, synchronously.
+    fn erase_sector_begin(&mut self, addr: u32) -> Result<SyscallRun, Error> {
+        self.erase_sector(addr)?;
+        Ok(SyscallRun::done(0))
+    }
+
+    /// Begin a resumable whole-chip erase (see [`erase_sector_begin`](Self::erase_sector_begin)).
+    fn erase_chip_begin(&mut self) -> Result<SyscallRun, Error> {
+        self.erase_chip()?;
+        Ok(SyscallRun::done(0))
+    }
+
+    /// Begin a resumable program of a page (see [`erase_sector_begin`](Self::erase_sector_begin)).
+    fn program_page_begin(&mut self, addr: u32, data: &[u8]) -> Result<SyscallRun, Error> {
+        self.program_page(addr, data)?;
+        Ok(SyscallRun::done(0))
+    }
+
+    /// Begin a resumable verify (see [`erase_sector_begin`](Self::erase_sector_begin)).
+    fn verify_begin(&mut self, addr: u32, data: &[u8]) -> Result<SyscallRun, Error> {
+        self.verify(addr, data)?;
+        Ok(SyscallRun::done(0))
+    }
+
+    /// Advance a `*_begin` run by one bounded probe.
+    fn advance_syscall(&mut self, run: &mut SyscallRun, now_us: u64) -> StepPoll {
+        run.advance_inert(now_us)
+    }
+
+    /// Read and interpret a completed run's status.
+    fn finish_syscall(&mut self, run: SyscallRun) -> Result<(), Error> {
+        let _ = run;
+        Ok(())
+    }
+
+    /// Spend `us` in the device's delay source; a no-op by default.
+    fn delay_us(&mut self, _us: u32) {}
 }
 
 impl<T: FlashInterface> FlashInterface for &mut T {
@@ -99,5 +139,33 @@ impl<T: FlashInterface> FlashInterface for &mut T {
 
     fn set_flash_algorithm(&mut self, addr: u32) -> Result<(), Error> {
         (**self).set_flash_algorithm(addr)
+    }
+
+    fn erase_sector_begin(&mut self, addr: u32) -> Result<SyscallRun, Error> {
+        (**self).erase_sector_begin(addr)
+    }
+
+    fn erase_chip_begin(&mut self) -> Result<SyscallRun, Error> {
+        (**self).erase_chip_begin()
+    }
+
+    fn program_page_begin(&mut self, addr: u32, data: &[u8]) -> Result<SyscallRun, Error> {
+        (**self).program_page_begin(addr, data)
+    }
+
+    fn verify_begin(&mut self, addr: u32, data: &[u8]) -> Result<SyscallRun, Error> {
+        (**self).verify_begin(addr, data)
+    }
+
+    fn advance_syscall(&mut self, run: &mut SyscallRun, now_us: u64) -> StepPoll {
+        (**self).advance_syscall(run, now_us)
+    }
+
+    fn finish_syscall(&mut self, run: SyscallRun) -> Result<(), Error> {
+        (**self).finish_syscall(run)
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        (**self).delay_us(us)
     }
 }

@@ -1,4 +1,6 @@
-//! Content-based format detection.
+//! Format detection by filename extension, then by the leading magic.
+
+use crate::uf2::UF2_MAGIC_START0;
 
 /// A detected image format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,10 +11,7 @@ pub enum Format {
     Unknown,
 }
 
-/// Detect an image format from an optional filename and the first bytes of the stream.
-///
-/// A recognized filename extension takes precedence over content sniffing; otherwise the format
-/// is inferred from the leading bytes (the uf2 magic word).
+/// Detect a format from the filename extension if recognized, else from the leading bytes.
 pub fn detect_format(filename: Option<&str>, first_chunk: &[u8]) -> Format {
     if let Some(name) = filename {
         if let Some(dot) = name.rfind('.') {
@@ -29,7 +28,7 @@ pub fn detect_format(filename: Option<&str>, first_chunk: &[u8]) -> Format {
             first_chunk[2],
             first_chunk[3],
         ]);
-        if magic == 0x0A32_4655 {
+        if magic == UF2_MAGIC_START0 {
             return Format::Uf2;
         }
     }

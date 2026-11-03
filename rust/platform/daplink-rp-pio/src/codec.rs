@@ -3,19 +3,19 @@
 /// Maximum bit count one command word encodes; the field is `bit_count - 1` over 8 bits.
 pub const MAX_BITS: u16 = 256;
 
-/// Encode a FIFO command word; `bits` must be in `1..=256`, a zero-bit command would deadlock.
+/// Encode a command; `bits` must be `1..=256` and `entry_abs` a loaded entry in `0..32`.
 pub const fn cmd_word(entry_abs: u8, dir_drive: bool, bits: u16) -> u32 {
     debug_assert!(bits >= 1 && bits <= MAX_BITS);
     ((bits - 1) as u32 & 0xff) | ((dir_drive as u32) << 8) | ((entry_abs as u32) << 9)
 }
 
-/// Encode a direction-only command: dispatch to the park site with no data phase.
+/// Encode a direction-only command; `get_next_cmd_abs` must be the loaded park entry in `0..32`.
 pub const fn skip_word(get_next_cmd_abs: u8, dir_drive: bool) -> u32 {
     // The SM ignores the count here, so it carries the harmless all-ones value.
     0xff | ((dir_drive as u32) << 8) | ((get_next_cmd_abs as u32) << 9)
 }
 
-/// Right-align an `n`-bit read result; the SM shifts input right, so it arrives in the top bits.
+/// Right-align an `n`-bit read result from the top bits; `n` must be `1..=32`.
 pub const fn read_align(raw: u32, n: u8) -> u32 {
     debug_assert!(n >= 1 && n <= 32);
     if n >= 32 {

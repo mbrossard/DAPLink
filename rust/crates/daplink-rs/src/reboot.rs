@@ -36,16 +36,13 @@ pub const KIND_NXP_ISP: u8 = 0x03;
 
 /// The board-specific ROM bootloader entry mechanism injected into [`RebootVendor`].
 pub trait BootloaderEntry {
-    /// Which ROM bootloader [`enter`](BootloaderEntry::enter) lands in (see the `KIND_*` constants).
-    /// `KIND_NONE` makes the reboot subcommand answer [`STATUS_UNSUPPORTED`] and `enter` unreachable.
+    /// Which ROM bootloader [`enter`](BootloaderEntry::enter) lands in; `KIND_NONE` means unsupported.
     const KIND: u8;
 
-    /// Latch a validated reboot request, from DAP dispatch context and possibly an ISR.
-    /// A no-op by default; an impl whose trigger cannot reach the live handler latches a flag here.
+    /// Latch a validated reboot request, possibly from an ISR; a no-op by default.
     fn arm(&self) {}
 
-    /// Enter the ROM bootloader; runs from thread mode only and never returns.
-    /// Not called when [`KIND`](BootloaderEntry::KIND) is `KIND_NONE`.
+    /// Enter the ROM bootloader from thread mode; never returns.
     fn enter(&self) -> !;
 }
 
@@ -63,8 +60,7 @@ impl BootloaderEntry for NoBootloader {
     }
 }
 
-/// Query seam: whether a flash session holds the shared SWD bus, so a mid-flash `0x9F` is declined.
-/// A `&'static SwdMux` implements it from its own live-session flag; [`NeverBusy`] is the default.
+/// Whether a flash session holds the shared SWD bus, so a mid-flash `0x9F` is declined.
 pub trait FlashBusy {
     /// `true` while a flash session holds the bus and a reboot must be declined.
     fn is_flashing(&self) -> bool;
@@ -99,8 +95,7 @@ where
     }
 }
 
-/// The shared reboot-to-bootloader [`VendorHandler`]: parses `0x9F` and arms the injected
-/// [`BootloaderEntry`] without entering inline, unless [`FlashBusy`] reports a live session.
+/// The `0x9F` reboot [`VendorHandler`]: arms the [`BootloaderEntry`] unless [`FlashBusy`].
 pub struct RebootVendor<B: BootloaderEntry, Q: FlashBusy = NeverBusy> {
     entry: B,
     busy: Q,
@@ -119,8 +114,7 @@ impl<B: BootloaderEntry> RebootVendor<B> {
 }
 
 impl<B: BootloaderEntry, Q: FlashBusy> RebootVendor<B, Q> {
-    /// Build the handler over a [`BootloaderEntry`] and an injected [`FlashBusy`] query.
-    /// A reboot is declined with [`STATUS_BUSY`] whenever `busy` reports a live flash session.
+    /// Build over an entry and a [`FlashBusy`] query; a live flash session answers [`STATUS_BUSY`].
     pub fn with_busy_check(entry: B, busy: Q) -> Self {
         Self {
             entry,
@@ -129,14 +123,12 @@ impl<B: BootloaderEntry, Q: FlashBusy> RebootVendor<B, Q> {
         }
     }
 
-    /// Whether a valid reboot request has been latched (the firmware's thread-mode trigger
-    /// performs the ROM entry after a grace delay).
+    /// Whether a valid reboot request has been latched.
     pub fn pending(&self) -> bool {
         self.pending
     }
 
-    /// Shared access to the injected entry mechanism (e.g. to call
-    /// [`enter`](BootloaderEntry::enter) from the firmware's thread-mode trigger).
+    /// The injected entry mechanism.
     pub fn entry(&self) -> &B {
         &self.entry
     }
@@ -144,7 +136,6 @@ impl<B: BootloaderEntry, Q: FlashBusy> RebootVendor<B, Q> {
 
 impl<B: BootloaderEntry, Q: FlashBusy> VendorHandler for RebootVendor<B, Q> {
     fn handle(&mut self, report: &[u8], response: &mut [u8]) -> Option<usize> {
-        // `response[0]` is pre-echoed by the facade; fill from byte 1, return the TOTAL length.
         match report {
             [REBOOT_CMD_ID, SUB_DISCOVER, ..] => {
                 if response.len() < 7 {
@@ -221,8 +212,7 @@ mod tests {
         }
     }
 
-    /// frozen: the reboot vendor id and its status bytes are the wire contract a host tool
-    /// hard-codes; a renumber of the id or of any status byte must fail here.
+    /// frozen: the reboot vendor id and status bytes a host tool hard-codes.
     #[test]
     fn reboot_id_and_status_bytes_are_pinned() {
         assert_eq!(REBOOT_CMD_ID, 0x9F);
@@ -250,7 +240,6 @@ mod tests {
             ]
         );
 
-        // A valid reboot request replies with the echoed id plus STATUS_ARMED.
         let len = v
             .handle(
                 &[REBOOT_CMD_ID, SUB_REBOOT, b'B', b'O', b'O', b'T'],
@@ -323,7 +312,6 @@ mod tests {
         let mut v = RebootVendor::new(NoneEntry);
         let mut resp = [0u8; 64];
         resp[0] = REBOOT_CMD_ID;
-        // Discovery still answers, with kind = none.
         let len = v.handle(&[REBOOT_CMD_ID, SUB_DISCOVER], &mut resp).unwrap();
         assert_eq!(resp[6], KIND_NONE);
         assert_eq!(len, 7);
@@ -392,7 +380,6 @@ mod tests {
         let mut resp = [0u8; 64];
         resp[0] = REBOOT_CMD_ID;
 
-        // First attempt while busy: declined.
         v.handle(
             &[REBOOT_CMD_ID, SUB_REBOOT, b'B', b'O', b'O', b'T'],
             &mut resp,
@@ -400,7 +387,6 @@ mod tests {
         .unwrap();
         assert_eq!(resp[1], STATUS_BUSY);
 
-        // The session ends; the retry arms.
         v.busy.flashing.set(false);
         let len = v
             .handle(
@@ -432,12 +418,13 @@ mod tests {
     /// A `&'static SwdMux` is itself the busy query, with no adapter closure.
     #[test]
     fn static_mux_reference_is_a_flash_busy_query() {
-        use crate::flash_mux::FlashMux;
-        use dap_rs::driver::bitbang::{BitbangAdapter, DelayCycles, InputOutputPin};
-        use dap_rs::jtag::TapConfig;
+        use crate::late_jtag::{LateJtag, LateJtagDeps, LateSwdDrv};
+        use crate::wired::ScanChainStorage;
+        use dap_rs::driver::bitbang::{DelayCycles, InputOutputPin};
         use embedded_hal::delay::DelayNs;
         use static_cell::StaticCell;
 
+        #[derive(Clone)]
         struct Pin;
         impl InputOutputPin for Pin {
             fn set_as_output(&mut self) {}
@@ -459,24 +446,16 @@ mod tests {
             fn delay_cycles(&mut self, _cycles: u32) {}
         }
 
-        static SCAN: StaticCell<[TapConfig; 1]> = StaticCell::new();
-        static MUX: StaticCell<FlashMux<Pin, Delay>> = StaticCell::new();
-        let adapter = BitbangAdapter::new(
-            Pin,
-            Pin,
-            Pin,
-            Pin,
-            Pin,
-            Delay,
-            SCAN.init([TapConfig::INIT; 1]),
-        );
-        let mux: &'static FlashMux<Pin, Delay> = MUX.init(SwdMux::new(adapter));
+        type Mux = SwdMux<LateJtagDeps<Pin, Delay>, LateSwdDrv<Pin, Delay>, LateJtag<Pin, Delay>>;
+        static SCAN: ScanChainStorage = ScanChainStorage::new();
+        static MUX: StaticCell<Mux> = StaticCell::new();
+        let deps = LateJtagDeps::wired(Pin, Pin, Pin, Pin, Pin, Delay, &SCAN);
+        let mux: &'static Mux = MUX.init(SwdMux::new(deps));
 
         let mut v = RebootVendor::with_busy_check(MockEntry::new(), mux);
         let mut resp = [0u8; 64];
         resp[0] = REBOOT_CMD_ID;
 
-        // Idle: arms normally.
         v.handle(
             &[REBOOT_CMD_ID, SUB_REBOOT, b'B', b'O', b'O', b'T'],
             &mut resp,
@@ -484,7 +463,6 @@ mod tests {
         .unwrap();
         assert_eq!(resp[1], STATUS_ARMED);
 
-        // A live flash session declines a fresh handler.
         let mut v2 = RebootVendor::with_busy_check(MockEntry::new(), mux);
         let session = mux.begin_flash().unwrap();
         v2.handle(

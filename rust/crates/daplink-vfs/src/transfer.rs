@@ -31,23 +31,34 @@ pub enum TransferOutcome {
 pub trait TransferSink {
     /// Begin a transfer of `fmt`; `sniffed` is true when content, not a dirent, named it.
     fn begin(&mut self, fmt: Format, sniffed: bool);
-    /// Deliver a decoded fragment at absolute `addr`.
+    /// Deliver a decoded fragment at absolute `addr`; `Err` is a decoder rejection.
+    /// A device failure latches instead, and [`latched_phase`](Self::latched_phase) reports it.
     fn fragment(&mut self, addr: u32, data: &[u8]) -> Result<(), DecodeError>;
-    /// End the transfer with the final `outcome`.
+    /// End input with `outcome`; a deferred sink may still need pumping to finalize its result.
     fn end(&mut self, outcome: TransferOutcome);
-    /// Note the family id of the UF2 block about to be delivered, immediately before its
-    /// [`fragment`](Self::fragment); `None` when the block declares none.
-    fn note_uf2_family(&mut self, _family: Option<u32>) {}
-    /// Note that the started transfer is bound to a visible image directory entry. May fire more
-    /// than once per transfer, and never for a bound drop that never streamed.
+    /// Note a parsed UF2 block's family, or `None`; `false` disregards the block, numbering included.
+    fn note_uf2_family(&mut self, _family: Option<u32>) -> bool {
+        true
+    }
+    /// Note the started transfer is bound to a visible image entry; may fire more than once.
     fn note_dirent_bound(&mut self) {}
-    /// Whether the following remount warrants a bus-level USB re-enumeration; consulted once per
-    /// remount edge, after [`end`](Self::end). Opt-in: UNIT ATTENTION alone republishes.
+    /// Whether the next remount warrants a USB re-enumeration; UNIT ATTENTION alone republishes.
     fn wants_reconnect(&self) -> bool {
         false
     }
     /// Render a short status line describing the last transfer.
     fn render_status(&self, _out: &mut StatusWriter<'_>) {}
+    /// Whether the caller pumps [`advance`](Self::advance); if not, `fragment` programs synchronously.
+    fn set_deferred(&mut self, _on: bool) {}
+    /// Advance deferred device work at `now_us`; `Pending` while a step is still owed.
+    /// `DirectIo::write` pumps it for its fragment, the transport's idle tick for the teardown.
+    fn advance(&mut self, _now_us: u64) -> crate::msc_io::SectorPoll {
+        crate::msc_io::SectorPoll::Ready
+    }
+    /// Last absolute microsecond deadline, if exposed; callers must check whether it is already due.
+    fn deferred_wake_us(&self) -> Option<u64> {
+        None
+    }
     /// Whether the last transfer failed.
     fn last_failed(&self) -> bool {
         false
@@ -56,8 +67,7 @@ pub trait TransferSink {
     fn latched_phase(&self) -> Option<FlashPhase> {
         None
     }
-    /// Select per-sector (`true`) or whole-chip (`false`) erase for later sessions; a `false`
-    /// return means the sink has no such control.
+    /// Select per-sector (`true`) or whole-chip erase; `false` return means no such control.
     fn set_sector_erase(&mut self, _sector: bool) -> bool {
         false
     }
@@ -111,18 +121,15 @@ pub enum SectorDecision {
     },
     /// Streamed the next in-order sector of the active transfer.
     Stream,
-    /// A sector foreign to the streaming file -- below its start, past its known size, or
-    /// lacking UF2 block magic -- arriving mid-transfer: ignored, never an abort.
+    /// A sector foreign to the streaming file arriving mid-transfer: ignored.
     MetaIgnore,
-    /// A re-write of an already-streamed sector: discarded and recorded, and fatal only if the
-    /// stream then ends unable to finish.
+    /// A re-write of a streamed sector: discarded, fatal only if the stream cannot finish.
     RewriteIgnore,
-    /// An in-window sector ahead of the contiguous streaming front: discarded and recorded, and
-    /// a hole in the image unless the front later re-covers it.
+    /// An in-window sector ahead of the front: discarded, a hole unless the front re-covers it.
     GapDiscard,
     /// The bound decoder rejected the stream near the given byte offset.
     DecodeFail {
-        /// Approximate byte offset (bytes streamed so far) at which decoding failed.
+        /// Approximate byte offset within the file at which decoding failed.
         offset: u32,
     },
     /// A data-region write while no transfer is active (finished, or nothing to bind).
@@ -153,7 +160,6 @@ impl VfsObserver for NoObserver {
     }
 }
 
-/// Human-readable format name.
 pub(crate) fn fmt_name(f: Option<Format>) -> &'static [u8] {
     match f {
         Some(Format::Uf2) => b"uf2",
@@ -162,7 +168,6 @@ pub(crate) fn fmt_name(f: Option<Format>) -> &'static [u8] {
     }
 }
 
-/// Human-readable outcome name.
 pub(crate) fn outcome_name(o: Option<TransferOutcome>) -> &'static [u8] {
     match o {
         None => b"none",
@@ -175,7 +180,6 @@ pub(crate) fn outcome_name(o: Option<TransferOutcome>) -> &'static [u8] {
     }
 }
 
-/// Human-readable flash-phase name.
 pub(crate) fn phase_name(p: FlashPhase) -> &'static [u8] {
     match p {
         FlashPhase::NoTarget => b"NoTarget",
@@ -201,8 +205,8 @@ impl<S: TransferSink> DecoderContext for SinkCtx<'_, S> {
         self.sink.fragment(addr, data)
     }
 
-    fn set_uf2_family(&mut self, family: Option<u32>) {
-        self.sink.note_uf2_family(family);
+    fn set_uf2_family(&mut self, family: Option<u32>) -> bool {
+        self.sink.note_uf2_family(family)
     }
 }
 
@@ -223,17 +227,17 @@ pub(crate) struct Transfer<D: DecoderSet> {
     expected_size: Option<u32>,
     bound_ext: Option<Format>,
     bound_name: Option<[u8; 11]>,
-    /// The LBA of the bound file's first data sector, or `None` while no cluster is allocated.
-    /// Only that sector may start the transfer; earlier data-region writes are ignored.
+    /// The bound file's first data LBA, the only sector that may start the transfer.
     win_start_lba: Option<u32>,
     decoder: Option<D::Running>,
     scratch: [u8; 1024],
     finished_latch: bool,
     /// A re-write of an already-streamed sector was discarded; benign unless the stream stalls.
     saw_rewrite: bool,
-    /// An in-window sector ahead of the front was discarded; the image is torn unless the front
-    /// later re-covered it.
+    /// An in-window sector ahead of the front was discarded; torn unless re-covered.
     saw_gap: bool,
+    /// Ended `Done` by a host write, whose tail may still be landing.
+    settling: bool,
 }
 
 /// Where a mid-stream sector write falls relative to the active transfer.
@@ -247,13 +251,14 @@ enum SectorClass {
     BehindFront,
     /// Ahead of the contiguous front but within the file's window.
     AheadOfFront,
+    /// Inside a declared window, ahead of the front, but not a block of the bound format.
+    Corrupt,
 }
 
 /// UF2 block magic (first two words); every real block carries it, host metadata does not.
 const UF2_MAGIC_START0: u32 = 0x0A32_4655;
 const UF2_MAGIC_START1: u32 = 0x9E5D_5157;
 
-/// Whether `sector` begins with the UF2 block magic.
 fn uf2_magic(sector: &[u8; 512]) -> bool {
     u32::from_le_bytes([sector[0], sector[1], sector[2], sector[3]]) == UF2_MAGIC_START0
         && u32::from_le_bytes([sector[4], sector[5], sector[6], sector[7]]) == UF2_MAGIC_START1
@@ -276,7 +281,13 @@ impl<D: DecoderSet> Transfer<D> {
             finished_latch: false,
             saw_rewrite: false,
             saw_gap: false,
+            settling: false,
         }
+    }
+
+    /// Whether a finished drop's host may still be writing: the medium waits for its silence.
+    pub(crate) fn settling(&self) -> bool {
+        self.finished_latch && self.settling
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -291,8 +302,7 @@ impl<D: DecoderSet> Transfer<D> {
         self.state == State::InProgress && self.fmt == Some(Format::Uf2) && size_met
     }
 
-    /// The idle threshold, in ms, that applies once [`can_finish`](Self::can_finish) is true:
-    /// tight for a size that was declared and met, longer for a stream still unsized.
+    /// The idle threshold, in ms, once finishable: tight when a declared size was met.
     pub(crate) fn finishable_timeout_ms(&self) -> u32 {
         if self.expected_size.is_none() {
             crate::MSC_TIMEOUT_FINISHABLE_UNSIZED_MS
@@ -301,14 +311,23 @@ impl<D: DecoderSet> Transfer<D> {
         }
     }
 
-    /// Whether a dirent bound a format but no data sector ever started a transfer. Such a drop
-    /// must fail loud through [`fail_pending`](Self::fail_pending) rather than vanish.
+    /// The idle threshold, in ms, now; a sized stream with a gap waits only for a re-delivery.
+    pub(crate) fn idle_timeout_ms(&self) -> u32 {
+        if self.can_finish() {
+            self.finishable_timeout_ms()
+        } else if self.saw_gap && self.expected_size.is_some() {
+            crate::MSC_TIMEOUT_GAPPED_MS
+        } else {
+            crate::MSC_TIMEOUT_ACTIVE_MS
+        }
+    }
+
+    /// Whether a dirent bound a format but no data sector ever started a transfer.
     pub(crate) fn is_pending(&self) -> bool {
         self.state == State::Idle && self.bound_ext.is_some()
     }
 
-    /// Fail a bound-but-never-started drop loud: latch [`TransferOutcome::NoData`] into the sink
-    /// and finish the machine. No flash session is opened, so the remount stays quiet.
+    /// Fail a bound-but-never-started drop with `NoData`, opening no flash session.
     pub(crate) fn fail_pending<S: TransferSink>(&mut self, sink: &mut S) {
         debug_assert!(self.is_pending());
         if let Some(fmt) = self.bound_ext {
@@ -328,8 +347,7 @@ impl<D: DecoderSet> Transfer<D> {
         }
     }
 
-    /// Bind a format, expected size, and data window from a directory event, restricted to the
-    /// composed set. An event that meets the streamed size completes the transfer inline.
+    /// Bind format, size and window from a directory event; a met size completes inline.
     pub(crate) fn file_event<S: TransferSink>(&mut self, evt: &FileEvent, sink: &mut S) {
         let (name, size, hidden, first_cluster) = match *evt {
             FileEvent::Created {
@@ -397,8 +415,7 @@ impl<D: DecoderSet> Transfer<D> {
         }
     }
 
-    /// Whether a directory entry arriving mid-stream describes the bytes being streamed. A named
-    /// stream answers to its name; a sniff-started one only to a window beginning where it did.
+    /// Whether a mid-stream entry describes the active stream: by name, or by window if sniffed.
     fn entry_describes_active_stream(&self, name: &[u8; 11], first_cluster: u32) -> bool {
         match self.bound_name {
             Some(active) => active == *name,
@@ -406,8 +423,7 @@ impl<D: DecoderSet> Transfer<D> {
         }
     }
 
-    /// Whether `sector` is a plausible first sector for the bound format. Consulted only while
-    /// the file's cluster window is unknown, to keep host metadata from starting a transfer.
+    /// Whether `sector` could start the bound format; guards metadata while the window is unknown.
     fn plausible_bound_start(&self, sector: &[u8; 512]) -> bool {
         match self.bound_ext {
             Some(Format::Uf2) => uf2_magic(sector),
@@ -415,23 +431,7 @@ impl<D: DecoderSet> Transfer<D> {
         }
     }
 
-    /// Whether a mid-stream `lba` is foreign to the bound file: below its start, past its known
-    /// size, or lacking UF2 magic. Foreign sectors are ignored, never an abort.
-    fn is_foreign(&self, lba: u32, sector: &[u8; 512]) -> bool {
-        if lba < self.start_lba {
-            return true;
-        }
-        if self.size_end_lba().is_some_and(|end| lba >= end) {
-            return true;
-        }
-        if self.fmt == Some(Format::Uf2) && !uf2_magic(sector) {
-            return true;
-        }
-        false
-    }
-
-    /// The first LBA past the streaming file's data, or `None` while no entry declared a size.
-    /// The engine's single statement of where the file ends, and what makes a sector foreign.
+    /// The first LBA past the streaming file's data, or `None` while unsized.
     fn size_end_lba(&self) -> Option<u32> {
         self.expected_size.map(|sz| {
             self.start_lba
@@ -441,17 +441,31 @@ impl<D: DecoderSet> Transfer<D> {
 
     /// Where a mid-stream `lba` falls relative to the active transfer; `InProgress` only.
     fn classify(&self, lba: u32, sector: &[u8; 512]) -> SectorClass {
-        if self.is_foreign(lba, sector) {
+        // Position decides first: outside the file's own sectors nothing is judged on content.
+        if lba < self.start_lba || self.size_end_lba().is_some_and(|end| lba >= end) {
             return SectorClass::Foreign;
         }
         if lba == self.next_lba {
-            SectorClass::AtFront
-        } else if lba < self.next_lba {
-            // `is_foreign` already excluded `lba < start_lba`.
-            SectorClass::BehindFront
-        } else {
-            SectorClass::AheadOfFront
+            // At the front the decoder judges the content, destroyed magic included.
+            return SectorClass::AtFront;
         }
+        let magicless = self.fmt == Some(Format::Uf2) && !uf2_magic(sector);
+        if lba < self.next_lba {
+            return if magicless {
+                SectorClass::Foreign
+            } else {
+                SectorClass::BehindFront
+            };
+        }
+        if magicless {
+            // In a declared window it is the file's own block, corrupted; unsized, housekeeping is tolerated.
+            return if self.expected_size.is_some() {
+                SectorClass::Corrupt
+            } else {
+                SectorClass::Foreign
+            };
+        }
+        SectorClass::AheadOfFront
     }
 
     pub(crate) fn data_sector<S: TransferSink>(
@@ -462,7 +476,7 @@ impl<D: DecoderSet> Transfer<D> {
     ) -> SectorDecision {
         match self.state {
             State::Idle => self.start(lba, sector, sink),
-            // Discard and record all but the in-order front; no mid-stream write ever aborts.
+            // Out-of-order sectors are recorded and dropped; an undecodable sector ends the transfer.
             State::InProgress => match self.classify(lba, sector) {
                 SectorClass::Foreign => SectorDecision::MetaIgnore,
                 SectorClass::AtFront => self.stream_sector(lba, sector, sink),
@@ -475,6 +489,11 @@ impl<D: DecoderSet> Transfer<D> {
                     // Recorded so an unhealed gap classifies OutOfOrder, never Done with a hole.
                     self.saw_gap = true;
                     SectorDecision::GapDiscard
+                }
+                SectorClass::Corrupt => {
+                    let offset = (lba - self.start_lba).saturating_mul(512);
+                    self.end(TransferOutcome::DecodeError, sink);
+                    SectorDecision::DecodeFail { offset }
                 }
             },
             State::Finished => SectorDecision::Inactive,
@@ -591,11 +610,11 @@ impl<D: DecoderSet> Transfer<D> {
         sink.end(outcome);
         self.state = State::Finished;
         self.finished_latch = true;
+        self.settling = outcome == TransferOutcome::Done;
         self.decoder = None;
     }
 
-    /// Classify and finish a stalled stream: a recorded gap tears the image whatever else holds,
-    /// a finishable stream completes, and a recorded rewrite separates `OutOfOrder` from `Timeout`.
+    /// Finish a stalled stream: a gap tears it, finishable completes, a rewrite means `OutOfOrder`.
     pub(crate) fn on_timeout<S: TransferSink>(&mut self, sink: &mut S) {
         if self.state != State::InProgress {
             return;
@@ -742,6 +761,7 @@ impl TransferSink for StatsSink {
 mod tests {
     use super::*;
     use crate::decoder_set::AllDecoders;
+    use crate::fixtures::uf2_block;
     use std::vec::Vec;
 
     struct RecSink {
@@ -773,18 +793,6 @@ mod tests {
         fn end(&mut self, outcome: TransferOutcome) {
             self.outcome = Some(outcome);
         }
-    }
-
-    /// One well-formed 512-byte UF2 block carrying `payload` at `addr`.
-    fn uf2_block(addr: u32, payload: &[u8]) -> [u8; 512] {
-        let mut b = [0u8; 512];
-        b[0..4].copy_from_slice(&UF2_MAGIC_START0.to_le_bytes());
-        b[4..8].copy_from_slice(&UF2_MAGIC_START1.to_le_bytes());
-        b[12..16].copy_from_slice(&addr.to_le_bytes());
-        b[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        b[32..32 + payload.len()].copy_from_slice(payload);
-        b[508..512].copy_from_slice(&0x0AB1_6F30u32.to_le_bytes());
-        b
     }
 
     /// A dirent create event for `name`, with the parameters each test varies.
@@ -841,8 +849,7 @@ mod tests {
         assert!(!sink.began);
     }
 
-    /// Payload before the directory entry: its magic starts the transfer, the late entry sizes
-    /// and completes it.
+    /// Payload before the directory entry: its magic starts the transfer, the entry completes it.
     #[test]
     fn sniffed_start_and_a_late_dirent_completes_it() {
         let mut t = Transfer::<AllDecoders>::new();
@@ -925,8 +932,7 @@ mod tests {
         assert_eq!(sink.outcome, Some(TransferOutcome::Done));
     }
 
-    /// A close tail that re-flushes a streamed sector and touches one past the front must still
-    /// let the finishable idle timeout complete the transfer.
+    /// A close tail re-flushing a streamed sector must still complete at the finishable timeout.
     #[test]
     fn unsized_trailing_rewrite_and_housekeeping_finish_done() {
         let mut t = Transfer::<AllDecoders>::new();
@@ -1062,9 +1068,9 @@ mod tests {
         assert_eq!(sink.outcome, Some(TransferOutcome::Done));
     }
 
-    /// A UF2 stream ignores any mid-stream sector without block magic, wherever it lands.
+    /// Unsized, a magic-less sector ahead of the front may be housekeeping: ignored.
     #[test]
-    fn uf2_nonmagic_sector_is_foreign() {
+    fn unsized_nonmagic_sector_is_foreign() {
         let mut t = Transfer::<AllDecoders>::new();
         let mut sink = RecSink::new();
         t.file_event(&created(b"APP     UF2", 0, 0), &mut sink);
@@ -1076,6 +1082,87 @@ mod tests {
         assert!(t.is_active());
         t.on_timeout(&mut sink);
         assert_eq!(sink.outcome, Some(TransferOutcome::Done));
+    }
+
+    /// A magic-less sector in a declared window ahead of the front ends the transfer at its offset.
+    #[test]
+    fn sized_corrupt_block_ends_the_transfer() {
+        let mut t = Transfer::<AllDecoders>::new();
+        let mut sink = RecSink::new();
+        // Four sectors: window is [133, 137).
+        t.file_event(&created(b"APP     UF2", 2048, 2), &mut sink);
+        t.data_sector(133, &uf2_block(0x0800_0000, &[1, 2]), &mut sink);
+        assert_eq!(
+            t.data_sector(135, &[0x5Au8; 512], &mut sink),
+            SectorDecision::DecodeFail { offset: 1024 },
+            "the offset names the corrupt sector's place in the file"
+        );
+        assert_eq!(sink.outcome, Some(TransferOutcome::DecodeError));
+        assert!(
+            !t.is_active(),
+            "no idle wait is needed to know the drop failed"
+        );
+        assert!(t.take_finished());
+    }
+
+    /// The same corruption at the front is reported once, at the streamed-bytes offset.
+    #[test]
+    fn corrupt_block_at_the_front_is_reported_once() {
+        let mut t = Transfer::<AllDecoders>::new();
+        let mut sink = RecSink::new();
+        t.file_event(&created(b"APP     UF2", 2048, 2), &mut sink);
+        t.data_sector(133, &uf2_block(0x0800_0000, &[1, 2]), &mut sink);
+        assert_eq!(
+            t.data_sector(134, &[0x5Au8; 512], &mut sink),
+            SectorDecision::DecodeFail { offset: 512 }
+        );
+        assert_eq!(sink.outcome, Some(TransferOutcome::DecodeError));
+        assert_eq!(
+            t.data_sector(135, &[0x5Au8; 512], &mut sink),
+            SectorDecision::Inactive,
+            "the finished machine does not report the failure a second time"
+        );
+    }
+
+    /// A magic-less re-write of a streamed sector is tolerated: those bytes are programmed.
+    #[test]
+    fn sized_nonmagic_rewrite_is_foreign() {
+        let mut t = Transfer::<AllDecoders>::new();
+        let mut sink = RecSink::new();
+        t.file_event(&created(b"APP     UF2", 2048, 2), &mut sink);
+        t.data_sector(133, &uf2_block(0x0800_0000, &[1, 2]), &mut sink);
+        t.data_sector(134, &uf2_block(0x0800_0100, &[3, 4]), &mut sink);
+        assert_eq!(
+            t.data_sector(133, &[0x5Au8; 512], &mut sink),
+            SectorDecision::MetaIgnore
+        );
+        assert!(t.is_active());
+        assert_eq!(sink.outcome, None);
+    }
+
+    /// A sized stream with a gap waits only for a re-delivery, not the full active window.
+    #[test]
+    fn sized_forward_gap_shortens_the_idle_window() {
+        let mut t = Transfer::<AllDecoders>::new();
+        let mut sink = RecSink::new();
+        t.file_event(&created(b"APP     UF2", 2048, 2), &mut sink);
+        t.data_sector(133, &uf2_block(0x0800_0000, &[1, 2]), &mut sink);
+        assert_eq!(t.idle_timeout_ms(), crate::MSC_TIMEOUT_ACTIVE_MS);
+        assert_eq!(
+            t.data_sector(135, &uf2_block(0x0800_0200, &[5, 6]), &mut sink),
+            SectorDecision::GapDiscard
+        );
+        assert_eq!(t.idle_timeout_ms(), crate::MSC_TIMEOUT_GAPPED_MS);
+    }
+
+    /// A stall with no gap keeps the active window: nothing says the host will not resume.
+    #[test]
+    fn a_stalled_stream_without_a_gap_keeps_the_active_window() {
+        let mut t = Transfer::<AllDecoders>::new();
+        let mut sink = RecSink::new();
+        t.file_event(&created(b"APP     UF2", 2048, 2), &mut sink);
+        t.data_sector(133, &uf2_block(0x0800_0000, &[1, 2]), &mut sink);
+        assert_eq!(t.idle_timeout_ms(), crate::MSC_TIMEOUT_ACTIVE_MS);
     }
 
     #[test]
@@ -1146,7 +1233,6 @@ mod tests {
         assert_eq!(s.addr_max, 0x208);
         s.end(TransferOutcome::Done);
         assert!(!s.last_failed());
-        // begin() resets the accumulators.
         s.begin(Format::Uf2, false);
         assert_eq!(s.stats.fragments, 0);
         assert_eq!(s.addr_min, u32::MAX);
@@ -1223,8 +1309,7 @@ mod tests {
         assert!(s.last_failed());
     }
 
-    /// A dirent rewrite landing after the whole image streamed completes it inline, not at the
-    /// idle timeout.
+    /// A dirent rewrite after the whole image streamed completes it inline.
     #[test]
     fn dirent_size_met_completes_inline() {
         let mut t = Transfer::<AllDecoders>::new();
@@ -1271,8 +1356,7 @@ mod tests {
         assert_eq!(sink.outcome, Some(TransferOutcome::Timeout));
     }
 
-    /// A size arriving mid-stall beyond what streamed must drop finishability, so the timeout
-    /// fails loud rather than flashing the short prefix.
+    /// A size beyond what streamed, arriving mid-stall, drops finishability.
     #[test]
     fn late_dirent_size_beyond_streamed_fails_loud() {
         let mut t = Transfer::<AllDecoders>::new();
